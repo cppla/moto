@@ -13,3 +13,13 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# goland
+.idea
+
+# mac os file
+.DS_store
+
+# go build
+go_build_run_go
+moto
