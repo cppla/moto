@@ -1,0 +1,72 @@
+{
+  "log": {
+    "level": "debug",
+    "path": "./moto.log",
+    "version": "1.0.0",
+    "date": "2022-06-08"
+  },
+  "rules": [
+    {
+      "name": "正常模式",
+      "listen": ":81",
+      "mode": "normal",
+      "timeout": 3000,
+      "blacklist": null,
+      "targets": [
+        {
+          "address": "1.1.1.1:85"
+        },
+        {
+          "address": "2.2.2.2:85"
+        }
+      ]
+    },
+    {
+      "name": "正则模式",
+      "listen": ":82",
+      "mode": "regex",
+      "timeout": 3000,
+      "blacklist": null,
+      "targets": [
+        {
+          "regexp": "^(GET|POST|HEAD|DELETE|PUT|CONNECT|OPTIONS|TRACE)",
+          "address": "1.1.1.1:80"
+        },
+        {
+          "regexp": "^SSH",
+          "address": "2.2.2.2:22"
+        }
+      ]
+    },
+    {
+      "name": "智能加速",
+      "listen": ":83",
+      "mode": "boost",
+      "timeout": 150,
+      "blacklist": null,
+      "targets": [
+        {
+          "address": "1.1.1.1:85"
+        },
+        {
+          "address": "2.2.2.2:85"
+        }
+      ]
+    },
+    {
+      "name": "轮询模式",
+      "listen": ":84",
+      "mode": "roundrobin",
+      "timeout": 150,
+      "blacklist": null,
+      "targets": [
+        {
+          "address": "1.1.1.1:85"
+        },
+        {
+          "address": "2.2.2.2:85"
+        }
+      ]
+    }
+  ]
+}
