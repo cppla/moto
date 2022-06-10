@@ -10,6 +10,26 @@ high-speed motorcycle，可以上高速的摩托车🏍️～
 轮询模式[roundrobin]：分散连接到所有目标地址    
 ```
 
+####智能加速模式演示，自动择路
+
+```bash
+`work from home(china telecom)`:
+{"level":"debug","ts":"2022-06-08 12:17:59.444","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49751","targetAddr":"47.241.9.9 [新加坡 阿里云] :85","decisionTime(ms)":79}
+{"level":"debug","ts":"2022-06-08 12:18:05.050","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49774","targetAddr":"47.241.9.9 [新加坡 阿里云] :85","decisionTime(ms)":81}
+{"level":"debug","ts":"2022-06-08 12:18:05.493","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49783","targetAddr":"34.124.1.1 [美国 得克萨斯州] :85","decisionTime(ms)":75}
+{"level":"debug","ts":"2022-06-08 12:18:05.838","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49792","targetAddr":"47.241.9.9 [新加坡 阿里云] :85","decisionTime(ms)":84}
+{"level":"debug","ts":"2022-06-08 12:18:05.838","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49790","targetAddr":"47.241.9.9 [新加坡 阿里云] :85","decisionTime(ms)":84}
+{"level":"debug","ts":"2022-06-08 12:18:09.176","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49810","targetAddr":"34.124.1.1 [美国 得克萨斯州] :85","decisionTime(ms)":81}
+
+`in office(china unicom)`:
+{"level":"debug","ts":"2022-06-09 19:24:43.216","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :63847","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":66}
+{"level":"debug","ts":"2022-06-09 19:24:49.412","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :63878","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":49}
+{"level":"debug","ts":"2022-06-09 19:24:57.356","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :63905","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":55}
+{"level":"debug","ts":"2022-06-09 19:27:06.394","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :64245","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":51}
+{"level":"debug","ts":"2022-06-09 19:27:07.666","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :64255","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":55}
+{"level":"debug","ts":"2022-06-09 19:27:07.666","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :64256","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":55}
+```
+
 #### 常见协议正则表达式      
 |协议|正则表达式|
 | --- | ---|
