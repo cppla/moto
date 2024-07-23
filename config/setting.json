@@ -2,8 +2,8 @@
   "log": {
     "level": "debug",
     "path": "./moto.log",
-    "version": "1.0.0",
-    "date": "2022-06-08"
+    "version": "1.0.1",
+    "date": "2024-07-23"
   },
   "rules": [
     {
@@ -42,7 +42,7 @@
       "name": "智能加速",
       "listen": ":83",
       "mode": "boost",
-      "timeout": 150,
+      "timeout": 300,
       "blacklist": null,
       "targets": [
         {
@@ -57,7 +57,7 @@
       "name": "轮询模式",
       "listen": ":84",
       "mode": "roundrobin",
-      "timeout": 150,
+      "timeout": 300,
       "blacklist": null,
       "targets": [
         {
