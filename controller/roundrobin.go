@@ -6,20 +6,21 @@ import (
 	"moto/config"
 	"moto/utils"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
-var tcpCounter = 0
+var tcpCounter uint64
 
 func HandleRoundrobin(conn net.Conn, rule *config.Rule) {
 	defer conn.Close()
 
-	v := rule.Targets[tcpCounter % len(rule.Targets)]
-	if tcpCounter >= 100*len(rule.Targets) {
-		tcpCounter = 1
-	} else {
-		tcpCounter += 1
+	index := atomic.AddUint64(&tcpCounter, 1) % uint64(len(rule.Targets))
+	if tcpCounter >= 100*uint64(len(rule.Targets)) {
+		atomic.StoreUint64(&tcpCounter, 1)
 	}
+
+	v := rule.Targets[index]
 
 	roundrobinBegin := time.Now()
 	target, err := net.Dial("tcp", v.Address)
@@ -40,6 +41,10 @@ func HandleRoundrobin(conn net.Conn, rule *config.Rule) {
 
 	defer target.Close()
 
-	go io.Copy(conn, target)
+	go func() {
+		io.Copy(conn, target)
+		conn.Close()
+		target.Close()
+	}()
 	io.Copy(target, conn)
 }

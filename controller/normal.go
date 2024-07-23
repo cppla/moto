@@ -38,6 +38,10 @@ func HandleNormal(conn net.Conn, rule *config.Rule) {
 
 	defer target.Close()
 
-	go io.Copy(conn, target)
+	go func() {
+		io.Copy(conn, target)
+		conn.Close()
+		target.Close()
+	}()
 	io.Copy(target, conn)
 }

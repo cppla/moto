@@ -17,10 +17,11 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 	conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(rule.Timeout)))
 	//获取第一个数据包
 	firstPacket := new(bytes.Buffer)
-	if count, _ := io.Copy(firstPacket, conn); count == 0 {
+	if _, err := io.CopyN(firstPacket, conn, 4096); err != nil {
 		utils.Logger.Error("unable to handle connection, failed to get first packet",
 			zap.String("ruleName", rule.Name),
-			zap.String("remoteAddr", conn.RemoteAddr().String()))
+			zap.String("remoteAddr", conn.RemoteAddr().String()),
+			zap.Error(err))
 		return
 	}
 
@@ -51,7 +52,7 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 	utils.Logger.Debug("establish connection",
 		zap.String("ruleName", rule.Name),
 		zap.String("remoteAddr", conn.RemoteAddr().String()),
-			zap.String("targetAddr", target.RemoteAddr().String()))
+		zap.String("targetAddr", target.RemoteAddr().String()))
 	//匹配到了，去除掉刚才设定的超时
 	conn.SetReadDeadline(time.Time{})
 	//把第一个数据包发送给目标
@@ -59,6 +60,10 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 
 	defer target.Close()
 
-	go io.Copy(conn, target)
+	go func() {
+		io.Copy(conn, target)
+		conn.Close()
+		target.Close()
+	}()
 	io.Copy(target, conn)
 }
