@@ -5,6 +5,27 @@
     "version": "1.0.1",
     "date": "2024-07-23"
   },
+  "wafs": [
+    {
+      "name": "限制单位时间内总请求次数@threshold",
+      "blackcountry": [
+        "US"
+      ],
+      "threshold": 200,
+      "findtime": 30,
+      "bantime": 86400
+    },
+    {
+      "name": "限制单位时间内总数据量@threshold",
+      "blackcountry": [
+        "TW",
+        "US"
+      ],
+      "threshold": 10240,
+      "findtime": 30,
+      "bantime": 86400
+    }
+  ],
   "rules": [
     {
       "name": "正常模式",

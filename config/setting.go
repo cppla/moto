@@ -8,28 +8,37 @@ import (
 )
 
 type projectConfig struct {
-	Log		log   `json:"log"`
-	Rules	[]*Rule `json:"rules"`
+	Log   log     `json:"log"`
+	Rules []*Rule `json:"rules"`
+	Wafs  []*Waf  `json:"wafs"`
 }
 
 type log struct {
-	Level		string	`json:"level"`
-	Path		string	`json:"path"`
-	Version		string	`json:"version"`
-	Date		string	`json:"date"`
+	Level   string `json:"level"`
+	Path    string `json:"path"`
+	Version string `json:"version"`
+	Date    string `json:"date"`
+}
+
+type Waf struct {
+	Name         string   `json:"name"`
+	Blackcountry []string `json:"blackcountry"`
+	Threshold    uint64   `json:"threshold"`
+	Findtime     uint64   `json:"findtime"`
+	Bantime      uint64   `json:"bantime"`
 }
 
 type Rule struct {
-	Name         string				`json:"name"`
-	Listen       string				`json:"listen"`
-	Mode  		 string				`json:"mode"`
-	Targets      []*struct {
-		Regexp  string				`json:"regexp"`
-		Re		*regexp.Regexp		`json:"-"`
-		Address string				`json:"address"`
+	Name    string `json:"name"`
+	Listen  string `json:"listen"`
+	Mode    string `json:"mode"`
+	Targets []*struct {
+		Regexp  string         `json:"regexp"`
+		Re      *regexp.Regexp `json:"-"`
+		Address string         `json:"address"`
 	} `json:"targets"`
-	Timeout		uint64 				`json:"timeout"`
-	Blacklist	map[string]bool		`json:"blacklist"`
+	Timeout   uint64          `json:"timeout"`
+	Blacklist map[string]bool `json:"blacklist"`
 }
 
 var GlobalCfg *projectConfig
@@ -52,6 +61,22 @@ func init() {
 		if err := v.verify(); err != nil {
 			fmt.Errorf("verity rule failed at pos %d : %s", i, err.Error())
 		}
+	}
+
+	for i, v := range GlobalCfg.Wafs {
+		if v.Name == "" {
+			fmt.Errorf("empty waf name at pos %d", i)
+		}
+		if v.Threshold == 0 {
+			fmt.Errorf("invalid threshold at pos %d", i)
+		}
+		if v.Findtime == 0 {
+			fmt.Errorf("invalid findtime at pos %d", i)
+		}
+		if v.Bantime == 0 {
+			fmt.Errorf("invalid bantime at pos %d", i)
+		}
+		fmt.Println(v)
 	}
 }
 
