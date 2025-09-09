@@ -46,7 +46,7 @@ type Rule struct {
 	Blacklist map[string]bool `json:"blacklist"`
 }
 
-// Accelerator config enables dual TCP tunnels, duplication and roles.
+// Accelerator config enables multi-tunnel acceleration roles.
 // When enabled with role "client", traffic from the 4 modes will be proxied
 // through persistent tunnels to the remote accelerator server which connects
 // to the selected target. When role is "server", the process listens for
@@ -60,12 +60,13 @@ type Accelerator struct {
 	Listen string `json:"listen"`
 	// Number of persistent TCP tunnels between client and server (auto if loss adaptation enabled)
 	Tunnels int `json:"tunnels"`
-	// Duplication factor per frame (legacy, ignored when loss adaptation enabled)
-	Duplication int `json:"duplication"`
-	// FrameSize controls the max payload per frame in bytes (default 8192)
+	// FrameSize controls the max payload per frame in bytes (default 32768)
 	FrameSize int `json:"frameSize"`
 	// Transport selects tunnel transport: "tcp" (default) or "quic"
 	Transport string `json:"transport"`
+	// TLS options for QUIC (nginx-like). If these are empty on server, a self-signed cert will be used.
+	CertificateFile string `json:"certificate-file"`
+	PrivateKeyFile  string `json:"private-key-file"`
 }
 
 // LossAdaptation maps observed loss(%) to duplication factor.
@@ -113,21 +114,15 @@ func init() {
 			if GlobalCfg.Accelerator.Tunnels <= 0 {
 				GlobalCfg.Accelerator.Tunnels = 2
 			}
-			if GlobalCfg.Accelerator.Duplication <= 0 {
-				GlobalCfg.Accelerator.Duplication = 1
-			}
-			if GlobalCfg.Accelerator.Duplication > 5 {
-				GlobalCfg.Accelerator.Duplication = 5
-			}
 		}
 		if GlobalCfg.Accelerator.FrameSize <= 0 {
 			GlobalCfg.Accelerator.FrameSize = 32768
 		}
-		// default downlink duplication to true unless users set explicitly
-		// note: zero-value bool=false, so set to true when unspecified and enabled
-		// cannot distinguish unspecified vs false directly; keep default true if currently false and role set
-		// We will not auto-flip if user set false explicitly; this is a best-effort sane default
 		if GlobalCfg.Accelerator.Transport == "" {
+			GlobalCfg.Accelerator.Transport = "tcp"
+		}
+		if GlobalCfg.Accelerator.Transport != "tcp" && GlobalCfg.Accelerator.Transport != "quic" {
+			fmt.Printf("invalid transport: %s, fallback to tcp\n", GlobalCfg.Accelerator.Transport)
 			GlobalCfg.Accelerator.Transport = "tcp"
 		}
 		if GlobalCfg.Accelerator.Role == "client" && GlobalCfg.Accelerator.Enabled && len(GlobalCfg.Accelerator.Remotes) == 0 {
@@ -156,7 +151,7 @@ func init() {
 
 	for i, v := range GlobalCfg.Rules {
 		if err := v.verify(); err != nil {
-			fmt.Printf("verity rule failed at pos %d : %s\n", i, err.Error())
+			fmt.Printf("verify rule failed at pos %d : %s\n", i, err.Error())
 		}
 	}
 
@@ -199,15 +194,16 @@ func Reload(path string) error {
 			if cfg.Accelerator.Tunnels <= 0 {
 				cfg.Accelerator.Tunnels = 2
 			}
-			if cfg.Accelerator.Duplication <= 0 {
-				cfg.Accelerator.Duplication = 1
-			}
-			if cfg.Accelerator.Duplication > 5 {
-				cfg.Accelerator.Duplication = 5
-			}
 		}
 		if cfg.Accelerator.FrameSize <= 0 {
 			cfg.Accelerator.FrameSize = 32768
+		}
+		if cfg.Accelerator.Transport == "" {
+			cfg.Accelerator.Transport = "tcp"
+		}
+		if cfg.Accelerator.Transport != "tcp" && cfg.Accelerator.Transport != "quic" {
+			fmt.Printf("invalid transport: %s, fallback to tcp\n", cfg.Accelerator.Transport)
+			cfg.Accelerator.Transport = "tcp"
 		}
 		if cfg.Accelerator.Role == "client" && cfg.Accelerator.Enabled && len(cfg.Accelerator.Remotes) == 0 {
 			fmt.Printf("accelerator role=client requires remotes\n")
@@ -232,7 +228,7 @@ func Reload(path string) error {
 	}
 	for i, v := range cfg.Rules {
 		if err := v.verify(); err != nil {
-			fmt.Printf("verity rule failed at pos %d : %s\n", i, err.Error())
+			fmt.Printf("verify rule failed at pos %d : %s\n", i, err.Error())
 		}
 	}
 	for i, v := range cfg.Wafs {

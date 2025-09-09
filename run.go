@@ -24,7 +24,7 @@ func printHelp() {
 	fmt.Println("    - role=server: accepts tunnels and dials real targets.")
 	fmt.Println()
 	fmt.Println("Loss adaptation:")
-	fmt.Println("  Dynamically chooses duplication (1..5x) based on observed loss between client and server.")
+	fmt.Println("  Dynamically chooses send multiplier (1..5x) based on observed loss between client and server.")
 	fmt.Println("  Default mapping:")
 	fmt.Println("    <1%  -> 1x; <10% -> 2x; <20% -> 3x; <30% -> 4x; >=30% -> 5x")
 }

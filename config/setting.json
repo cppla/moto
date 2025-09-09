@@ -97,9 +97,10 @@
     "remotes": ["127.0.0.1:9900"],
     "listen": ":9900",
     "tunnels": 3,
-    "duplication": 0,
     "frameSize": 32768,
-    "transport": "tcp"
+  "transport": "tcp",
+  "certificate-file": "",
+  "private-key-file": ""
   },
   "lossAdaptation": {
     "enabled": true,

@@ -24,7 +24,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// Simple framed multiplex tunnel with duplication across multiple TCP links.
+// Simple framed multiplex tunnel with adaptive multi-send across multiple links.
 // Frame format:
 // magic[4] = 'M','O','T','O'
 // flags u8  (1=SYN,2=FIN,4=RST,8=DATA)
@@ -116,7 +116,7 @@ type accelManager struct {
 
 	// loss/adaptation stats (per process side)
 	statsMu   sync.Mutex
-	sentCount int // number of frames actually sent (after duplication)
+	sentCount int // number of frames actually sent (including duplicates)
 	ackCount  int // number of ACK frames received from peer
 	currDup   int // current adaptive duplication (1..5)
 
@@ -188,6 +188,14 @@ func (m *accelManager) startClient() {
 					utils.Logger.Warn("ACC: dial remote failed", zap.String("remote", remote), zap.Error(err))
 					time.Sleep(time.Second)
 					continue
+				}
+				// TCP specific tuning
+				if nc, ok := c.(net.Conn); ok {
+					if tcp, ok2 := nc.(*net.TCPConn); ok2 {
+						_ = tcp.SetNoDelay(true)
+						_ = tcp.SetKeepAlive(true)
+						_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+					}
 				}
 				t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{})}
 				m.tunMu.Lock()
@@ -447,7 +455,7 @@ func (m *accelManager) acceptUpstream(streamID uint32, addr string, t *accelTunn
 }
 
 func (m *accelManager) pipeUpToClient(streamID uint32, up net.Conn, t *accelTunnel) {
-	// read from upstream and send DATA frames to client (duplication)
+	// read from upstream and send DATA frames to client (downlink)
 	buf := make([]byte, m.cfg.FrameSize)
 	if len(buf) == 0 {
 		buf = make([]byte, 8192)
@@ -488,7 +496,7 @@ func sendOnTunnel(t *accelTunnel, fr frame) error {
 	return writeFrame(t.conn, fr)
 }
 
-// send frame to multiple tunnels according to Duplication
+// send frame to multiple tunnels according to current adaptive multiplier
 func (m *accelManager) broadcast(fr frame) {
 	m.tunMu.RLock()
 	tunnels := append([]*accelTunnel(nil), m.tunnels...)
@@ -502,7 +510,9 @@ func (m *accelManager) broadcast(fr frame) {
 	for _, t := range sel {
 		go func(tn *accelTunnel) {
 			tn.wrMu.Lock()
-			_ = writeFrame(tn.conn, fr)
+			if err := writeFrame(tn.conn, fr); err != nil {
+				utils.Logger.Warn("ACC: write frame failed", zap.Error(err))
+			}
 			tn.wrMu.Unlock()
 		}(t)
 	}
@@ -514,7 +524,7 @@ func (m *accelManager) broadcast(fr frame) {
 	}
 }
 
-// Downlink duplication on server side. Primary is the tunnel where upstream was initiated from, we always include it.
+// Downlink send on server side. Primary is the tunnel where upstream was initiated from; we always include it.
 func (m *accelManager) dupSendFromServer(fr frame, primary *accelTunnel) {
 	m.tunMu.RLock()
 	tunnels := append([]*accelTunnel(nil), m.tunnels...)
@@ -546,7 +556,9 @@ func (m *accelManager) dupSendFromServer(fr frame, primary *accelTunnel) {
 	// send
 	for _, tn := range sel {
 		tn.wrMu.Lock()
-		_ = writeFrame(tn.conn, fr)
+		if err := writeFrame(tn.conn, fr); err != nil {
+			utils.Logger.Warn("ACC: write frame failed", zap.Error(err))
+		}
 		tn.wrMu.Unlock()
 	}
 	// sent accounting (downlink DATA/FIN duplicates only)
@@ -615,15 +627,18 @@ func (m *accelManager) probeTunnel(t *accelTunnel) {
 		interval = time.Duration(la.ProbeIntervalMs) * time.Millisecond
 	}
 	ticker := time.NewTicker(interval)
+	buf := make([]byte, 8)
 	for {
 		select {
 		case <-ticker.C:
 			// send PING with timestamp
 			now := time.Now().UnixNano()
-			buf := make([]byte, 8)
 			binary.BigEndian.PutUint64(buf, uint64(now))
 			t.wrMu.Lock()
-			_ = writeFrame(t.conn, frame{flags: flagPING, streamID: 0, seq: 0, payload: buf})
+			if err := writeFrame(t.conn, frame{flags: flagPING, streamID: 0, seq: 0, payload: buf}); err != nil {
+				t.wrMu.Unlock()
+				return
+			}
 			t.wrMu.Unlock()
 		case <-t.closed:
 			return
@@ -632,6 +647,7 @@ func (m *accelManager) probeTunnel(t *accelTunnel) {
 }
 
 func (m *accelManager) getDuplication() int {
+	// Only support adaptive multiplier; when disabled, default to 1
 	if config.GlobalCfg.LossAdaptation != nil && config.GlobalCfg.LossAdaptation.Enabled {
 		m.statsMu.Lock()
 		dup := m.currDup
@@ -644,14 +660,7 @@ func (m *accelManager) getDuplication() int {
 		}
 		return dup
 	}
-	dup := m.cfg.Duplication
-	if dup <= 0 {
-		dup = 1
-	}
-	if dup > 5 {
-		dup = 5
-	}
-	return dup
+	return 1
 }
 
 func (m *accelManager) startAdaptation() {
@@ -702,7 +711,7 @@ func (m *accelManager) startAdaptation() {
 				newDup = 5
 			}
 			if newDup != prevDup {
-				utils.Logger.Debug("ACC: adapt duplication",
+				utils.Logger.Debug("ACC: adapt multiplier",
 					zap.Float64("loss(%)", loss),
 					zap.Int("dup.prev", prevDup),
 					zap.Int("dup.new", newDup),
@@ -924,7 +933,7 @@ func (m *accelManager) dialTransport(remote string) (io.ReadWriteCloser, error) 
 		return c, nil
 	}
 	if m.cfg.Transport == "quic" {
-		tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"moto-accel"}}
+		tlsConf := &tls.Config{NextProtos: []string{"moto-accel"}, InsecureSkipVerify: true}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		qc, err := quic.DialAddr(ctx, remote, tlsConf, nil)
@@ -943,7 +952,19 @@ func (m *accelManager) dialTransport(remote string) (io.ReadWriteCloser, error) 
 
 // QUIC server listener: accept connections and streams, each stream is a tunnel
 func (m *accelManager) startServerQUIC() {
-	tlsConf := generateTLSConfig()
+	// load server cert if configured, else generate self-signed
+	var tlsConf *tls.Config
+	if m.cfg.CertificateFile != "" && m.cfg.PrivateKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(m.cfg.CertificateFile, m.cfg.PrivateKeyFile)
+		if err != nil {
+			utils.Logger.Error("ACC: load TLS cert/key failed, falling back to self-signed", zap.Error(err))
+			tlsConf = generateTLSConfig()
+		} else {
+			tlsConf = &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"moto-accel"}}
+		}
+	} else {
+		tlsConf = generateTLSConfig()
+	}
 	ln, err := quic.ListenAddr(m.cfg.Listen, tlsConf, nil)
 	if err != nil {
 		utils.Logger.Error("ACC: quic listen failed", zap.String("listen", m.cfg.Listen), zap.Error(err))
