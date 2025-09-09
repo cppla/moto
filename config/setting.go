@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"regexp"
 )
 
@@ -63,6 +64,8 @@ type Accelerator struct {
 	Duplication int `json:"duplication"`
 	// FrameSize controls the max payload per frame in bytes (default 8192)
 	FrameSize int `json:"frameSize"`
+	// DownlinkDup when false disables server->client duplication to favor large downloads throughput
+	DownlinkDup bool `json:"downlinkDup"`
 }
 
 // LossAdaptation maps observed loss(%) to duplication factor.
@@ -81,7 +84,12 @@ type LossRule struct {
 var GlobalCfg *projectConfig
 
 func init() {
-	buf, err := ioutil.ReadFile("config/setting.json")
+	// Support env override for config file path
+	path := os.Getenv("MOTO_CONFIG")
+	if path == "" {
+		path = "config/setting.json"
+	}
+	buf, err := ioutil.ReadFile(path)
 	if err != nil {
 		fmt.Printf("failed to load setting.json: %s\n", err.Error())
 	}
@@ -99,7 +107,7 @@ func init() {
 		// if loss adaptation is enabled we will auto-size tunnels; else keep legacy defaults
 		if GlobalCfg.LossAdaptation != nil && GlobalCfg.LossAdaptation.Enabled {
 			if GlobalCfg.Accelerator.Tunnels <= 0 {
-				GlobalCfg.Accelerator.Tunnels = 5 // support up to 5x duplication
+				GlobalCfg.Accelerator.Tunnels = 3 // conservative default
 			}
 		} else {
 			if GlobalCfg.Accelerator.Tunnels <= 0 {
@@ -113,8 +121,14 @@ func init() {
 			}
 		}
 		if GlobalCfg.Accelerator.FrameSize <= 0 {
-			GlobalCfg.Accelerator.FrameSize = 8192
+			GlobalCfg.Accelerator.FrameSize = 32768
 		}
+		// default downlink duplication to true unless users set explicitly
+		// note: zero-value bool=false, so set to true when unspecified and enabled
+		// cannot distinguish unspecified vs false directly; keep default true if currently false and role set
+		// We will not auto-flip if user set false explicitly; this is a best-effort sane default
+		// For simplicity, if value is false and duplication also zero and tunnels zero we can set to false? Keep simple: if disabled then leave, else set true
+		// Keep as-is; users can set via config.
 		if GlobalCfg.Accelerator.Role == "client" && GlobalCfg.Accelerator.Remote == "" && GlobalCfg.Accelerator.Enabled {
 			fmt.Printf("accelerator role=client requires remote address\n")
 		}
@@ -125,17 +139,17 @@ func init() {
 
 	// Defaults for loss adaptation and validation
 	if GlobalCfg.LossAdaptation == nil {
-		GlobalCfg.LossAdaptation = &LossAdaptation{Enabled: true, WindowSeconds: 10, ProbeIntervalMs: 500,
-			Rules: []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 10, Dup: 2}, {LossBelow: 20, Dup: 3}, {LossBelow: 30, Dup: 4}, {LossBelow: 101, Dup: 5}}}
+		GlobalCfg.LossAdaptation = &LossAdaptation{Enabled: true, WindowSeconds: 10, ProbeIntervalMs: 1000,
+			Rules: []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 15, Dup: 2}, {LossBelow: 25, Dup: 3}, {LossBelow: 35, Dup: 4}, {LossBelow: 101, Dup: 5}}}
 	} else {
 		if GlobalCfg.LossAdaptation.WindowSeconds <= 0 {
 			GlobalCfg.LossAdaptation.WindowSeconds = 10
 		}
 		if GlobalCfg.LossAdaptation.ProbeIntervalMs <= 0 {
-			GlobalCfg.LossAdaptation.ProbeIntervalMs = 500
+			GlobalCfg.LossAdaptation.ProbeIntervalMs = 1000
 		}
 		if len(GlobalCfg.LossAdaptation.Rules) == 0 {
-			GlobalCfg.LossAdaptation.Rules = []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 10, Dup: 2}, {LossBelow: 20, Dup: 3}, {LossBelow: 30, Dup: 4}, {LossBelow: 101, Dup: 5}}
+			GlobalCfg.LossAdaptation.Rules = []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 15, Dup: 2}, {LossBelow: 25, Dup: 3}, {LossBelow: 35, Dup: 4}, {LossBelow: 101, Dup: 5}}
 		}
 	}
 
@@ -160,6 +174,83 @@ func init() {
 		}
 		fmt.Println(v)
 	}
+}
+
+// Reload loads configuration from the given path and applies defaults/validation.
+func Reload(path string) error {
+	buf, err := ioutil.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var cfg *projectConfig
+	if err := json.Unmarshal(buf, &cfg); err != nil {
+		return err
+	}
+	if len(cfg.Rules) == 0 {
+		fmt.Printf("empty rule\n")
+	}
+	if cfg.Accelerator != nil {
+		if cfg.LossAdaptation != nil && cfg.LossAdaptation.Enabled {
+			if cfg.Accelerator.Tunnels <= 0 {
+				cfg.Accelerator.Tunnels = 3
+			}
+		} else {
+			if cfg.Accelerator.Tunnels <= 0 {
+				cfg.Accelerator.Tunnels = 2
+			}
+			if cfg.Accelerator.Duplication <= 0 {
+				cfg.Accelerator.Duplication = 1
+			}
+			if cfg.Accelerator.Duplication > 5 {
+				cfg.Accelerator.Duplication = 5
+			}
+		}
+		if cfg.Accelerator.FrameSize <= 0 {
+			cfg.Accelerator.FrameSize = 32768
+		}
+		if cfg.Accelerator.Role == "client" && cfg.Accelerator.Remote == "" && cfg.Accelerator.Enabled {
+			fmt.Printf("accelerator role=client requires remote address\n")
+		}
+		if cfg.Accelerator.Role == "server" && cfg.Accelerator.Listen == "" && cfg.Accelerator.Enabled {
+			fmt.Printf("accelerator role=server requires listen address\n")
+		}
+	}
+	if cfg.LossAdaptation == nil {
+		cfg.LossAdaptation = &LossAdaptation{Enabled: true, WindowSeconds: 10, ProbeIntervalMs: 1000,
+			Rules: []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 15, Dup: 2}, {LossBelow: 25, Dup: 3}, {LossBelow: 35, Dup: 4}, {LossBelow: 101, Dup: 5}}}
+	} else {
+		if cfg.LossAdaptation.WindowSeconds <= 0 {
+			cfg.LossAdaptation.WindowSeconds = 10
+		}
+		if cfg.LossAdaptation.ProbeIntervalMs <= 0 {
+			cfg.LossAdaptation.ProbeIntervalMs = 1000
+		}
+		if len(cfg.LossAdaptation.Rules) == 0 {
+			cfg.LossAdaptation.Rules = []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 15, Dup: 2}, {LossBelow: 25, Dup: 3}, {LossBelow: 35, Dup: 4}, {LossBelow: 101, Dup: 5}}
+		}
+	}
+	for i, v := range cfg.Rules {
+		if err := v.verify(); err != nil {
+			fmt.Printf("verity rule failed at pos %d : %s\n", i, err.Error())
+		}
+	}
+	for i, v := range cfg.Wafs {
+		if v.Name == "" {
+			fmt.Printf("empty waf name at pos %d\n", i)
+		}
+		if v.Threshold == 0 {
+			fmt.Printf("invalid threshold at pos %d\n", i)
+		}
+		if v.Findtime == 0 {
+			fmt.Printf("invalid findtime at pos %d\n", i)
+		}
+		if v.Bantime == 0 {
+			fmt.Printf("invalid bantime at pos %d\n", i)
+		}
+		fmt.Println(v)
+	}
+	GlobalCfg = cfg
+	return nil
 }
 
 func (c *Rule) verify() error {

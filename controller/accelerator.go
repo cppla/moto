@@ -33,6 +33,7 @@ const (
 	flagACK  = 16
 	flagPING = 32
 	flagPONG = 64
+	flagNACK = 128
 )
 
 var magic = [4]byte{'M', 'O', 'T', 'O'}
@@ -91,9 +92,8 @@ type accelManager struct {
 	cfg *config.Accelerator
 
 	// client side fields
-	tunnels    []*accelTunnel
-	tunMu      sync.RWMutex
-	nextTunIdx int
+	tunnels []*accelTunnel
+	tunMu   sync.RWMutex
 
 	// streams on client side: streamID -> *streamConn
 	streams    map[uint32]*streamConn
@@ -111,6 +111,11 @@ type accelManager struct {
 	sentCount int // number of frames actually sent (after duplication)
 	ackCount  int // number of ACK frames received from peer
 	currDup   int // current adaptive duplication (1..5)
+
+	// server-side downlink cache for selective retransmission (NACK)
+	downMu         sync.RWMutex
+	downCache      map[uint32]map[uint32][]byte // streamID -> seq -> payload
+	downCacheFloor map[uint32]uint32            // per stream lowest retained seq for pruning
 }
 
 type accelTunnel struct {
@@ -136,11 +141,13 @@ func InitAccelerator() {
 	}
 	onceAccel.Do(func() {
 		gAccel = &accelManager{
-			cfg:         config.GlobalCfg.Accelerator,
-			streams:     make(map[uint32]*streamConn),
-			upstreams:   make(map[uint32]net.Conn),
-			upExpectSeq: make(map[uint32]uint32),
-			upPending:   make(map[uint32]map[uint32][]byte),
+			cfg:            config.GlobalCfg.Accelerator,
+			streams:        make(map[uint32]*streamConn),
+			upstreams:      make(map[uint32]net.Conn),
+			upExpectSeq:    make(map[uint32]uint32),
+			upPending:      make(map[uint32]map[uint32][]byte),
+			downCache:      make(map[uint32]map[uint32][]byte),
+			downCacheFloor: make(map[uint32]uint32),
 		}
 		if gAccel.cfg.Role == "client" {
 			gAccel.startClient()
@@ -166,6 +173,10 @@ func (m *accelManager) startClient() {
 					utils.Logger.Warn("ACC: dial remote failed", zap.String("remote", m.cfg.Remote), zap.Error(err))
 					time.Sleep(time.Second)
 					continue
+				}
+				// enable TCP_NODELAY
+				if tcp, ok := c.(*net.TCPConn); ok {
+					_ = tcp.SetNoDelay(true)
 				}
 				t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{})}
 				m.tunMu.Lock()
@@ -206,6 +217,9 @@ func (m *accelManager) startServer() {
 			utils.Logger.Error("ACC: accept failed", zap.Error(err))
 			time.Sleep(time.Second)
 			continue
+		}
+		if tcp, ok := c.(*net.TCPConn); ok {
+			_ = tcp.SetNoDelay(true)
 		}
 		t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{})}
 		m.tunMu.Lock()
@@ -276,6 +290,16 @@ func (m *accelManager) handleTunnelClient(t *accelTunnel) {
 		if fr.flags == flagDATA || fr.flags == flagFIN {
 			_ = sendOnTunnel(t, frame{flags: flagACK, streamID: fr.streamID, seq: fr.seq})
 		}
+		// if we see a gap for this stream, issue NACK asking for next expected seq
+		if fr.flags == flagDATA {
+			sc.readMu.Lock()
+			expect := sc.readSeq
+			if fr.seq > expect {
+				// request retransmission of the missing seq 'expect'
+				_ = sendOnTunnel(t, frame{flags: flagNACK, streamID: fr.streamID, seq: expect})
+			}
+			sc.readMu.Unlock()
+		}
 		sc.onFrame(fr)
 	}
 }
@@ -313,11 +337,37 @@ func (m *accelManager) handleTunnelServer(t *accelTunnel) {
 			}
 			// write to upstream in order by seq
 			m.writeInOrderServer(fr.streamID, up, fr.seq, fr.payload)
+		case flagNACK:
+			// client requests retransmission of seq=fr.seq for stream
+			sid := fr.streamID
+			seq := fr.seq
+			m.downMu.RLock()
+			if cache, ok := m.downCache[sid]; ok {
+				if pld, ok2 := cache[seq]; ok2 {
+					// retransmit on primary (t) to reduce duplication
+					_ = sendOnTunnel(t, frame{flags: flagDATA, streamID: sid, seq: seq, payload: pld})
+				}
+			}
+			m.downMu.RUnlock()
 		case flagACK:
 			// ACK for our downlink frames -> update stats
 			m.statsMu.Lock()
 			m.ackCount++
 			m.statsMu.Unlock()
+			// prune cache for stream up to acked seq
+			sid := fr.streamID
+			acked := fr.seq
+			m.downMu.Lock()
+			floor := m.downCacheFloor[sid]
+			if acked >= floor {
+				if cache, ok := m.downCache[sid]; ok {
+					for s := floor; s <= acked; s++ {
+						delete(cache, s)
+					}
+				}
+				m.downCacheFloor[sid] = acked + 1
+			}
+			m.downMu.Unlock()
 		case flagPING:
 			// echo back PONG
 			_ = sendOnTunnel(t, frame{flags: flagPONG, streamID: fr.streamID, seq: fr.seq, payload: fr.payload})
@@ -336,6 +386,11 @@ func (m *accelManager) handleTunnelServer(t *accelTunnel) {
 			delete(m.upExpectSeq, fr.streamID)
 			delete(m.upPending, fr.streamID)
 			m.upMu.Unlock()
+			// clear downlink cache for this stream
+			m.downMu.Lock()
+			delete(m.downCache, fr.streamID)
+			delete(m.downCacheFloor, fr.streamID)
+			m.downMu.Unlock()
 		}
 	}
 }
@@ -346,6 +401,9 @@ func (m *accelManager) acceptUpstream(streamID uint32, addr string, t *accelTunn
 		// send RST back on the same tunnel
 		_ = sendOnTunnel(t, frame{flags: flagRST, streamID: streamID, seq: 0, payload: nil})
 		return
+	}
+	if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
 	}
 	m.upMu.Lock()
 	m.upstreams[streamID] = c
@@ -387,6 +445,14 @@ func (m *accelManager) pipeUpToClient(streamID uint32, up net.Conn, t *accelTunn
 		if n > 0 {
 			payload := make([]byte, n)
 			copy(payload, buf[:n])
+			// Cache for possible retransmission
+			m.downMu.Lock()
+			if _, ok := m.downCache[streamID]; !ok {
+				m.downCache[streamID] = make(map[uint32][]byte)
+				m.downCacheFloor[streamID] = seq
+			}
+			m.downCache[streamID][seq] = payload
+			m.downMu.Unlock()
 			// Downlink: duplicate across available tunnels
 			m.dupSendFromServer(frame{flags: flagDATA, streamID: streamID, seq: seq, payload: payload}, t)
 			seq++
@@ -427,10 +493,12 @@ func (m *accelManager) broadcast(fr frame) {
 			tn.wrMu.Unlock()
 		}(t)
 	}
-	// sent accounting (uplink duplicates)
-	m.statsMu.Lock()
-	m.sentCount += len(sel)
-	m.statsMu.Unlock()
+	// sent accounting (uplink DATA/FIN duplicates only)
+	if fr.flags == flagDATA || fr.flags == flagFIN {
+		m.statsMu.Lock()
+		m.sentCount += len(sel)
+		m.statsMu.Unlock()
+	}
 }
 
 // Downlink duplication on server side. Primary is the tunnel where upstream was initiated from, we always include it.
@@ -467,10 +535,12 @@ func (m *accelManager) dupSendFromServer(fr frame, primary *accelTunnel) {
 		_ = writeFrame(tn.conn, fr)
 		tn.wrMu.Unlock()
 	}
-	// sent accounting (downlink duplicates)
-	m.statsMu.Lock()
-	m.sentCount += len(sel)
-	m.statsMu.Unlock()
+	// sent accounting (downlink DATA/FIN duplicates only)
+	if fr.flags == flagDATA || fr.flags == flagFIN {
+		m.statsMu.Lock()
+		m.sentCount += len(sel)
+		m.statsMu.Unlock()
+	}
 }
 
 // selectTopTunnelsByHealth returns top k tunnels ordered by (rttEWMA + jitterEWMA) ascending. Unknown metrics go to the end.
