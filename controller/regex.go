@@ -19,7 +19,7 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 	//获取第一个数据包
 	firstPacket := new(bytes.Buffer)
 	if _, err := io.CopyN(firstPacket, conn, 4096); err != nil {
-		utils.Logger.Error("unable to handle connection, failed to get first packet",
+		utils.Logger.Error("无法处理连接，读取首包失败",
 			zap.String("ruleName", rule.Name),
 			zap.String("remoteAddr", conn.RemoteAddr().String()),
 			zap.Error(err))
@@ -34,7 +34,7 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 		}
 		c, _, err := DialAccelerated(v.Address)
 		if err != nil {
-			utils.Logger.Error("unable to establish connection",
+			utils.Logger.Error("无法建立连接",
 				zap.String("ruleName", rule.Name),
 				zap.String("remoteAddr", conn.RemoteAddr().String()),
 				zap.String("targetAddr", v.Address))
@@ -44,13 +44,13 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 		break
 	}
 	if target == nil {
-		utils.Logger.Error("can't match target , so can't handle connection",
+		utils.Logger.Error("未匹配到任何目标，无法处理连接",
 			zap.String("ruleName", rule.Name),
 			zap.String("remoteAddr", conn.RemoteAddr().String()))
 		return
 	}
 
-	utils.Logger.Debug("establish connection",
+	utils.Logger.Debug("建立连接",
 		zap.String("ruleName", rule.Name),
 		zap.String("remoteAddr", conn.RemoteAddr().String()),
 		zap.String("targetAddr", target.RemoteAddr().String()))

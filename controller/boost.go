@@ -40,12 +40,12 @@ func HandleBoost(conn net.Conn, rule *config.Rule) {
 	case target = <-switchBetter:
 		cancel()
 	case <-dtx.Done():
-		utils.Logger.Error("Boost Decision Failed！All Online Network Disconnect!",
+		utils.Logger.Error("加速决策失败：所有线路均不可用",
 			zap.String("ruleName", rule.Name))
 		return
 	}
 
-	utils.Logger.Debug("ESTABLISHED",
+	utils.Logger.Debug("建立连接",
 		zap.String("ruleName", rule.Name),
 		zap.String("remoteAddr", conn.RemoteAddr().String()),
 		zap.String("targetAddr", target.RemoteAddr().String()),

@@ -132,11 +132,25 @@ type accelTunnel struct {
 	wrMu   sync.Mutex
 	closed chan struct{}
 
+	// human-readable remote peer (addr)
+	peer string
+
 	// health metrics
 	statMu     sync.RWMutex
 	rttEWMA    float64 // ms
 	jitterEWMA float64 // ms
 	samples    int
+}
+
+// snapshotPeers returns a copy of current tunnel peers for logging
+func (m *accelManager) snapshotPeers() []string {
+	m.tunMu.RLock()
+	defer m.tunMu.RUnlock()
+	res := make([]string, 0, len(m.tunnels))
+	for _, t := range m.tunnels {
+		res = append(res, t.peer)
+	}
+	return res
 }
 
 var gAccel *accelManager
@@ -178,14 +192,14 @@ func (m *accelManager) startClient() {
 			for {
 				// pick remote (round-robin over remotes)
 				if len(m.cfg.Remotes) == 0 {
-					utils.Logger.Warn("ACC: no remotes configured")
+					utils.Logger.Warn("ACC: 未配置任何远端 remotes")
 					time.Sleep(time.Second)
 					continue
 				}
 				remote := m.cfg.Remotes[idx%len(m.cfg.Remotes)]
 				c, err := m.dialTransport(remote)
 				if err != nil {
-					utils.Logger.Warn("ACC: dial remote failed", zap.String("remote", remote), zap.Error(err))
+					utils.Logger.Warn("ACC: 拨号远端失败", zap.String("remote", remote), zap.Error(err))
 					time.Sleep(time.Second)
 					continue
 				}
@@ -197,15 +211,15 @@ func (m *accelManager) startClient() {
 						_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 					}
 				}
-				t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{})}
+				t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{}), peer: remote}
 				m.tunMu.Lock()
 				m.tunnels = append(m.tunnels, t)
 				m.tunMu.Unlock()
-				utils.Logger.Info("ACC: tunnel up", zap.String("remote", remote))
+				utils.Logger.Info("ACC: 隧道已建立", zap.String("remote", remote))
 				// start health probing
 				go m.probeTunnel(t)
 				m.handleTunnelClient(t)
-				utils.Logger.Warn("ACC: tunnel down")
+				utils.Logger.Warn("ACC: 隧道断开")
 				c.Close()
 				// remove from slice
 				m.tunMu.Lock()
@@ -231,22 +245,22 @@ func (m *accelManager) startServer() {
 	// TCP server
 	ln, err := net.Listen("tcp", m.cfg.Listen)
 	if err != nil {
-		utils.Logger.Error("ACC: listen failed", zap.String("listen", m.cfg.Listen), zap.Error(err))
+		utils.Logger.Error("ACC: 监听失败 (tcp)", zap.String("listen", m.cfg.Listen), zap.Error(err))
 		return
 	}
-	utils.Logger.Info("ACC: server listening (tcp)", zap.String("listen", m.cfg.Listen))
+	utils.Logger.Info("ACC: 服务器开始监听 (tcp)", zap.String("listen", m.cfg.Listen))
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			utils.Logger.Error("ACC: accept failed", zap.Error(err))
+			utils.Logger.Error("ACC: 接受连接失败", zap.Error(err))
 			time.Sleep(time.Second)
 			continue
 		}
-		t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{})}
+		t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{}), peer: c.RemoteAddr().String()}
 		m.tunMu.Lock()
 		m.tunnels = append(m.tunnels, t)
 		m.tunMu.Unlock()
-		utils.Logger.Info("ACC: server tunnel up", zap.String("peer", c.RemoteAddr().String()))
+		utils.Logger.Info("ACC: 服务器隧道已建立", zap.String("peer", c.RemoteAddr().String()))
 		go func() {
 			// start health probing
 			go m.probeTunnel(t)
@@ -261,7 +275,7 @@ func (m *accelManager) startServer() {
 				}
 			}
 			m.tunMu.Unlock()
-			utils.Logger.Warn("ACC: server tunnel down")
+			utils.Logger.Warn("ACC: 服务器隧道断开")
 		}()
 	}
 }
@@ -511,7 +525,7 @@ func (m *accelManager) broadcast(fr frame) {
 		go func(tn *accelTunnel) {
 			tn.wrMu.Lock()
 			if err := writeFrame(tn.conn, fr); err != nil {
-				utils.Logger.Warn("ACC: write frame failed", zap.Error(err))
+				utils.Logger.Warn("ACC: 写帧失败", zap.Error(err))
 			}
 			tn.wrMu.Unlock()
 		}(t)
@@ -557,7 +571,7 @@ func (m *accelManager) dupSendFromServer(fr frame, primary *accelTunnel) {
 	for _, tn := range sel {
 		tn.wrMu.Lock()
 		if err := writeFrame(tn.conn, fr); err != nil {
-			utils.Logger.Warn("ACC: write frame failed", zap.Error(err))
+			utils.Logger.Warn("ACC: 写帧失败", zap.Error(err))
 		}
 		tn.wrMu.Unlock()
 	}
@@ -710,22 +724,27 @@ func (m *accelManager) startAdaptation() {
 			if newDup > 5 {
 				newDup = 5
 			}
+			peers := m.snapshotPeers()
 			if newDup != prevDup {
-				utils.Logger.Debug("ACC: adapt multiplier",
-					zap.Float64("loss(%)", loss),
-					zap.Int("dup.prev", prevDup),
-					zap.Int("dup.new", newDup),
-					zap.Int("sent", sent),
-					zap.Int("ack", ack),
-					zap.Int("windowSeconds", la.WindowSeconds))
+				utils.Logger.Debug("ACC: 自适应倍率更新",
+					zap.Float64("丢包率(%)", loss),
+					zap.Int("倍率.旧", prevDup),
+					zap.Int("倍率.新", newDup),
+					zap.Int("窗口发送", sent),
+					zap.Int("窗口确认", ack),
+					zap.Int("隧道数", len(peers)),
+					zap.Strings("远端", peers),
+					zap.Int("窗口秒", la.WindowSeconds))
 			} else {
 				// periodic debug even when unchanged
-				utils.Logger.Debug("ACC: adapt tick",
-					zap.Float64("loss(%)", loss),
-					zap.Int("dup", newDup),
-					zap.Int("sent", sent),
-					zap.Int("ack", ack),
-					zap.Int("windowSeconds", la.WindowSeconds))
+				utils.Logger.Debug("ACC: 自适应倍率",
+					zap.Float64("丢包率(%)", loss),
+					zap.Int("倍率", newDup),
+					zap.Int("窗口发送", sent),
+					zap.Int("窗口确认", ack),
+					zap.Int("隧道数", len(peers)),
+					zap.Strings("远端", peers),
+					zap.Int("窗口秒", la.WindowSeconds))
 			}
 			m.statsMu.Lock()
 			m.currDup = newDup
@@ -781,7 +800,7 @@ func DialAccelerated(addr string) (net.Conn, bool, error) {
 			return c, true, nil
 		}
 		// fall back to direct
-		utils.Logger.Warn("ACC: fallback to direct dial", zap.String("addr", addr), zap.Error(err))
+		utils.Logger.Warn("ACC: 回退为直连", zap.String("addr", addr), zap.Error(err))
 	}
 	c, err := net.Dial("tcp", addr)
 	return c, false, err
@@ -957,7 +976,7 @@ func (m *accelManager) startServerQUIC() {
 	if m.cfg.CertificateFile != "" && m.cfg.PrivateKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(m.cfg.CertificateFile, m.cfg.PrivateKeyFile)
 		if err != nil {
-			utils.Logger.Error("ACC: load TLS cert/key failed, falling back to self-signed", zap.Error(err))
+			utils.Logger.Error("ACC: 加载 TLS 证书/私钥失败，回落到自签名", zap.Error(err))
 			tlsConf = generateTLSConfig()
 		} else {
 			tlsConf = &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"moto-accel"}}
@@ -967,28 +986,28 @@ func (m *accelManager) startServerQUIC() {
 	}
 	ln, err := quic.ListenAddr(m.cfg.Listen, tlsConf, nil)
 	if err != nil {
-		utils.Logger.Error("ACC: quic listen failed", zap.String("listen", m.cfg.Listen), zap.Error(err))
+		utils.Logger.Error("ACC: 监听失败 (quic)", zap.String("listen", m.cfg.Listen), zap.Error(err))
 		return
 	}
-	utils.Logger.Info("ACC: server listening (quic)", zap.String("listen", m.cfg.Listen))
+	utils.Logger.Info("ACC: 服务器开始监听 (quic)", zap.String("listen", m.cfg.Listen))
 	for {
 		qc, err := ln.Accept(context.Background())
 		if err != nil {
-			utils.Logger.Error("ACC: quic accept conn failed", zap.Error(err))
+			utils.Logger.Error("ACC: 接受 QUIC 连接失败", zap.Error(err))
 			continue
 		}
 		go func(qc quic.Connection) {
 			for {
 				st, err := qc.AcceptStream(context.Background())
 				if err != nil {
-					utils.Logger.Warn("ACC: quic accept stream end", zap.Error(err))
+					utils.Logger.Warn("ACC: QUIC 流结束", zap.Error(err))
 					return
 				}
-				t := &accelTunnel{conn: &quicStreamConn{conn: qc, stream: st}, rd: bufio.NewReaderSize(st, 64*1024), closed: make(chan struct{})}
+				t := &accelTunnel{conn: &quicStreamConn{conn: qc, stream: st}, rd: bufio.NewReaderSize(st, 64*1024), closed: make(chan struct{}), peer: qc.RemoteAddr().String()}
 				m.tunMu.Lock()
 				m.tunnels = append(m.tunnels, t)
 				m.tunMu.Unlock()
-				utils.Logger.Info("ACC: server tunnel up (quic stream)")
+				utils.Logger.Info("ACC: 服务器隧道已建立 (quic stream)")
 				go func(tt *accelTunnel) {
 					go m.probeTunnel(tt)
 					m.handleTunnelServer(tt)
@@ -1001,7 +1020,7 @@ func (m *accelManager) startServerQUIC() {
 						}
 					}
 					m.tunMu.Unlock()
-					utils.Logger.Warn("ACC: server tunnel down (quic stream)")
+					utils.Logger.Warn("ACC: 服务器隧道断开 (quic stream)")
 				}(t)
 			}
 		}(qc)

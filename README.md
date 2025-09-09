@@ -47,25 +47,22 @@
     "rules": [
       {"lossBelow": 0.5,  "dup": 1},
       {"lossBelow": 5,    "dup": 2},
-      {"lossBelow": 10,   "dup": 3},
-      {"lossBelow": 20,   "dup": 4},
-      {"lossBelow": 101,  "dup": 5}
+  {"lossBelow": 10,   "dup": 3},
+  {"lossBelow": 20,   "dup": 4},
+  {"lossBelow": 101,  "dup": 5}
     ]
   }
 }
 ```
 - 启用自适应后无需手动设置 tunnels，系统会根据映射选择发送倍率，并基于 RTT/抖动择优隧道。
 
-## 运行与帮助
+## 运行
 - 加速服务器（server 侧）：
   - `accelerator.enabled=true`，`role=server`，`listen=":9900"`
 - 加速客户端（client 侧）：
   - `accelerator.enabled=true`，`role=client`，`remotes=["<server-ip-1>:9900","<server-ip-2>:9900"]`
   - 四种转发规则仍在客户端监听入口；出站改走隧道复用流
-- 查看帮助：
-```bash
-./moto --help
-```
+  - 使用 `--config` 指定配置文件，或通过环境变量 `MOTO_CONFIG` 指向配置路径。
 
 ## QUIC 模式快速上手
 
@@ -78,9 +75,9 @@
     "listen": ":9900",
     "tunnels": 3,
     "frameSize": 32768,
-  "transport": "quic",
-  "certificate-file": "/etc/nginx/41.pem",
-  "private-key-file": "/etc/nginx/41.key"
+    "transport": "quic",
+    "certificate-file": "/etc/nginx/41.pem",
+    "private-key-file": "/etc/nginx/41.key"
   },
   "rules": []
 }
@@ -111,7 +108,7 @@
 
 本地验证（一个终端运行 server，一个终端运行 client，再起一个目标服务）：
 - 放行/可用 UDP 9900（QUIC 使用 UDP）。
-- 分别以 `--config` 指向上述 JSON 运行，两侧都打印出 “server/client tunnel up (quic)” 日志后，用 `nc` 向客户端监听端口发数据，在目标侧能看到收到的数据。
+- 分别以 `--config` 指向上述 JSON 运行，两侧都打印出 “ACC: 服务器隧道已建立 (quic stream)”（服务端）/ “ACC: 隧道已建立”（客户端）日志后，用 `nc` 向客户端监听端口发数据，在目标侧能看到收到的数据。
 
 ## 多路径最佳实践（remotes）
 - 选择“不同网络路径”的远端：
@@ -138,8 +135,8 @@
 
 ## 验证清单
 - 启动日志出现：
-  - server: `ACC: server listening (tcp|quic)` 以及 `server tunnel up`（QUIC 模式下为 stream）。
-  - client: `ACC: tunnel up`，并周期打印健康度/自适应调节 debug 日志。
+  - server: `ACC: 服务器开始监听 (tcp|quic)` 以及 `ACC: 服务器隧道已建立 (quic stream)`。
+  - client: `ACC: 隧道已建立`，并周期打印健康度/自适应调节日志（`ACC: 自适应倍率/自适应倍率更新`）。
 - 业务连通：通过客户端规则监听端口发起连接，目标后端有流量，客户端日志可见 ACK/NACK 正常往返。
 
 

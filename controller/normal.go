@@ -17,7 +17,7 @@ func HandleNormal(conn net.Conn, rule *config.Rule) {
 	for _, v := range rule.Targets {
 		c, _, err := DialAccelerated(v.Address)
 		if err != nil {
-			utils.Logger.Error("unable to establish connection, try next target",
+			utils.Logger.Error("无法建立连接，尝试下一个目标",
 				zap.String("ruleName", rule.Name),
 				zap.String("remoteAddr", conn.RemoteAddr().String()),
 				zap.String("targetAddr", v.Address))
@@ -27,12 +27,12 @@ func HandleNormal(conn net.Conn, rule *config.Rule) {
 		break
 	}
 	if target == nil {
-		utils.Logger.Error("all targets connected failed，so can't to handle connection",
+		utils.Logger.Error("所有目标均连接失败，无法处理连接",
 			zap.String("ruleName", rule.Name),
 			zap.String("remoteAddr", conn.RemoteAddr().String()))
 		return
 	}
-	utils.Logger.Debug("establish connection",
+	utils.Logger.Debug("建立连接",
 		zap.String("ruleName", rule.Name),
 		zap.String("remoteAddr", conn.RemoteAddr().String()),
 		zap.String("targetAddr", target.RemoteAddr().String()))

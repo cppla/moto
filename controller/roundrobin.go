@@ -26,7 +26,7 @@ func HandleRoundrobin(conn net.Conn, rule *config.Rule) {
 	roundrobinBegin := time.Now()
 	target, _, err := DialAccelerated(v.Address)
 	if err != nil {
-		utils.Logger.Error("unable to establish connection, Smart switch boost mode",
+		utils.Logger.Error("无法建立连接，切换到 boost 模式",
 			zap.String("ruleName", rule.Name),
 			zap.String("remoteAddr", conn.RemoteAddr().String()),
 			zap.String("targetAddr", v.Address),
@@ -34,7 +34,7 @@ func HandleRoundrobin(conn net.Conn, rule *config.Rule) {
 		HandleBoost(conn, rule)
 		return
 	}
-	utils.Logger.Debug("establish connection",
+	utils.Logger.Debug("建立连接",
 		zap.String("ruleName", rule.Name),
 		zap.String("remoteAddr", conn.RemoteAddr().String()),
 		zap.String("targetAddr", target.RemoteAddr().String()),
