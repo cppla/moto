@@ -1,144 +1,99 @@
 # Moto
-端口转发、正则匹配[端口复用]转发、智能加速、轮询加速。TCP转发，零拷贝转发。    
-high-speed motorcycle，可以上高速的摩托车🏍️～      
 
-# Usage    
-```diff
-普通模式[normal]：逐一连接目标地址，成功为止       
-正则模式[regex]：利用正则匹配第一个数据报文来实现端口复用      
-智能加速[boost]：多线路多TCP主动竞争最优TCP通道，大幅降低网络丢包、中断、切换、出口高低峰的影响!    
-轮询模式[roundrobin]：分散连接到所有目标地址    
-```
+端口转发、正则匹配[端口复用]转发、智能加速、轮询加速。支持零拷贝转发与弱网加速（多隧道复用 + 自适应多倍发送）。high-speed motorcycle，可以上高速的摩托车🏍️～
 
-#### 智能加速模式演示，自动择路    
+## 特性
+- 四种模式：normal / regex / boost / roundrobin
+- 弱网加速：
+  - 持久多 TCP 隧道 + 多路复用，避免频繁建连
+  - 双向“暴力发包”：上行/下行均可多倍重复发送（1~5x）
+  - 自适应倍率：根据观测丢包率动态选择 1~5 倍；无需手动设置 duplication
+  - 健康度优选：基于 RTT/抖动（EWMA）选择更健康的隧道作为主路径
+- 正则端口复用：基于首包正则，按协议特征路由不同后端
 
-```bash
-`work from home(china telecom)`:
-{"level":"debug","ts":"2022-06-08 12:17:59.444","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49751","targetAddr":"47.241.9.9 [新加坡 阿里云] :85","decisionTime(ms)":79}
-{"level":"debug","ts":"2022-06-08 12:18:05.050","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49774","targetAddr":"47.241.9.9 [新加坡 阿里云] :85","decisionTime(ms)":81}
-{"level":"debug","ts":"2022-06-08 12:18:05.493","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49783","targetAddr":"34.124.1.1 [美国 得克萨斯州] :85","decisionTime(ms)":75}
-{"level":"debug","ts":"2022-06-08 12:18:05.838","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49792","targetAddr":"47.241.9.9 [新加坡 阿里云] :85","decisionTime(ms)":84}
-{"level":"debug","ts":"2022-06-08 12:18:05.838","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49790","targetAddr":"47.241.9.9 [新加坡 阿里云] :85","decisionTime(ms)":84}
-{"level":"debug","ts":"2022-06-08 12:18:09.176","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :49810","targetAddr":"34.124.1.1 [美国 得克萨斯州] :85","decisionTime(ms)":81}
+## 模式说明
+- normal：按 targets 顺序逐一尝试，首个连通即转发
+- regex：读取首包，在 `targets[].regexp` 中匹配成功者即转发
+- boost：对所有 targets 并发拨号，谁先连上用谁
+- roundrobin：轮询选择一个 target，失败可回落至 boost
 
-`in office(china unicom)`:
-{"level":"debug","ts":"2022-06-09 19:24:43.216","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :63847","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":66}
-{"level":"debug","ts":"2022-06-09 19:24:49.412","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :63878","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":49}
-{"level":"debug","ts":"2022-06-09 19:24:57.356","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :63905","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":55}
-{"level":"debug","ts":"2022-06-09 19:27:06.394","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :64245","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":51}
-{"level":"debug","ts":"2022-06-09 19:27:07.666","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :64255","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":55}
-{"level":"debug","ts":"2022-06-09 19:27:07.666","msg":"establish connection","ruleName":"智能加速","remoteAddr":"127.0.0.1 [本机地址] :64256","targetAddr":"119.28.5.2 [香港 腾讯云] :85","decisionTime(ms)":55}
-```
+以上四种模式在“启用加速器 client 角色”时，实际对后端的连接通过“复用流”走持久隧道，由“加速器 server 角色”代拨目标，达到复用与弱网加速效果。
 
-#### 常见协议正则表达式      
-|协议|正则表达式|
-| --- | ---|
-|HTTP|^(GET\|POST\|HEAD\|DELETE\|PUT\|CONNECT\|OPTIONS\|TRACE)|
-|SSH|^SSH|
-|HTTPS(SSL)|^\x16\x03|
-|RDP|^\x03\x00\x00|
-|SOCKS5|^\x05|
-|HTTP代理|(^CONNECT)\|(Proxy-Connection:)|
+## 自适应发包倍率（默认映射）
+- 丢包率 < 1%  -> 1x
+- 丢包率 < 10% -> 2x
+- 丢包率 < 20% -> 3x
+- 丢包率 < 30% -> 4x
+- 丢包率 ≥ 30% -> 5x
 
-1、复制到JSON中记得注意特殊符号，例如^\\x16\\x03得改成^\\\\x16\\\\x03**     
-2、正则模式的原理是根据客户端建立连接后第一个数据包的特征进行判断是什么协议，该方式不支持连接建立之后服务器主动握手的协议，例如VNC，FTP，MYSQL，被动SSH等。**
+说明：系统在固定时间窗内统计“发送帧数 vs 收到 ACK 帧数”估算丢包率，并按映射选择新的倍率；上下行均生效。倍率上限为 5。
 
-# Example    
-```
+## 配置（片段）
+```json
 {
-  "log": {
-    "level": "info",
-    "path": "./moto.log",
-    "version": "1.0.0",
-    "date": "2022-06-08"
+  "accelerator": {
+    "enabled": true,
+    "role": "client",
+    "remote": "1.2.3.4:9900",
+    "listen": ":9900",
+    "tunnels": 0,
+    "duplication": 0,
+    "frameSize": 8192
   },
-  "rules": [
-    {
-      "name": "普通模式",
-      "listen": ":81",
-      "mode": "normal",
-      "timeout": 3000,
-      "blacklist": null,
-      "targets": [
-        {
-          "address": "1.1.1.1:85"
-        },
-        {
-          "address": "2.2.2.2:85"
-        }
-      ]
-    },
-    {
-      "name": "正则模式",
-      "listen": ":82",
-      "mode": "regex",
-      "timeout": 3000,
-      "blacklist": null,
-      "targets": [
-        {
-          "regexp": "^(GET|POST|HEAD|DELETE|PUT|CONNECT|OPTIONS|TRACE)",
-          "address": "1.1.1.1:80"
-        },
-        {
-          "regexp": "^SSH",
-          "address": "2.2.2.2:22"
-        }
-      ]
-    },
-    {
-      "name": "智能加速",
-      "listen": ":83",
-      "mode": "boost",
-      "timeout": 150,
-      "blacklist": null,
-      "targets": [
-        {
-          "address": "1.1.1.1:85"
-        },
-        {
-          "address": "2.2.2.2:85"
-        }
-      ]
-    },
-    {
-      "name": "轮询模式",
-      "listen": ":84",
-      "mode": "roundrobin",
-      "timeout": 150,
-      "blacklist": null,
-      "targets": [
-        {
-          "address": "1.1.1.1:85"
-        },
-        {
-          "address": "2.2.2.2:85"
-        }
-      ]
-    }
-  ]
+  "lossAdaptation": {
+    "enabled": true,
+    "windowSeconds": 10,
+    "probeIntervalMs": 500,
+    "rules": [
+      {"lossBelow": 1,  "dup": 1},
+      {"lossBelow": 10, "dup": 2},
+      {"lossBelow": 20, "dup": 3},
+      {"lossBelow": 30, "dup": 4},
+      {"lossBelow": 101, "dup": 5}
+    ]
+  }
 }
 ```
+- 启用自适应后无需手动设置 tunnels/duplication，系统会根据映射选择发送倍率，并基于 RTT/抖动择优隧道。
 
+## 运行与帮助
+- 加速服务器（server 侧）：
+  - `accelerator.enabled=true`，`role=server`，`listen=":9900"`
+- 加速客户端（client 侧）：
+  - `accelerator.enabled=true`，`role=client`，`remote="<server-ip>:9900"`
+  - 四种转发规则仍在客户端监听入口；出站改走隧道复用流
+- 查看帮助：
+```bash
+./moto --help
+```
 
-# Build    
-#### build for linux    
+## 常见协议正则表达式
+| 协议 | 正则 |
+| --- | --- |
+| HTTP | ^(GET|POST|HEAD|DELETE|PUT|CONNECT|OPTIONS|TRACE) |
+| HTTP代理 | (^CONNECT)|(Proxy-Connection:) |
 
-CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo   
-
-#### build for macos
-
+## 构建
+- linux：
+```bash
+CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo
+```
+- macOS：
+```bash
 CGO_ENABLED=0 GOOS=darwin go build -a -installsuffix cgo
+```
+- windows：
+```bash
+CGO_ENABLED=0 GOOS=windows go build -a -installsuffix cgo
+```
 
-#### build for windows 
+## 设计要点
+- 帧协议（SYN/DATA/FIN/ACK/PING/PONG），支持乱序重组与重复去重
+- 自适应窗口统计 sent/ack 估算丢包率，按规则设定 1..5 倍重复
+- 健康度：基于 RTT 与抖动的 EWMA 作为评分，优先选择更健康隧道
 
-CGO_ENABLED=0 GOOS=windows go build -a -installsuffix cgo    
-
-# Make Better        
-
-* todo
-* better way for tcp relay: https://hostloc.com/thread-969397-1-1.html
-* switcher: https://github.com/crabkun/switcher
-
-# Jetbrains    
-
-<a href="https://www.jetbrains.com/?from=cppla"><img src="https://resources.jetbrains.com/storage/products/company/brand/logos/jb_square.png" width="100px"></a>
+## 参考与致谢
+- better way for tcp relay: https://hostloc.com/thread-969397-1-1.html
+- switcher: https://github.com/crabkun/switcher
+- JetBrains: 
+  <a href="https://www.jetbrains.com/?from=cppla"><img src="https://resources.jetbrains.com/storage/products/company/brand/logos/jb_square.png" width="100px"></a>

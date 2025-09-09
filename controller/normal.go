@@ -1,11 +1,12 @@
 package controller
 
 import (
-	"go.uber.org/zap"
 	"io"
 	"moto/config"
 	"moto/utils"
 	"net"
+
+	"go.uber.org/zap"
 )
 
 func HandleNormal(conn net.Conn, rule *config.Rule) {
@@ -14,7 +15,7 @@ func HandleNormal(conn net.Conn, rule *config.Rule) {
 	var target net.Conn
 	//正常模式下挨个连接直到成功连接
 	for _, v := range rule.Targets {
-		c, err := net.Dial("tcp", v.Address)
+		c, _, err := DialAccelerated(v.Address)
 		if err != nil {
 			utils.Logger.Error("unable to establish connection, try next target",
 				zap.String("ruleName", rule.Name),

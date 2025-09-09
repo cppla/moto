@@ -90,4 +90,26 @@
       ]
     }
   ]
+  ,
+  "accelerator": {
+    "enabled": false,
+    "role": "client",
+    "remote": "127.0.0.1:9900",
+    "listen": ":9900",
+    "tunnels": 0,
+    "duplication": 0,
+    "frameSize": 8192
+  },
+  "lossAdaptation": {
+    "enabled": true,
+    "windowSeconds": 10,
+    "probeIntervalMs": 500,
+    "rules": [
+      {"lossBelow": 1,  "dup": 1},
+      {"lossBelow": 10, "dup": 2},
+      {"lossBelow": 20, "dup": 3},
+      {"lossBelow": 30, "dup": 4},
+      {"lossBelow": 101, "dup": 5}
+    ]
+  }
 }

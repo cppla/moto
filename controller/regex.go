@@ -2,12 +2,13 @@ package controller
 
 import (
 	"bytes"
-	"go.uber.org/zap"
 	"io"
 	"moto/config"
 	"moto/utils"
 	"net"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 func HandleRegexp(conn net.Conn, rule *config.Rule) {
@@ -31,7 +32,7 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 		if !v.Re.Match(firstPacket.Bytes()) {
 			continue
 		}
-		c, err := net.Dial("tcp", v.Address)
+		c, _, err := DialAccelerated(v.Address)
 		if err != nil {
 			utils.Logger.Error("unable to establish connection",
 				zap.String("ruleName", rule.Name),

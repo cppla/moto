@@ -1,19 +1,20 @@
 package utils
 
 import (
+	"moto/config"
+	"time"
+
 	"github.com/natefinch/lumberjack"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"moto/config"
-	"time"
 )
 
 var (
 	Logger *zap.Logger
 )
 
-func init()  {
-	highPriority := zap.LevelEnablerFunc(func(lvl zapcore.Level) bool{
+func init() {
+	highPriority := zap.LevelEnablerFunc(func(lvl zapcore.Level) bool {
 		return lvl >= levelMap[config.GlobalCfg.Log.Level]
 	})
 
@@ -32,16 +33,15 @@ func init()  {
 	//consoles := zapcore.AddSync(os.Stdout)
 	files := zapcore.AddSync(&hook)
 
-
 	encoderConfig := zapcore.EncoderConfig{
-		TimeKey:        "ts",
-		LevelKey:       "level",
-		NameKey:        "logger",
+		TimeKey:  "ts",
+		LevelKey: "level",
+		NameKey:  "logger",
 		//CallerKey:      "caller",
-		MessageKey:     "msg",
-		StacktraceKey:  "stacktrace",
-		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.LowercaseLevelEncoder,
+		MessageKey:    "msg",
+		StacktraceKey: "stacktrace",
+		LineEnding:    zapcore.DefaultLineEnding,
+		EncodeLevel:   zapcore.LowercaseLevelEncoder,
 		//EncodeLevel:	zapcore.CapitalColorLevelEncoder,
 		EncodeTime:     TimeEncoder,
 		EncodeDuration: zapcore.SecondsDurationEncoder,
@@ -76,3 +76,7 @@ var levelMap = map[string]zapcore.Level{
 func TimeEncoder(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
 	enc.AppendString(t.Format("2006-01-02 15:04:05.000"))
 }
+
+// optional helpers for structured fields (used in some modules)
+func ZapString(k, v string) zap.Field { return zap.String(k, v) }
+func ZapErr(err error) zap.Field      { return zap.Error(err) }
