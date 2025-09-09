@@ -94,23 +94,23 @@
   "accelerator": {
     "enabled": false,
     "role": "client",
-    "remote": "127.0.0.1:9900",
+    "remotes": ["127.0.0.1:9900"],
     "listen": ":9900",
     "tunnels": 3,
     "duplication": 0,
     "frameSize": 32768,
-    "downlinkDup": false
+    "transport": "tcp"
   },
   "lossAdaptation": {
     "enabled": true,
     "windowSeconds": 10,
     "probeIntervalMs": 1000,
     "rules": [
-      {"lossBelow": 1,  "dup": 1},
-      {"lossBelow": 15, "dup": 2},
-      {"lossBelow": 25, "dup": 3},
-      {"lossBelow": 35, "dup": 4},
-      {"lossBelow": 101, "dup": 5}
+      {"lossBelow": 0.5,  "dup": 1},
+      {"lossBelow": 5,    "dup": 2},
+      {"lossBelow": 10,   "dup": 3},
+      {"lossBelow": 20,   "dup": 4},
+      {"lossBelow": 101,  "dup": 5}
     ]
   }
 }

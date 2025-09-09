@@ -2,10 +2,17 @@ package controller
 
 import (
 	"bufio"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"moto/config"
 	"moto/utils"
 	"net"
@@ -13,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	quic "github.com/quic-go/quic-go"
 	"go.uber.org/zap"
 )
 
@@ -119,7 +127,7 @@ type accelManager struct {
 }
 
 type accelTunnel struct {
-	conn   net.Conn
+	conn   io.ReadWriteCloser
 	rd     *bufio.Reader
 	wrMu   sync.Mutex
 	closed chan struct{}
@@ -168,21 +176,24 @@ func (m *accelManager) startClient() {
 	for i := 0; i < n; i++ {
 		go func(idx int) {
 			for {
-				c, err := net.Dial("tcp", m.cfg.Remote)
-				if err != nil {
-					utils.Logger.Warn("ACC: dial remote failed", zap.String("remote", m.cfg.Remote), zap.Error(err))
+				// pick remote (round-robin over remotes)
+				if len(m.cfg.Remotes) == 0 {
+					utils.Logger.Warn("ACC: no remotes configured")
 					time.Sleep(time.Second)
 					continue
 				}
-				// enable TCP_NODELAY
-				if tcp, ok := c.(*net.TCPConn); ok {
-					_ = tcp.SetNoDelay(true)
+				remote := m.cfg.Remotes[idx%len(m.cfg.Remotes)]
+				c, err := m.dialTransport(remote)
+				if err != nil {
+					utils.Logger.Warn("ACC: dial remote failed", zap.String("remote", remote), zap.Error(err))
+					time.Sleep(time.Second)
+					continue
 				}
 				t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{})}
 				m.tunMu.Lock()
 				m.tunnels = append(m.tunnels, t)
 				m.tunMu.Unlock()
-				utils.Logger.Info("ACC: tunnel up", zap.String("remote", c.RemoteAddr().String()))
+				utils.Logger.Info("ACC: tunnel up", zap.String("remote", remote))
 				// start health probing
 				go m.probeTunnel(t)
 				m.handleTunnelClient(t)
@@ -205,21 +216,23 @@ func (m *accelManager) startClient() {
 
 // Server: accept tunnels
 func (m *accelManager) startServer() {
+	if m.cfg.Transport == "quic" {
+		m.startServerQUIC()
+		return
+	}
+	// TCP server
 	ln, err := net.Listen("tcp", m.cfg.Listen)
 	if err != nil {
 		utils.Logger.Error("ACC: listen failed", zap.String("listen", m.cfg.Listen), zap.Error(err))
 		return
 	}
-	utils.Logger.Info("ACC: server listening", zap.String("listen", m.cfg.Listen))
+	utils.Logger.Info("ACC: server listening (tcp)", zap.String("listen", m.cfg.Listen))
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			utils.Logger.Error("ACC: accept failed", zap.Error(err))
 			time.Sleep(time.Second)
 			continue
-		}
-		if tcp, ok := c.(*net.TCPConn); ok {
-			_ = tcp.SetNoDelay(true)
 		}
 		t := &accelTunnel{conn: c, rd: bufio.NewReaderSize(c, 64*1024), closed: make(chan struct{})}
 		m.tunMu.Lock()
@@ -509,7 +522,8 @@ func (m *accelManager) dupSendFromServer(fr frame, primary *accelTunnel) {
 	if len(tunnels) == 0 {
 		return
 	}
-	dup := m.getDuplication()
+	// Requirement: disable downlink duplication entirely
+	dup := 1
 	// order by health, ensure primary included
 	sel := selectTopTunnelsByHealth(tunnels, dup)
 	includedPrimary := false
@@ -899,3 +913,106 @@ type dummyAddr string
 
 func (d dummyAddr) Network() string { return string(d) }
 func (d dummyAddr) String() string  { return string(d) }
+
+// dialTransport dials a tunnel using configured transport. Currently supports tcp; quic is stubbed to tcp fallback.
+func (m *accelManager) dialTransport(remote string) (io.ReadWriteCloser, error) {
+	if m.cfg.Transport == "" || m.cfg.Transport == "tcp" {
+		c, err := net.Dial("tcp", remote)
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	if m.cfg.Transport == "quic" {
+		tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"moto-accel"}}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		qc, err := quic.DialAddr(ctx, remote, tlsConf, nil)
+		if err != nil {
+			return nil, err
+		}
+		st, err := qc.OpenStreamSync(ctx)
+		if err != nil {
+			_ = qc.CloseWithError(0, "open stream failed")
+			return nil, err
+		}
+		return &quicStreamConn{conn: qc, stream: st}, nil
+	}
+	return nil, fmt.Errorf("unsupported transport: %s", m.cfg.Transport)
+}
+
+// QUIC server listener: accept connections and streams, each stream is a tunnel
+func (m *accelManager) startServerQUIC() {
+	tlsConf := generateTLSConfig()
+	ln, err := quic.ListenAddr(m.cfg.Listen, tlsConf, nil)
+	if err != nil {
+		utils.Logger.Error("ACC: quic listen failed", zap.String("listen", m.cfg.Listen), zap.Error(err))
+		return
+	}
+	utils.Logger.Info("ACC: server listening (quic)", zap.String("listen", m.cfg.Listen))
+	for {
+		qc, err := ln.Accept(context.Background())
+		if err != nil {
+			utils.Logger.Error("ACC: quic accept conn failed", zap.Error(err))
+			continue
+		}
+		go func(qc quic.Connection) {
+			for {
+				st, err := qc.AcceptStream(context.Background())
+				if err != nil {
+					utils.Logger.Warn("ACC: quic accept stream end", zap.Error(err))
+					return
+				}
+				t := &accelTunnel{conn: &quicStreamConn{conn: qc, stream: st}, rd: bufio.NewReaderSize(st, 64*1024), closed: make(chan struct{})}
+				m.tunMu.Lock()
+				m.tunnels = append(m.tunnels, t)
+				m.tunMu.Unlock()
+				utils.Logger.Info("ACC: server tunnel up (quic stream)")
+				go func(tt *accelTunnel) {
+					go m.probeTunnel(tt)
+					m.handleTunnelServer(tt)
+					// on return, remove
+					m.tunMu.Lock()
+					for i := range m.tunnels {
+						if m.tunnels[i] == tt {
+							m.tunnels = append(m.tunnels[:i], m.tunnels[i+1:]...)
+							break
+						}
+					}
+					m.tunMu.Unlock()
+					utils.Logger.Warn("ACC: server tunnel down (quic stream)")
+				}(t)
+			}
+		}(qc)
+	}
+}
+
+type quicStreamConn struct {
+	conn   quic.Connection
+	stream quic.Stream
+}
+
+func (q *quicStreamConn) Read(p []byte) (int, error)  { return q.stream.Read(p) }
+func (q *quicStreamConn) Write(p []byte) (int, error) { return q.stream.Write(p) }
+func (q *quicStreamConn) Close() error {
+	_ = q.stream.Close()
+	return q.conn.CloseWithError(0, "closed")
+}
+
+// generateTLSConfig creates a self-signed cert for QUIC server
+func generateTLSConfig() *tls.Config {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	serialNumber, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+	tmpl := x509.Certificate{
+		SerialNumber:          serialNumber,
+		Subject:               pkix.Name{Organization: []string{"moto"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, _ := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"moto-accel"}}
+}

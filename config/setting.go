@@ -54,8 +54,8 @@ type Rule struct {
 type Accelerator struct {
 	Enabled bool   `json:"enabled"`
 	Role    string `json:"role"` // client | server
-	// For client role: Remote is the address of the accelerator server, e.g. "1.2.3.4:9900"
-	Remote string `json:"remote"`
+	// Client role: multiple remote endpoints for multi-path
+	Remotes []string `json:"remotes"`
 	// For server role: Listen is the address for accelerator server to listen on, e.g. ":9900"
 	Listen string `json:"listen"`
 	// Number of persistent TCP tunnels between client and server (auto if loss adaptation enabled)
@@ -64,8 +64,8 @@ type Accelerator struct {
 	Duplication int `json:"duplication"`
 	// FrameSize controls the max payload per frame in bytes (default 8192)
 	FrameSize int `json:"frameSize"`
-	// DownlinkDup when false disables server->client duplication to favor large downloads throughput
-	DownlinkDup bool `json:"downlinkDup"`
+	// Transport selects tunnel transport: "tcp" (default) or "quic"
+	Transport string `json:"transport"`
 }
 
 // LossAdaptation maps observed loss(%) to duplication factor.
@@ -127,10 +127,11 @@ func init() {
 		// note: zero-value bool=false, so set to true when unspecified and enabled
 		// cannot distinguish unspecified vs false directly; keep default true if currently false and role set
 		// We will not auto-flip if user set false explicitly; this is a best-effort sane default
-		// For simplicity, if value is false and duplication also zero and tunnels zero we can set to false? Keep simple: if disabled then leave, else set true
-		// Keep as-is; users can set via config.
-		if GlobalCfg.Accelerator.Role == "client" && GlobalCfg.Accelerator.Remote == "" && GlobalCfg.Accelerator.Enabled {
-			fmt.Printf("accelerator role=client requires remote address\n")
+		if GlobalCfg.Accelerator.Transport == "" {
+			GlobalCfg.Accelerator.Transport = "tcp"
+		}
+		if GlobalCfg.Accelerator.Role == "client" && GlobalCfg.Accelerator.Enabled && len(GlobalCfg.Accelerator.Remotes) == 0 {
+			fmt.Printf("accelerator role=client requires remotes\n")
 		}
 		if GlobalCfg.Accelerator.Role == "server" && GlobalCfg.Accelerator.Listen == "" && GlobalCfg.Accelerator.Enabled {
 			fmt.Printf("accelerator role=server requires listen address\n")
@@ -149,7 +150,7 @@ func init() {
 			GlobalCfg.LossAdaptation.ProbeIntervalMs = 1000
 		}
 		if len(GlobalCfg.LossAdaptation.Rules) == 0 {
-			GlobalCfg.LossAdaptation.Rules = []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 15, Dup: 2}, {LossBelow: 25, Dup: 3}, {LossBelow: 35, Dup: 4}, {LossBelow: 101, Dup: 5}}
+			GlobalCfg.LossAdaptation.Rules = []LossRule{{LossBelow: 0.5, Dup: 1}, {LossBelow: 5, Dup: 2}, {LossBelow: 10, Dup: 3}, {LossBelow: 20, Dup: 4}, {LossBelow: 101, Dup: 5}}
 		}
 	}
 
@@ -208,8 +209,8 @@ func Reload(path string) error {
 		if cfg.Accelerator.FrameSize <= 0 {
 			cfg.Accelerator.FrameSize = 32768
 		}
-		if cfg.Accelerator.Role == "client" && cfg.Accelerator.Remote == "" && cfg.Accelerator.Enabled {
-			fmt.Printf("accelerator role=client requires remote address\n")
+		if cfg.Accelerator.Role == "client" && cfg.Accelerator.Enabled && len(cfg.Accelerator.Remotes) == 0 {
+			fmt.Printf("accelerator role=client requires remotes\n")
 		}
 		if cfg.Accelerator.Role == "server" && cfg.Accelerator.Listen == "" && cfg.Accelerator.Enabled {
 			fmt.Printf("accelerator role=server requires listen address\n")
@@ -217,7 +218,7 @@ func Reload(path string) error {
 	}
 	if cfg.LossAdaptation == nil {
 		cfg.LossAdaptation = &LossAdaptation{Enabled: true, WindowSeconds: 10, ProbeIntervalMs: 1000,
-			Rules: []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 15, Dup: 2}, {LossBelow: 25, Dup: 3}, {LossBelow: 35, Dup: 4}, {LossBelow: 101, Dup: 5}}}
+			Rules: []LossRule{{LossBelow: 0.5, Dup: 1}, {LossBelow: 5, Dup: 2}, {LossBelow: 10, Dup: 3}, {LossBelow: 20, Dup: 4}, {LossBelow: 101, Dup: 5}}}
 	} else {
 		if cfg.LossAdaptation.WindowSeconds <= 0 {
 			cfg.LossAdaptation.WindowSeconds = 10
@@ -226,7 +227,7 @@ func Reload(path string) error {
 			cfg.LossAdaptation.ProbeIntervalMs = 1000
 		}
 		if len(cfg.LossAdaptation.Rules) == 0 {
-			cfg.LossAdaptation.Rules = []LossRule{{LossBelow: 1, Dup: 1}, {LossBelow: 15, Dup: 2}, {LossBelow: 25, Dup: 3}, {LossBelow: 35, Dup: 4}, {LossBelow: 101, Dup: 5}}
+			cfg.LossAdaptation.Rules = []LossRule{{LossBelow: 0.5, Dup: 1}, {LossBelow: 5, Dup: 2}, {LossBelow: 10, Dup: 3}, {LossBelow: 20, Dup: 4}, {LossBelow: 101, Dup: 5}}
 		}
 	}
 	for i, v := range cfg.Rules {
