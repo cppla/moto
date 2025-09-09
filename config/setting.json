@@ -89,15 +89,12 @@
         }
       ]
     }
-  ]
-  ,
+  ],
   "accelerator": {
     "enabled": false,
     "role": "client",
     "remotes": ["127.0.0.1:9900"],
     "listen": ":9900",
-    "tunnels": 3,
-    "frameSize": 32768,
     "transport": "tcp",
     "certificate-file": "",
     "private-key-file": ""
@@ -107,11 +104,11 @@
     "windowSeconds": 10,
     "probeIntervalMs": 1000,
     "rules": [
-      {"lossBelow": 0.5,  "dup": 1},
-      {"lossBelow": 5,    "dup": 2},
-      {"lossBelow": 10,   "dup": 2},
-      {"lossBelow": 20,   "dup": 3},
-      {"lossBelow": 101,  "dup": 4}
+  {"lossBelow": 0.5,  "dup": 1, "frameSize": 32768},
+  {"lossBelow": 5,    "dup": 2, "frameSize": 16384},
+  {"lossBelow": 10,   "dup": 2, "frameSize": 16384},
+  {"lossBelow": 20,   "dup": 3, "frameSize": 8192},
+  {"lossBelow": 101,  "dup": 4, "frameSize": 4096}
     ]
   }
 }

@@ -115,15 +115,17 @@ type accelManager struct {
 	upPending   map[uint32]map[uint32][]byte // streamID -> seq -> payload
 
 	// loss/adaptation stats (per process side)
-	statsMu   sync.Mutex
-	sentCount int // number of frames actually sent (including duplicates)
-	ackCount  int // number of ACK frames received from peer
-	currDup   int // current adaptive duplication (1..5)
+	statsMu sync.Mutex
+	currDup int // current adaptive duplication (1..5)
 
 	// server-side downlink cache for selective retransmission (NACK)
 	downMu         sync.RWMutex
 	downCache      map[uint32]map[uint32][]byte // streamID -> seq -> payload
 	downCacheFloor map[uint32]uint32            // per stream lowest retained seq for pruning
+
+	// adaptive frame size
+	dynMu        sync.RWMutex
+	dynFrameSize int
 }
 
 type accelTunnel struct {
@@ -140,6 +142,25 @@ type accelTunnel struct {
 	rttEWMA    float64 // ms
 	jitterEWMA float64 // ms
 	samples    int
+
+	// per-tunnel adaptation stats
+	sentCount int // frames sent (DATA/FIN) via this tunnel in window
+	ackCount  int // ACKs received on this tunnel in window
+	currDup   int // current adaptive multiplier for this tunnel (1..5)
+}
+
+// getDup returns the current per-tunnel multiplier (1..5), defaults to 1
+func (t *accelTunnel) getDup() int {
+	t.statMu.RLock()
+	d := t.currDup
+	t.statMu.RUnlock()
+	if d < 1 {
+		d = 1
+	}
+	if d > 5 {
+		d = 5
+	}
+	return d
 }
 
 // snapshotPeers returns a copy of current tunnel peers for logging
@@ -178,6 +199,11 @@ func InitAccelerator() {
 			go gAccel.startServer()
 			gAccel.startAdaptation()
 		}
+		// init dynamic frame size from baseline (dup==1 rule -> frameSize)
+		fs := gAccel.baseFrameSize()
+		gAccel.dynMu.Lock()
+		gAccel.dynFrameSize = fs
+		gAccel.dynMu.Unlock()
 	})
 }
 
@@ -282,10 +308,7 @@ func (m *accelManager) startServer() {
 
 // client side tunnel reader: delivers frames to streamConns
 func (m *accelManager) handleTunnelClient(t *accelTunnel) {
-	max := m.cfg.FrameSize
-	if max <= 0 {
-		max = 8192
-	}
+	max := m.getReadMax()
 	for {
 		fr, err := readFrame(t.rd, max)
 		if err != nil {
@@ -294,9 +317,10 @@ func (m *accelManager) handleTunnelClient(t *accelTunnel) {
 		}
 		// handle ACK for our uplink frames
 		if fr.flags == flagACK {
-			m.statsMu.Lock()
-			m.ackCount++
-			m.statsMu.Unlock()
+			// uplink ACKs counted per-tunnel
+			t.statMu.Lock()
+			t.ackCount++
+			t.statMu.Unlock()
 			continue
 		}
 		if fr.flags == flagPING {
@@ -341,10 +365,7 @@ func (m *accelManager) handleTunnelClient(t *accelTunnel) {
 
 // server side tunnel reader: handles SYN/Data for upstreams
 func (m *accelManager) handleTunnelServer(t *accelTunnel) {
-	max := m.cfg.FrameSize
-	if max <= 0 {
-		max = 8192
-	}
+	max := m.getReadMax()
 	for {
 		fr, err := readFrame(t.rd, max)
 		if err != nil {
@@ -385,10 +406,10 @@ func (m *accelManager) handleTunnelServer(t *accelTunnel) {
 			}
 			m.downMu.RUnlock()
 		case flagACK:
-			// ACK for our downlink frames -> update stats
-			m.statsMu.Lock()
-			m.ackCount++
-			m.statsMu.Unlock()
+			// ACK for our downlink frames -> per-tunnel stats
+			t.statMu.Lock()
+			t.ackCount++
+			t.statMu.Unlock()
 			// prune cache for stream up to acked seq
 			sid := fr.streamID
 			acked := fr.seq
@@ -470,10 +491,11 @@ func (m *accelManager) acceptUpstream(streamID uint32, addr string, t *accelTunn
 
 func (m *accelManager) pipeUpToClient(streamID uint32, up net.Conn, t *accelTunnel) {
 	// read from upstream and send DATA frames to client (downlink)
-	buf := make([]byte, m.cfg.FrameSize)
-	if len(buf) == 0 {
-		buf = make([]byte, 8192)
+	fs := m.getFrameSize()
+	if fs <= 0 {
+		fs = 8192
 	}
+	buf := make([]byte, fs)
 	var seq uint32 = 1
 	for {
 		n, err := up.Read(buf)
@@ -518,9 +540,16 @@ func (m *accelManager) broadcast(fr frame) {
 	if len(tunnels) == 0 {
 		return
 	}
-	dup := m.getDuplication()
+	// choose max dup among tunnels for uplink send fanout
+	maxDup := 1
+	for _, t := range tunnels {
+		d := t.getDup()
+		if d > maxDup {
+			maxDup = d
+		}
+	}
 	// pick healthiest tunnels first
-	sel := selectTopTunnelsByHealth(tunnels, dup)
+	sel := selectTopTunnelsByHealth(tunnels, maxDup)
 	for _, t := range sel {
 		go func(tn *accelTunnel) {
 			tn.wrMu.Lock()
@@ -528,13 +557,13 @@ func (m *accelManager) broadcast(fr frame) {
 				utils.Logger.Warn("ACC: 写帧失败", zap.Error(err))
 			}
 			tn.wrMu.Unlock()
+			// per-tunnel sent accounting (uplink)
+			if fr.flags == flagDATA || fr.flags == flagFIN {
+				tn.statMu.Lock()
+				tn.sentCount++
+				tn.statMu.Unlock()
+			}
 		}(t)
-	}
-	// sent accounting (uplink DATA/FIN duplicates only)
-	if fr.flags == flagDATA || fr.flags == flagFIN {
-		m.statsMu.Lock()
-		m.sentCount += len(sel)
-		m.statsMu.Unlock()
 	}
 }
 
@@ -546,10 +575,16 @@ func (m *accelManager) dupSendFromServer(fr frame, primary *accelTunnel) {
 	if len(tunnels) == 0 {
 		return
 	}
-	// Requirement: disable downlink duplication entirely
-	dup := 1
+	// Downlink: follow per-tunnel multiplier as uplink (fanout by max dup among tunnels)
+	maxDup := 1
+	for _, t := range tunnels {
+		d := t.getDup()
+		if d > maxDup {
+			maxDup = d
+		}
+	}
 	// order by health, ensure primary included
-	sel := selectTopTunnelsByHealth(tunnels, dup)
+	sel := selectTopTunnelsByHealth(tunnels, maxDup)
 	includedPrimary := false
 	if primary != nil {
 		for _, x := range sel {
@@ -574,12 +609,6 @@ func (m *accelManager) dupSendFromServer(fr frame, primary *accelTunnel) {
 			utils.Logger.Warn("ACC: 写帧失败", zap.Error(err))
 		}
 		tn.wrMu.Unlock()
-	}
-	// sent accounting (downlink DATA/FIN duplicates only)
-	if fr.flags == flagDATA || fr.flags == flagFIN {
-		m.statsMu.Lock()
-		m.sentCount += len(sel)
-		m.statsMu.Unlock()
 	}
 }
 
@@ -694,61 +723,87 @@ func (m *accelManager) startAdaptation() {
 	ticker := time.NewTicker(window)
 	go func() {
 		for range ticker.C {
-			m.statsMu.Lock()
-			sent := m.sentCount
-			ack := m.ackCount
-			m.sentCount = 0
-			m.ackCount = 0
-			prevDup := m.currDup
-			m.statsMu.Unlock()
-			if sent <= 0 {
-				continue
-			}
-			delivered := float64(ack)
-			total := float64(sent)
-			loss := 0.0
-			if delivered < total {
-				loss = (total - delivered) * 100.0 / total
-			}
-			// select dup by rules (assume ascending lossBelow)
-			newDup := 1
-			for _, r := range la.Rules {
-				if loss < r.LossBelow {
-					newDup = r.Dup
-					break
+			// iterate per-tunnel and adapt independently
+			m.tunMu.RLock()
+			list := append([]*accelTunnel(nil), m.tunnels...)
+			m.tunMu.RUnlock()
+			suggestedFS := 0
+			for _, t := range list {
+				t.statMu.Lock()
+				sent := t.sentCount
+				ack := t.ackCount
+				t.sentCount = 0
+				t.ackCount = 0
+				prevDup := t.currDup
+				t.statMu.Unlock()
+				if sent <= 0 {
+					continue
+				}
+				delivered := float64(ack)
+				total := float64(sent)
+				loss := 0.0
+				if delivered < total {
+					loss = (total - delivered) * 100.0 / total
+				}
+				// select dup by rules (assume ascending lossBelow)
+				newDup := 1
+				newFS := m.baseFrameSize()
+				for _, r := range la.Rules {
+					if loss < r.LossBelow {
+						newDup = r.Dup
+						if r.FrameSize > 0 {
+							newFS = r.FrameSize
+						}
+						break
+					}
+				}
+				if newDup < 1 {
+					newDup = 1
+				}
+				if newDup > 5 {
+					newDup = 5
+				}
+				if newDup != prevDup {
+					utils.Logger.Debug("ACC: 自适应倍率更新",
+						zap.String("远端", t.peer),
+						zap.Float64("丢包率(%)", loss),
+						zap.Int("倍率.旧", prevDup),
+						zap.Int("倍率.新", newDup),
+						zap.Int("窗口发送", sent),
+						zap.Int("窗口确认", ack),
+						zap.Int("窗口秒", la.WindowSeconds))
+				} else {
+					utils.Logger.Debug("ACC: 自适应倍率",
+						zap.String("远端", t.peer),
+						zap.Float64("丢包率(%)", loss),
+						zap.Int("倍率", newDup),
+						zap.Int("窗口发送", sent),
+						zap.Int("窗口确认", ack),
+						zap.Int("窗口秒", la.WindowSeconds))
+				}
+				t.statMu.Lock()
+				t.currDup = newDup
+				t.statMu.Unlock()
+
+				if newFS > 0 && (suggestedFS == 0 || newFS < suggestedFS) {
+					suggestedFS = newFS
 				}
 			}
-			if newDup < 1 {
-				newDup = 1
+			if suggestedFS > 0 {
+				m.dynMu.Lock()
+				prev := m.dynFrameSize
+				if prev <= 0 {
+					prev = m.baseFrameSize()
+				}
+				changed := suggestedFS != prev
+				m.dynFrameSize = suggestedFS
+				m.dynMu.Unlock()
+				if changed {
+					utils.Logger.Debug("ACC: 自适应分片大小",
+						zap.Int("frameSize.旧", prev),
+						zap.Int("frameSize.新", suggestedFS))
+				}
 			}
-			if newDup > 5 {
-				newDup = 5
-			}
-			peers := m.snapshotPeers()
-			if newDup != prevDup {
-				utils.Logger.Debug("ACC: 自适应倍率更新",
-					zap.Float64("丢包率(%)", loss),
-					zap.Int("倍率.旧", prevDup),
-					zap.Int("倍率.新", newDup),
-					zap.Int("窗口发送", sent),
-					zap.Int("窗口确认", ack),
-					zap.Int("隧道数", len(peers)),
-					zap.Strings("远端", peers),
-					zap.Int("窗口秒", la.WindowSeconds))
-			} else {
-				// periodic debug even when unchanged
-				utils.Logger.Debug("ACC: 自适应倍率",
-					zap.Float64("丢包率(%)", loss),
-					zap.Int("倍率", newDup),
-					zap.Int("窗口发送", sent),
-					zap.Int("窗口确认", ack),
-					zap.Int("隧道数", len(peers)),
-					zap.Strings("远端", peers),
-					zap.Int("窗口秒", la.WindowSeconds))
-			}
-			m.statsMu.Lock()
-			m.currDup = newDup
-			m.statsMu.Unlock()
 		}
 	}()
 }
@@ -830,7 +885,7 @@ func (sc *streamConn) Read(b []byte) (int, error) {
 
 func (sc *streamConn) Write(b []byte) (int, error) {
 	// split into frames
-	max := sc.mgr.cfg.FrameSize
+	max := sc.mgr.getFrameSize()
 	if max <= 0 {
 		max = 8192
 	}
@@ -848,6 +903,57 @@ func (sc *streamConn) Write(b []byte) (int, error) {
 		written += n
 	}
 	return written, nil
+}
+
+// getFrameSize returns current adaptive frame size used for writing frames
+func (m *accelManager) getFrameSize() int {
+	m.dynMu.RLock()
+	fs := m.dynFrameSize
+	m.dynMu.RUnlock()
+	if fs <= 0 {
+		fs = m.baseFrameSize()
+	}
+	if fs <= 0 {
+		fs = 8192
+	}
+	rm := m.getReadMax()
+	if fs > rm {
+		fs = rm
+	}
+	return fs
+}
+
+// getReadMax computes a safe max payload length accepted by readFrame
+func (m *accelManager) getReadMax() int {
+	// start from conservative minimum
+	max := 0
+	if max < 32768 {
+		max = 32768
+	}
+	la := config.GlobalCfg.LossAdaptation
+	if la != nil {
+		for _, r := range la.Rules {
+			if r.FrameSize > max {
+				max = r.FrameSize
+			}
+		}
+	}
+	return max
+}
+
+// baseFrameSize returns the baseline frame size preference:
+// 1) use lossAdaptation rule where dup==1 and frameSize>0, if present
+// 2) else default to 32768
+func (m *accelManager) baseFrameSize() int {
+	la := config.GlobalCfg.LossAdaptation
+	if la != nil {
+		for _, r := range la.Rules {
+			if r.Dup == 1 && r.FrameSize > 0 {
+				return r.FrameSize
+			}
+		}
+	}
+	return 32768
 }
 
 func (sc *streamConn) Close() error {
