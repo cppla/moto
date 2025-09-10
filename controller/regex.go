@@ -32,7 +32,7 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 		if !v.Re.Match(firstPacket.Bytes()) {
 			continue
 		}
-		c, _, err := DialAccelerated(v.Address)
+		c, used, err := DialAccelerated(v.Address)
 		if err != nil {
 			utils.Logger.Error("无法建立连接",
 				zap.String("ruleName", rule.Name),
@@ -40,7 +40,11 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 				zap.String("targetAddr", v.Address))
 			continue
 		}
-		target = c
+		if !used {
+			target = newOneSidedConn(c)
+		} else {
+			target = c
+		}
 		break
 	}
 	if target == nil {

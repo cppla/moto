@@ -12,10 +12,6 @@ type projectConfig struct {
 	Log   log     `json:"log"`
 	Rules []*Rule `json:"rules"`
 	Wafs  []*Waf  `json:"wafs"`
-	// Accelerator provides optional weak-network acceleration overlay
-	Accelerator *Accelerator `json:"accelerator"`
-	// LossAdaptation configures dynamic duplication based on observed loss
-	LossAdaptation *LossAdaptation `json:"lossAdaptation"`
 }
 
 type log struct {
@@ -46,42 +42,7 @@ type Rule struct {
 	Blacklist map[string]bool `json:"blacklist"`
 }
 
-// Accelerator config enables multi-tunnel acceleration roles.
-// When enabled with role "client", traffic from the 4 modes will be proxied
-// through persistent tunnels to the remote accelerator server which connects
-// to the selected target. When role is "server", the process listens for
-// tunnel connections and performs the actual target dial-out.
-type Accelerator struct {
-	Enabled bool   `json:"enabled"`
-	Role    string `json:"role"` // client | server
-	// Client role: multiple remote endpoints for multi-path
-	Remotes []string `json:"remotes"`
-	// For server role: Listen is the address for accelerator server to listen on, e.g. ":9900"
-	Listen string `json:"listen"`
-	// Number of persistent TCP tunnels between client and server (auto if loss adaptation enabled)
-	Tunnels int `json:"tunnels"`
-	// Transport selects tunnel transport: "tcp" (default) or "quic"
-	Transport string `json:"transport"`
-	// TLS options for QUIC (nginx-like). If these are empty on server, a self-signed cert will be used.
-	CertificateFile string `json:"certificate-file"`
-	PrivateKeyFile  string `json:"private-key-file"`
-}
-
-// LossAdaptation maps observed loss(%) to duplication factor.
-type LossAdaptation struct {
-	Enabled         bool       `json:"enabled"`
-	WindowSeconds   int        `json:"windowSeconds"`
-	ProbeIntervalMs int        `json:"probeIntervalMs"`
-	Rules           []LossRule `json:"rules"`
-}
-
-type LossRule struct {
-	LossBelow float64 `json:"lossBelow"` // e.g. 1, 10, 20, 30 meaning %
-	Dup       int     `json:"dup"`       // 1..5
-	// Optional: preferred frame size for this loss bucket (bytes). When >0, sending side may
-	// downshift to this size to reduce loss on bad networks and upshift on good networks.
-	FrameSize int `json:"frameSize,omitempty"`
-}
+// (single-sided mode) accelerator and loss adaptation are removed
 
 var GlobalCfg *projectConfig
 
@@ -102,70 +63,6 @@ func init() {
 
 	if len(GlobalCfg.Rules) == 0 {
 		fmt.Printf("empty rule\n")
-	}
-
-	if GlobalCfg.Accelerator != nil {
-		// defaults and quick validation
-		// legacy defaults for tunnels (will be overridden by remotes-based auto sizing below)
-		if GlobalCfg.LossAdaptation != nil && GlobalCfg.LossAdaptation.Enabled {
-			if GlobalCfg.Accelerator.Tunnels <= 0 {
-				GlobalCfg.Accelerator.Tunnels = 3 // conservative default
-			}
-		} else {
-			if GlobalCfg.Accelerator.Tunnels <= 0 {
-				GlobalCfg.Accelerator.Tunnels = 2
-			}
-		}
-		if GlobalCfg.Accelerator.Transport == "" {
-			GlobalCfg.Accelerator.Transport = "tcp"
-		}
-		if GlobalCfg.Accelerator.Transport != "tcp" && GlobalCfg.Accelerator.Transport != "quic" {
-			fmt.Printf("invalid transport: %s, fallback to tcp\n", GlobalCfg.Accelerator.Transport)
-			GlobalCfg.Accelerator.Transport = "tcp"
-		}
-		if GlobalCfg.Accelerator.Role == "client" && GlobalCfg.Accelerator.Enabled && len(GlobalCfg.Accelerator.Remotes) == 0 {
-			fmt.Printf("accelerator role=client requires remotes\n")
-		}
-		if GlobalCfg.Accelerator.Role == "server" && GlobalCfg.Accelerator.Listen == "" && GlobalCfg.Accelerator.Enabled {
-			fmt.Printf("accelerator role=server requires listen address\n")
-		}
-
-		// Auto size tunnels: 2 per remote when client role is enabled
-		if GlobalCfg.Accelerator.Role == "client" && GlobalCfg.Accelerator.Enabled {
-			n := len(GlobalCfg.Accelerator.Remotes)
-			if n > 0 {
-				GlobalCfg.Accelerator.Tunnels = n * 2
-				fmt.Printf("[加速器] 自动设置隧道数量: remotes=%d => tunnels=%d\n", n, GlobalCfg.Accelerator.Tunnels)
-			}
-		}
-	}
-
-	// Defaults for loss adaptation and validation
-	if GlobalCfg.LossAdaptation == nil {
-		GlobalCfg.LossAdaptation = &LossAdaptation{Enabled: true, WindowSeconds: 10, ProbeIntervalMs: 1000,
-			Rules: []LossRule{
-				{LossBelow: 0.5, Dup: 1, FrameSize: 32768},
-				{LossBelow: 5, Dup: 2, FrameSize: 16384},
-				{LossBelow: 10, Dup: 2, FrameSize: 16384},
-				{LossBelow: 20, Dup: 3, FrameSize: 8192},
-				{LossBelow: 101, Dup: 4, FrameSize: 4096},
-			}}
-	} else {
-		if GlobalCfg.LossAdaptation.WindowSeconds <= 0 {
-			GlobalCfg.LossAdaptation.WindowSeconds = 10
-		}
-		if GlobalCfg.LossAdaptation.ProbeIntervalMs <= 0 {
-			GlobalCfg.LossAdaptation.ProbeIntervalMs = 1000
-		}
-		if len(GlobalCfg.LossAdaptation.Rules) == 0 {
-			GlobalCfg.LossAdaptation.Rules = []LossRule{
-				{LossBelow: 0.5, Dup: 1, FrameSize: 32768},
-				{LossBelow: 5, Dup: 2, FrameSize: 16384},
-				{LossBelow: 10, Dup: 2, FrameSize: 16384},
-				{LossBelow: 20, Dup: 3, FrameSize: 8192},
-				{LossBelow: 101, Dup: 4, FrameSize: 4096},
-			}
-		}
 	}
 
 	for i, v := range GlobalCfg.Rules {
@@ -203,66 +100,6 @@ func Reload(path string) error {
 	}
 	if len(cfg.Rules) == 0 {
 		fmt.Printf("empty rule\n")
-	}
-	if cfg.Accelerator != nil {
-		// legacy defaults (overridden by automatic remote-based sizing below)
-		if cfg.LossAdaptation != nil && cfg.LossAdaptation.Enabled {
-			if cfg.Accelerator.Tunnels <= 0 {
-				cfg.Accelerator.Tunnels = 3
-			}
-		} else {
-			if cfg.Accelerator.Tunnels <= 0 {
-				cfg.Accelerator.Tunnels = 2
-			}
-		}
-		if cfg.Accelerator.Transport == "" {
-			cfg.Accelerator.Transport = "tcp"
-		}
-		if cfg.Accelerator.Transport != "tcp" && cfg.Accelerator.Transport != "quic" {
-			fmt.Printf("invalid transport: %s, fallback to tcp\n", cfg.Accelerator.Transport)
-			cfg.Accelerator.Transport = "tcp"
-		}
-		if cfg.Accelerator.Role == "client" && cfg.Accelerator.Enabled && len(cfg.Accelerator.Remotes) == 0 {
-			fmt.Printf("accelerator role=client requires remotes\n")
-		}
-		if cfg.Accelerator.Role == "server" && cfg.Accelerator.Listen == "" && cfg.Accelerator.Enabled {
-			fmt.Printf("accelerator role=server requires listen address\n")
-		}
-
-		// Auto size tunnels: 2 per remote when client role is enabled
-		if cfg.Accelerator.Role == "client" && cfg.Accelerator.Enabled {
-			n := len(cfg.Accelerator.Remotes)
-			if n > 0 {
-				cfg.Accelerator.Tunnels = n * 2
-				fmt.Printf("[加速器] 自动设置隧道数量: remotes=%d => tunnels=%d\n", n, cfg.Accelerator.Tunnels)
-			}
-		}
-	}
-	if cfg.LossAdaptation == nil {
-		cfg.LossAdaptation = &LossAdaptation{Enabled: true, WindowSeconds: 10, ProbeIntervalMs: 1000,
-			Rules: []LossRule{
-				{LossBelow: 0.5, Dup: 1, FrameSize: 32768},
-				{LossBelow: 5, Dup: 2, FrameSize: 16384},
-				{LossBelow: 10, Dup: 2, FrameSize: 16384},
-				{LossBelow: 20, Dup: 3, FrameSize: 8192},
-				{LossBelow: 101, Dup: 4, FrameSize: 4096},
-			}}
-	} else {
-		if cfg.LossAdaptation.WindowSeconds <= 0 {
-			cfg.LossAdaptation.WindowSeconds = 10
-		}
-		if cfg.LossAdaptation.ProbeIntervalMs <= 0 {
-			cfg.LossAdaptation.ProbeIntervalMs = 1000
-		}
-		if len(cfg.LossAdaptation.Rules) == 0 {
-			cfg.LossAdaptation.Rules = []LossRule{
-				{LossBelow: 0.5, Dup: 1, FrameSize: 32768},
-				{LossBelow: 5, Dup: 2, FrameSize: 16384},
-				{LossBelow: 10, Dup: 2, FrameSize: 16384},
-				{LossBelow: 20, Dup: 3, FrameSize: 8192},
-				{LossBelow: 101, Dup: 4, FrameSize: 4096},
-			}
-		}
 	}
 	for i, v := range cfg.Rules {
 		if err := v.verify(); err != nil {

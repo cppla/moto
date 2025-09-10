@@ -25,8 +25,7 @@ func main() {
 	defer utils.Logger.Sync()
 
 	utils.Logger.Info("MOTO 启动...")
-	// init accelerator (client/server role) if enabled
-	controller.InitAccelerator()
+	// single-sided build: no accelerator init required
 	wg := &sync.WaitGroup{}
 	for _, v := range config.GlobalCfg.Rules {
 		wg.Add(1)

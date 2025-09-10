@@ -23,7 +23,10 @@ func HandleBoost(conn net.Conn, rule *config.Rule) {
 	switchBetter := make(chan net.Conn, 1)
 	for _, v := range rule.Targets {
 		go func(address string) {
-			if tryGetQuickConn, _, err := DialAccelerated(address); err == nil {
+			if tryGetQuickConn, used, err := DialAccelerated(address); err == nil {
+				if !used {
+					tryGetQuickConn = newOneSidedConn(tryGetQuickConn)
+				}
 				select {
 				case switchBetter <- tryGetQuickConn:
 				case <-ctx.Done():

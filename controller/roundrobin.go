@@ -24,7 +24,7 @@ func HandleRoundrobin(conn net.Conn, rule *config.Rule) {
 	v := rule.Targets[index]
 
 	roundrobinBegin := time.Now()
-	target, _, err := DialAccelerated(v.Address)
+	target, used, err := DialAccelerated(v.Address)
 	if err != nil {
 		utils.Logger.Error("无法建立连接，切换到 boost 模式",
 			zap.String("ruleName", rule.Name),
@@ -33,6 +33,9 @@ func HandleRoundrobin(conn net.Conn, rule *config.Rule) {
 			zap.Int64("failedTime(ms)", time.Since(roundrobinBegin).Milliseconds()))
 		HandleBoost(conn, rule)
 		return
+	}
+	if !used {
+		target = newOneSidedConn(target)
 	}
 	utils.Logger.Debug("建立连接",
 		zap.String("ruleName", rule.Name),
