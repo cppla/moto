@@ -9,20 +9,43 @@ import (
 
 // DialFast performs fastest direct TCP dial by resolving all IPs for host
 // and attempting parallel connections, returning the first success.
+// hasDialLatency is an optional interface implemented by connections that can report dial latency.
+type hasDialLatency interface{ DialLatency() time.Duration }
+
+type dialConn struct {
+	net.Conn
+	latency time.Duration
+}
+
+func (d *dialConn) DialLatency() time.Duration { return d.latency }
+
 func DialFast(addr string) (net.Conn, error) {
+	start := time.Now()
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
+		c, e := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
+		if e != nil {
+			return nil, e
+		}
+		return &dialConn{Conn: c, latency: time.Since(start)}, nil
 	}
 	if ip, perr := netip.ParseAddr(host); perr == nil {
 		target := net.JoinHostPort(ip.String(), port)
-		return (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", target)
+		c, e := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", target)
+		if e != nil {
+			return nil, e
+		}
+		return &dialConn{Conn: c, latency: time.Since(start)}, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	addrs, rerr := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if rerr != nil || len(addrs) == 0 {
-		return (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
+		c, e := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
+		if e != nil {
+			return nil, e
+		}
+		return &dialConn{Conn: c, latency: time.Since(start)}, nil
 	}
 	type result struct {
 		c   net.Conn
@@ -52,8 +75,15 @@ func DialFast(addr string) (net.Conn, error) {
 	}
 	select {
 	case r := <-resCh:
-		return r.c, r.err
+		if r.err != nil {
+			return nil, r.err
+		}
+		return &dialConn{Conn: r.c, latency: time.Since(start)}, nil
 	case <-ctx.Done():
-		return (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
+		c, e := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
+		if e != nil {
+			return nil, e
+		}
+		return &dialConn{Conn: c, latency: time.Since(start)}, nil
 	}
 }

@@ -57,6 +57,12 @@ func HandleNormal(conn net.Conn, rule *config.Rule) {
 // This is best-effort and only applies on client egress when server is not available.
 type oneSidedConn struct {
 	net.Conn
+	enableDup bool
+	dupBudget int           // bytes left for duplication (only first N bytes)
+	ewmaBlock time.Duration // EWMA of write blocking time
+	winBytes  int
+	winChunks int
+	lastAdj   time.Time
 }
 
 func newOneSidedConn(c net.Conn) net.Conn {
@@ -66,11 +72,18 @@ func newOneSidedConn(c net.Conn) net.Conn {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 	}
-	return &oneSidedConn{Conn: c}
+	// adaptive: if dial was very fast, disable duplication; else enable
+	dup := true
+	if hl, ok := c.(interface{ DialLatency() time.Duration }); ok {
+		if hl.DialLatency() < 40*time.Millisecond {
+			dup = false
+		}
+	}
+	return &oneSidedConn{Conn: c, enableDup: dup, dupBudget: 64 * 1024, lastAdj: time.Now()}
 }
 
 func (o *oneSidedConn) Write(p []byte) (int, error) {
-	// simple fragmentation: cap fragment to 1200 bytes to fit typical MTU, and duplicate on send
+	// simple fragmentation: cap fragment to 1200 bytes to fit typical MTU, optional duplicate on send
 	const frag = 1200
 	written := 0
 	for written < len(p) {
@@ -79,14 +92,59 @@ func (o *oneSidedConn) Write(p []byte) (int, error) {
 			n = frag
 		}
 		chunk := p[written : written+n]
-		// primary write
+		// primary write with blocking time measurement
+		t0 := time.Now()
 		if _, err := o.Conn.Write(chunk); err != nil {
 			return written, err
 		}
-		// duplicate once with tiny delay to reduce collision
-		time.Sleep(2 * time.Millisecond)
-		_, _ = o.Conn.Write(chunk)
+		dt := time.Since(t0)
+		if o.ewmaBlock == 0 {
+			o.ewmaBlock = dt
+		} else {
+			const alpha = 0.2
+			o.ewmaBlock = time.Duration(alpha*float64(dt) + (1-alpha)*float64(o.ewmaBlock))
+		}
+		o.winBytes += n
+		o.winChunks++
+		// duplicate once with tiny delay to reduce collision (only if enabled and with budget)
+		if o.enableDup && o.dupBudget > 0 {
+			time.Sleep(2 * time.Millisecond)
+			_, _ = o.Conn.Write(chunk)
+			o.dupBudget -= len(chunk)
+			if o.dupBudget < 0 {
+				o.dupBudget = 0
+			}
+		}
+		// periodic reassessment
+		if time.Since(o.lastAdj) > 500*time.Millisecond || o.winChunks >= 32 {
+			o.reassess()
+		}
 		written += n
 	}
 	return written, nil
+}
+
+// reassess toggles duplication based on EWMA of blocking time and adjusts budget.
+func (o *oneSidedConn) reassess() {
+	fast := 2 * time.Millisecond
+	slow := 8 * time.Millisecond
+	if o.ewmaBlock > 0 {
+		if o.ewmaBlock <= fast {
+			o.enableDup = false
+			if o.dupBudget > 16*1024 {
+				o.dupBudget -= 16 * 1024
+			} else if o.dupBudget > 0 {
+				o.dupBudget /= 2
+			}
+		} else if o.ewmaBlock >= slow {
+			o.enableDup = true
+			o.dupBudget += 32 * 1024
+			if o.dupBudget > 256*1024 {
+				o.dupBudget = 256 * 1024
+			}
+		}
+	}
+	o.winBytes = 0
+	o.winChunks = 0
+	o.lastAdj = time.Now()
 }
