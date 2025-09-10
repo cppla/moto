@@ -33,8 +33,6 @@ go run ./run.go --config config/setting.json
 ```
 也可通过环境变量：`MOTO_CONFIG=/path/to/your.json`。
 
-## 配置
-仅需日志 log、限速/防护 wafs、转发规则 rules。示例见 `config/setting.json`。
 
 ## 构建
 ```bash
