@@ -11,14 +11,14 @@
       "listen": ":81",
       "mode": "normal",
       "prewarm": false,
-      "timeout": 3000,
+      "timeout": 60000,
       "blacklist": null,
       "targets": [
         {
-          "address": "223.5.5.5:80"
+          "address": "www.baidu.com:80"
         },
         {
-          "address": "223.5.5.5:80"
+          "address": "www.baidu.com:80"
         }
       ]
     },
@@ -27,16 +27,16 @@
       "listen": ":82",
       "mode": "regex",
       "prewarm": false,
-      "timeout": 3000,
+      "timeout": 60000,
       "blacklist": null,
       "targets": [
         {
           "regexp": "^(GET|POST|HEAD|DELETE|PUT|CONNECT|OPTIONS|TRACE)",
-          "address": "223.5.5.5:80"
+          "address": "www.baidu.com:80"
         },
         {
           "regexp": "^SSH",
-          "address": "223.5.5.5:22"
+          "address": "www.baidu.com:22"
         }
       ]
     },
@@ -44,15 +44,18 @@
       "name": "智能加速",
       "listen": ":83",
       "mode": "boost",
-      "prewarm": false,
-      "timeout": 300,
+      "prewarm": true,
+      "timeout": 60000,
       "blacklist": null,
       "targets": [
         {
-          "address": "223.5.5.5:85"
+          "address": "www.baidu.com:80"
         },
         {
-          "address": "223.5.5.5:85"
+          "address": "www.baidu.com:80"
+        },
+        {
+          "address": "www.baidu.com:80"
         }
       ]
     },
@@ -61,14 +64,14 @@
       "listen": ":84",
       "mode": "roundrobin",
       "prewarm": false,
-      "timeout": 300,
+      "timeout": 60000,
       "blacklist": null,
       "targets": [
         {
-          "address": "223.5.5.5:85"
+          "address": "www.baidu.com:80"
         },
         {
-          "address": "223.5.5.5:85"
+          "address": "www.baidu.com:80"
         }
       ]
     }
