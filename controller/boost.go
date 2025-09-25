@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// HandleBoost 同时发起多路拨号，挑选最先成功的连接并套上单边加速。
 func HandleBoost(conn net.Conn, rule *config.Rule) {
 	defer conn.Close()
 
@@ -23,7 +24,7 @@ func HandleBoost(conn net.Conn, rule *config.Rule) {
 	switchBetter := make(chan net.Conn, 1)
 	for _, v := range rule.Targets {
 		go func(address string) {
-			if tryGetQuickConn, used, err := DialAccelerated(address); err == nil {
+			if tryGetQuickConn, used, err := outboundDial(address); err == nil {
 				if !used {
 					tryGetQuickConn = newOneSidedConn(tryGetQuickConn)
 				}

@@ -7,11 +7,7 @@ import (
 	"time"
 )
 
-// DialFast performs fastest direct TCP dial by resolving all IPs for host
-// and attempting parallel connections, returning the first success.
-// hasDialLatency is an optional interface implemented by connections that can report dial latency.
-type hasDialLatency interface{ DialLatency() time.Duration }
-
+// dialConn 在原始连接基础上附带拨号延迟，供自适应复制逻辑使用。
 type dialConn struct {
 	net.Conn
 	latency time.Duration
@@ -19,6 +15,7 @@ type dialConn struct {
 
 func (d *dialConn) DialLatency() time.Duration { return d.latency }
 
+// DialFast 实现简化版的 Happy Eyeballs，并记录拨号延迟。
 func DialFast(addr string) (net.Conn, error) {
 	start := time.Now()
 	host, port, err := net.SplitHostPort(addr)

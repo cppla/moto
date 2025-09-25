@@ -1,19 +1,22 @@
 package controller
 
 import (
-	"github.com/patrickmn/go-cache"
 	"moto/config"
 	"moto/utils"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/patrickmn/go-cache"
 )
 
 var ipCache = cache.New(30*time.Second, 1*time.Minute)
 
+// Listen 根据规则启动 TCP 监听，做基础限流并分发到对应模式。
 func Listen(rule *config.Rule, wg *sync.WaitGroup) {
 	defer wg.Done()
+	initPrewarm(rule)
 	//监听
 	listener, err := net.Listen("tcp", rule.Listen)
 	if err != nil {

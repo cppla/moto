@@ -13,6 +13,7 @@ import (
 
 var tcpCounter uint64
 
+// HandleRoundrobin 顺序轮转目标，失败时回退到 boost 模式。
 func HandleRoundrobin(conn net.Conn, rule *config.Rule) {
 	defer conn.Close()
 
@@ -24,7 +25,7 @@ func HandleRoundrobin(conn net.Conn, rule *config.Rule) {
 	v := rule.Targets[index]
 
 	roundrobinBegin := time.Now()
-	target, used, err := DialAccelerated(v.Address)
+	target, used, err := outboundDial(v.Address)
 	if err != nil {
 		utils.Logger.Error("无法建立连接，切换到 boost 模式",
 			zap.String("ruleName", rule.Name),

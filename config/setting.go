@@ -8,6 +8,7 @@ import (
 	"regexp"
 )
 
+// projectConfig 保存从 setting.json 读取的顶层配置。
 type projectConfig struct {
 	Log   log     `json:"log"`
 	Rules []*Rule `json:"rules"`
@@ -21,6 +22,7 @@ type log struct {
 	Date    string `json:"date"`
 }
 
+// Waf 表示用于封禁恶意 IP 的简易限流策略。
 type Waf struct {
 	Name         string   `json:"name"`
 	Blackcountry []string `json:"blackcountry"`
@@ -29,6 +31,7 @@ type Waf struct {
 	Bantime      uint64   `json:"bantime"`
 }
 
+// Rule 描述一个监听端口以及接入流量的路由策略。
 type Rule struct {
 	Name    string `json:"name"`
 	Listen  string `json:"listen"`
@@ -42,12 +45,13 @@ type Rule struct {
 	Blacklist map[string]bool `json:"blacklist"`
 }
 
-// (single-sided mode) accelerator and loss adaptation are removed
+// （单边模式）已移除加速端和丢包自适应的旧配置。
 
+// GlobalCfg 指向全局生效的配置对象。
 var GlobalCfg *projectConfig
 
 func init() {
-	// Support env override for config file path
+	// 支持通过环境变量覆盖配置文件路径
 	path := os.Getenv("MOTO_CONFIG")
 	if path == "" {
 		path = "config/setting.json"
@@ -88,7 +92,7 @@ func init() {
 	}
 }
 
-// Reload loads configuration from the given path and applies defaults/validation.
+// Reload 从指定路径重载配置，并执行默认值填充与校验。
 func Reload(path string) error {
 	buf, err := ioutil.ReadFile(path)
 	if err != nil {
@@ -125,6 +129,7 @@ func Reload(path string) error {
 	return nil
 }
 
+// verify 校验规则配置，并在需要时编译正则。
 func (c *Rule) verify() error {
 	if c.Name == "" {
 		return fmt.Errorf("empty name")

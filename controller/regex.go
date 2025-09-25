@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// HandleRegexp 通过正则检测首包选出目标，再转发后续数据流。
 func HandleRegexp(conn net.Conn, rule *config.Rule) {
 	defer conn.Close()
 
@@ -32,7 +33,7 @@ func HandleRegexp(conn net.Conn, rule *config.Rule) {
 		if !v.Re.Match(firstPacket.Bytes()) {
 			continue
 		}
-		c, used, err := DialAccelerated(v.Address)
+		c, used, err := outboundDial(v.Address)
 		if err != nil {
 			utils.Logger.Error("无法建立连接",
 				zap.String("ruleName", rule.Name),
