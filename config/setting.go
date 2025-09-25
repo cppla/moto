@@ -12,7 +12,6 @@ import (
 type projectConfig struct {
 	Log   log     `json:"log"`
 	Rules []*Rule `json:"rules"`
-	Wafs  []*Waf  `json:"wafs"`
 }
 
 type log struct {
@@ -20,15 +19,6 @@ type log struct {
 	Path    string `json:"path"`
 	Version string `json:"version"`
 	Date    string `json:"date"`
-}
-
-// Waf 表示用于封禁恶意 IP 的简易限流策略。
-type Waf struct {
-	Name         string   `json:"name"`
-	Blackcountry []string `json:"blackcountry"`
-	Threshold    uint64   `json:"threshold"`
-	Findtime     uint64   `json:"findtime"`
-	Bantime      uint64   `json:"bantime"`
 }
 
 // Rule 描述一个监听端口以及接入流量的路由策略。
@@ -74,22 +64,6 @@ func init() {
 			fmt.Printf("verify rule failed at pos %d : %s\n", i, err.Error())
 		}
 	}
-
-	for i, v := range GlobalCfg.Wafs {
-		if v.Name == "" {
-			fmt.Printf("empty waf name at pos %d\n", i)
-		}
-		if v.Threshold == 0 {
-			fmt.Printf("invalid threshold at pos %d\n", i)
-		}
-		if v.Findtime == 0 {
-			fmt.Printf("invalid findtime at pos %d\n", i)
-		}
-		if v.Bantime == 0 {
-			fmt.Printf("invalid bantime at pos %d\n", i)
-		}
-		fmt.Println(v)
-	}
 }
 
 // Reload 从指定路径重载配置，并执行默认值填充与校验。
@@ -109,21 +83,6 @@ func Reload(path string) error {
 		if err := v.verify(); err != nil {
 			fmt.Printf("verify rule failed at pos %d : %s\n", i, err.Error())
 		}
-	}
-	for i, v := range cfg.Wafs {
-		if v.Name == "" {
-			fmt.Printf("empty waf name at pos %d\n", i)
-		}
-		if v.Threshold == 0 {
-			fmt.Printf("invalid threshold at pos %d\n", i)
-		}
-		if v.Findtime == 0 {
-			fmt.Printf("invalid findtime at pos %d\n", i)
-		}
-		if v.Bantime == 0 {
-			fmt.Printf("invalid bantime at pos %d\n", i)
-		}
-		fmt.Println(v)
 	}
 	GlobalCfg = cfg
 	return nil
