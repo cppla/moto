@@ -31,6 +31,9 @@ type prewarmPool struct {
 
 // initPrewarm 会为规则中的每个目标开启后台保温。
 func initPrewarm(rule *config.Rule) {
+	if !rule.Prewarm {
+		return
+	}
 	desired := prewarmDefaultSize
 	if rule.Mode == "boost" {
 		desired = prewarmBoostSize

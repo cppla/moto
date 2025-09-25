@@ -10,6 +10,7 @@
       "name": "正常模式",
       "listen": ":81",
       "mode": "normal",
+      "prewarm": false,
       "timeout": 3000,
       "blacklist": null,
       "targets": [
@@ -25,6 +26,7 @@
       "name": "正则模式",
       "listen": ":82",
       "mode": "regex",
+      "prewarm": false,
       "timeout": 3000,
       "blacklist": null,
       "targets": [
@@ -42,6 +44,7 @@
       "name": "智能加速",
       "listen": ":83",
       "mode": "boost",
+      "prewarm": false,
       "timeout": 300,
       "blacklist": null,
       "targets": [
@@ -57,6 +60,7 @@
       "name": "轮询模式",
       "listen": ":84",
       "mode": "roundrobin",
+      "prewarm": false,
       "timeout": 300,
       "blacklist": null,
       "targets": [

@@ -26,6 +26,7 @@ type Rule struct {
 	Name    string `json:"name"`
 	Listen  string `json:"listen"`
 	Mode    string `json:"mode"`
+	Prewarm bool   `json:"prewarm"`
 	Targets []*struct {
 		Regexp  string         `json:"regexp"`
 		Re      *regexp.Regexp `json:"-"`

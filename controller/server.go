@@ -12,7 +12,9 @@ import (
 // Listen 根据规则启动 TCP 监听，做基础限流并分发到对应模式。
 func Listen(rule *config.Rule, wg *sync.WaitGroup) {
 	defer wg.Done()
-	initPrewarm(rule)
+	if rule.Prewarm {
+		initPrewarm(rule)
+	}
 	//监听
 	listener, err := net.Listen("tcp", rule.Listen)
 	if err != nil {
