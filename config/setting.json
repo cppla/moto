@@ -53,9 +53,6 @@
         },
         {
           "address": "www.baidu.com:80"
-        },
-        {
-          "address": "www.baidu.com:80"
         }
       ]
     },
@@ -63,7 +60,7 @@
       "name": "轮询模式",
       "listen": ":84",
       "mode": "roundrobin",
-      "prewarm": false,
+      "prewarm": true,
       "timeout": 60000,
       "blacklist": null,
       "targets": [

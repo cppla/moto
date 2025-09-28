@@ -14,7 +14,7 @@ import (
 // 每个目标默认预热连接数量。
 const (
 	prewarmDefaultSize = 1
-	prewarmBoostSize   = 8
+	prewarmBoostSize   = 16
 )
 
 var prewarmPools sync.Map // 映射地址到对应的预热池
