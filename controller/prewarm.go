@@ -58,6 +58,9 @@ func ensurePrewarmPool(addr string, desired int) *prewarmPool {
 // ensureLocked 会持续补齐预热连接直到达到期望值。
 func (p *prewarmPool) ensureLocked() {
 	need := p.desired - len(p.idle) - p.warming
+	if need <= 0 {
+		return
+	}
 	for i := 0; i < need; i++ {
 		p.warming++
 		go p.dialOne()
@@ -112,13 +115,14 @@ func acquirePrewarmed(addr string) (net.Conn, bool) {
 }
 
 // outboundDial 先尝试预热池，失败再发起新建连接。
-func outboundDial(addr string) (net.Conn, bool, error) {
+// 之前返回 (conn, usedFlag, error)，由于当前不再区分来源，精简为 (conn, error)。
+func outboundDial(addr string) (net.Conn, error) {
 	if conn, ok := acquirePrewarmed(addr); ok {
-		return conn, false, nil
+		return conn, nil
 	}
 	c, err := DialFast(addr)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	return c, false, nil
+	return c, nil
 }
