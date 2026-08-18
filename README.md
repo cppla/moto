@@ -1,6 +1,10 @@
-# Moto
+<p align="center">
+  <img src="docs/assets/moto-logo.png" alt="Moto 加速摩托与网络线路 Logo" width="480">
+</p>
 
-> 把一组忽快忽慢、时好时坏的 TCP 上游，收敛成一个稳定、低延迟、可观测的本地入口。
+<h1 align="center">Moto</h1>
+
+<p align="center"><strong>把一组忽快忽慢、时好时坏的 TCP 上游，收敛成一个稳定、低延迟、可观测的本地入口。</strong></p>
 
 Moto 是一个轻量级、自适应的 TCP 网关。它不满足于“这个地址还能连通”，而是根据真实拨号延迟、近期故障和转发结果持续判断：**这一刻，哪条线路最值得承载下一条连接？**
 
