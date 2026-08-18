@@ -73,6 +73,14 @@ go run . --config config/setting.json
 
 `timeout` 单位为毫秒：在 `normal` 模式中是整组目标的拨号期限；在 `regex` 模式中分别限制首包分类和匹配后整组目标的拨号（两个阶段各自计时）；在 `boost` 及轮询回退中是竞速决策期限。省略或设为 `0` 时，正则模式默认 500 毫秒，其余模式默认 3 秒。
 
+## WebSocket
+
+Moto 在 TCP 层透明支持 `ws://` 和 `wss://`：HTTP Upgrade/TLS 握手及后续 WebSocket 帧都不会被解析或改写，连接建立后的会话时长也不受上述拨号或首包 `timeout` 限制。仓库的端到端测试覆盖四种运行模式下的 Upgrade、文本帧回显、Ping/Pong，以及超过规则超时后继续传输。
+
+WebSocket 长连接会持续占用全局、规则和单 IP 的连接额度。Moto 关闭时仍遵循 10 秒优雅退出窗口，届时尚未结束的连接会被强制关闭，因此客户端应实现断线重连。
+
+`regex` 模式只能检查明文 WS 握手前 4 KiB；若要按 `Host`、路径或 `Upgrade: websocket` 分流，表达式必须等待对应 Header 到达，不能只写会提前命中的通用 `^GET`。WSS 握手经过 TLS 加密，Moto 不终止 TLS，也不能从中读取 HTTP Host/Path；这类分流需要专门的 SNI 解析或在 Moto 前终止 TLS。WebSocket 规则建议默认保持 `prewarm: false`，除非已确认上游允许业务握手前的空闲 TCP 连接。
+
 ## 健康检查与指标
 
 启用 `metrics` 后提供三个仅本机可访问的 HTTP 端点：
