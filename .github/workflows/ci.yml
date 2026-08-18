@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: 1.25.13
+          cache: true
+      - name: Check formatting
+        run: make fmt-check
+      - name: Validate workflows
+        run: make workflow-check
+      - name: Verify modules
+        run: make mod-check
+      - name: Test
+        run: make test
+      - name: Vet
+        run: make vet
+      - name: Static analysis
+        run: make staticcheck
+      - name: Test with race detector
+        run: make race
+      - name: Check reachable vulnerabilities
+        run: make vuln
+      - name: Validate sample config
+        run: make config-check
+      - name: Check benchmark script syntax
+        run: make bench-check
+      - name: Run loopback-only benchmark smoke
+        run: make bench-smoke
+
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: 1.25.13
+          cache: true
+      - run: go build -trimpath -buildvcs=false ./...
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}

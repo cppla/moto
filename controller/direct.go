@@ -3,84 +3,47 @@ package controller
 import (
 	"context"
 	"net"
-	"net/netip"
 	"time"
 )
 
-// dialConn 在原始连接基础上附带拨号延迟，供自适应复制逻辑使用。
-type dialConn struct {
-	net.Conn
-	latency time.Duration
+const dialTimeout = 3 * time.Second
+
+// configureTCP applies the transport settings used by every outbound TCP
+// connection. DialFastContext deliberately returns the real *net.TCPConn so
+// callers do not lose access to TCP-specific operations behind a wrapper.
+func configureTCP(conn net.Conn) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcpConn.SetNoDelay(true)
+	_ = tcpConn.SetKeepAlive(true)
+	_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 }
 
-func (d *dialConn) DialLatency() time.Duration { return d.latency }
-
-// DialFast 实现简化版的 Happy Eyeballs，并记录拨号延迟。
-func DialFast(addr string) (net.Conn, error) {
-	start := time.Now()
-	host, port, err := net.SplitHostPort(addr)
+// DialFastContext dials addr with the supplied cancellation context. Go's
+// net.Dialer already implements IPv4/IPv6 fallback, avoiding resolver and
+// fallback goroutine leaks from a hand-rolled race.
+func DialFastContext(ctx context.Context, addr string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialer := &net.Dialer{
+		Timeout:   dialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		c, e := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
-		if e != nil {
-			return nil, e
-		}
-		return &dialConn{Conn: c, latency: time.Since(start)}, nil
+		return nil, err
 	}
-	if ip, perr := netip.ParseAddr(host); perr == nil {
-		target := net.JoinHostPort(ip.String(), port)
-		c, e := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", target)
-		if e != nil {
-			return nil, e
-		}
-		return &dialConn{Conn: c, latency: time.Since(start)}, nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	configureTCP(conn)
+	return conn, nil
+}
+
+// DialFast preserves the original API for callers that do not yet carry a
+// context. The wrapper remains bounded and delegates to DialFastContext.
+func DialFast(addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	addrs, rerr := net.DefaultResolver.LookupIP(ctx, "ip", host)
-	if rerr != nil || len(addrs) == 0 {
-		c, e := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
-		if e != nil {
-			return nil, e
-		}
-		return &dialConn{Conn: c, latency: time.Since(start)}, nil
-	}
-	type result struct {
-		c   net.Conn
-		err error
-	}
-	resCh := make(chan result, 1)
-	for i, ip := range addrs {
-		go func(delay int, ip net.IP) {
-			if delay > 0 {
-				select {
-				case <-time.After(time.Duration(delay) * 50 * time.Millisecond):
-				case <-ctx.Done():
-					return
-				}
-			}
-			d := &net.Dialer{Timeout: 2 * time.Second}
-			c, e := d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
-			if e == nil {
-				select {
-				case resCh <- result{c: c}:
-					cancel()
-				default:
-					_ = c.Close()
-				}
-			}
-		}(i, ip)
-	}
-	select {
-	case r := <-resCh:
-		if r.err != nil {
-			return nil, r.err
-		}
-		return &dialConn{Conn: r.c, latency: time.Since(start)}, nil
-	case <-ctx.Done():
-		c, e := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", addr)
-		if e != nil {
-			return nil, e
-		}
-		return &dialConn{Conn: c, latency: time.Since(start)}, nil
-	}
+	return DialFastContext(ctx, addr)
 }

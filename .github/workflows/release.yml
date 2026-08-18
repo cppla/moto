@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: 1.25.13
+          cache: true
+      - name: Build reproducible release assets
+        shell: bash
+        env:
+          TARGET_OS: ${{ matrix.goos }}
+          TARGET_ARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C TZ=UTC
+          epoch="$(git show -s --format=%ct HEAD)"
+          commit="$(git rev-parse HEAD)"
+          build_date="$(date -u -d "@${epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          package="moto_${GITHUB_REF_NAME}_${TARGET_OS}_${TARGET_ARCH}"
+          binary="moto"
+          if [[ "${TARGET_OS}" == "windows" ]]; then binary="moto.exe"; fi
+          mkdir -p dist stage/config
+          CGO_ENABLED=0 GOOS="${TARGET_OS}" GOARCH="${TARGET_ARCH}" \
+            go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -buildid= -X main.version=${GITHUB_REF_NAME} -X main.commit=${commit} -X main.buildDate=${build_date}" \
+            -o "stage/${binary}" .
+          install -m 0644 README.md LICENSE stage/
+          install -m 0644 config/setting.json stage/config/
+          tar --sort=name --mtime="@${epoch}" --owner=0 --group=0 --numeric-owner \
+            -C stage -cf - . | gzip -n > "dist/${package}.tar.gz"
+
+          tool_dir="$(mktemp -d)"
+          raw_sbom="${tool_dir}/${package}.raw.cdx.json"
+          sbom="dist/${package}.sbom.cdx.json"
+          GOBIN="${tool_dir}" go install \
+            github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.9.0
+          CGO_ENABLED=0 GOOS="${TARGET_OS}" GOARCH="${TARGET_ARCH}" \
+            "${tool_dir}/cyclonedx-gomod" mod -json -licenses -noserial \
+            -output "${raw_sbom}" .
+          python3 - "${raw_sbom}" "${sbom}" "${build_date}" \
+            "${GITHUB_REF_NAME}" "${TARGET_OS}" "${TARGET_ARCH}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          raw_path = pathlib.Path(sys.argv[1])
+          output_path = pathlib.Path(sys.argv[2])
+          timestamp, release, target_os, target_arch = sys.argv[3:]
+          document = json.loads(raw_path.read_text(encoding="utf-8"))
+          document["metadata"]["timestamp"] = timestamp
+          component = document["metadata"]["component"]
+          if component.get("version") != release:
+              raise SystemExit(
+                  f"SBOM version {component.get('version')!r} does not match release {release!r}"
+              )
+          purl = component.get("purl", "")
+          required = (f"goos={target_os}", f"goarch={target_arch}")
+          if any(value not in purl for value in required):
+              raise SystemExit(f"SBOM platform does not match {target_os}/{target_arch}: {purl}")
+          output_path.write_text(
+              json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          raw_path.unlink()
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: moto-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: moto-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets=(darwin_arm64 linux_amd64 linux_arm64 windows_amd64)
+          for target in "${targets[@]}"; do
+            test -s "dist/moto_${GITHUB_REF_NAME}_${target}.tar.gz"
+            test -s "dist/moto_${GITHUB_REF_NAME}_${target}.sbom.cdx.json"
+          done
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 8
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          export LC_ALL=C
+          sha256sum * > SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"

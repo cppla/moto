@@ -1,36 +1,91 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"moto/config"
 	"moto/controller"
 	"moto/utils"
 	"os"
-	"sync"
+	"os/signal"
+	"syscall"
+
+	"go.uber.org/zap"
+)
+
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildDate = "unknown"
 )
 
 func main() {
-	conf := flag.String("config", "", "Path to config file")
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "moto: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	conf := flag.String("config", "", "配置文件路径")
+	checkConfig := flag.Bool("check-config", false, "只校验配置，不启动监听")
+	showVersion := flag.Bool("version", false, "显示版本信息")
 	flag.Parse()
-
-	// Load config if a path is provided; overrides default and env
-	if *conf != "" {
-		if err := config.Reload(*conf); err != nil {
-			fmt.Printf("failed to load config: %v\n", err)
-			os.Exit(1)
-		}
+	if *showVersion {
+		fmt.Printf("moto %s (commit %s, built %s)\n", version, commit, buildDate)
+		return nil
 	}
 
-	defer utils.Logger.Sync()
-
-	utils.Logger.Info("MOTO 启动...")
-	// single-sided build: no accelerator init required
-	wg := &sync.WaitGroup{}
-	for _, v := range config.GlobalCfg.Rules {
-		wg.Add(1)
-		go controller.Listen(v, wg)
+	path := *conf
+	if path == "" {
+		path = os.Getenv("MOTO_CONFIG")
 	}
-	wg.Wait()
-	utils.Logger.Info("MOTO 关闭...")
+	if path == "" {
+		path = config.DefaultPath
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		return fmt.Errorf("加载配置 %q: %w", path, err)
+	}
+	if *checkConfig {
+		fmt.Printf("配置有效: %s（%d 条规则）\n", path, len(cfg.Rules))
+		return nil
+	}
+
+	if err := config.SetGlobal(cfg); err != nil {
+		return fmt.Errorf("应用配置: %w", err)
+	}
+	if err := utils.Configure(cfg.Log); err != nil {
+		return fmt.Errorf("初始化日志: %w", err)
+	}
+	defer func() { _ = utils.Logger.Sync() }()
+
+	metricsListen := ""
+	if cfg.Metrics.Enabled {
+		metricsListen = cfg.Metrics.Listen
+	}
+	server, err := controller.NewServerWithMetrics(cfg.Rules, metricsListen)
+	if err != nil {
+		return err
+	}
+	defer server.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	utils.Logger.Info("MOTO 启动",
+		zap.String("version", version),
+		zap.String("commit", commit),
+		zap.String("buildDate", buildDate),
+		zap.String("config", path),
+		zap.Int("rules", len(cfg.Rules)),
+		zap.Bool("metricsEnabled", cfg.Metrics.Enabled),
+		zap.String("metricsListen", metricsListen))
+	if err := server.Serve(ctx); err != nil {
+		return err
+	}
+	utils.Logger.Info("MOTO 关闭")
+	return nil
 }

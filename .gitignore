@@ -23,5 +23,6 @@
 # go build
 go_build_run_go
 moto
+/bin/
 # moto log
 moto.log
