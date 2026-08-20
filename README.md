@@ -4,21 +4,45 @@
 
 <h1 align="center">Moto</h1>
 
-Moto 是一个轻量级、自适应的 TCP 网关，在不断变化的网络里找到更值得走的路。
+<p align="center"><strong>在不断变化的网络里，自动找到更值得走的 TCP 路径。</strong></p>
 
-当同一项服务同时拥有多个出入口、隧道或跨地域节点时，静态优先级很快会过时，普通轮询又无法区分线路质量。Moto 把故障切换、首包分类、EWMA 延迟学习、Top-2 线路竞速、熔断与半开恢复组合在一个进程里；应用只连接一个稳定地址，线路选择和故障绕行由 Moto 完成。 Moto 工作在 TCP 字节流层，不终止 TLS、不改写协议、不篡改流量。 HTTP、HTTPS、WebSocket、SSH、SOCKS5 以及私有 TCP 协议都可以从同一个透明转发核心受益。
+<p align="center">
+  <a href="https://github.com/cppla/moto/actions/workflows/ci.yml"><img src="https://github.com/cppla/moto/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/cppla/moto" alt="Go version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/cppla/moto" alt="License"></a>
+</p>
 
+Moto 是轻量级、自适应的 TCP 网关。应用只连接一个稳定入口，Moto 根据真实拨号延迟、近期故障和转发规则，从多个上游、隧道或跨地域节点中动态选路。
 
 ## 为什么是 Moto？
 
-Moto 给现有 TCP 应用加上一层聪明、克制、开箱即用的多线路大脑：**一个入口、一份配置，自动学习线路质量，主动绕开故障节点。**
+- **自适应选路：** 顺序故障切换、首包分类、EWMA 延迟学习、Top-2 竞速、轮询、熔断和恢复探测都在一个进程内完成。
+- **协议透明：** 不终止 TLS、不改写流量，也不要求接入 SDK；HTTP(S)、WebSocket、SSH、SOCKS5 和私有 TCP 协议均可直接使用。
+- **轻而可靠：** 单个 Go 二进制加一份 JSON 即可运行，同时内置严格配置校验、资源上限、访问控制、Prometheus 指标、优雅退出和跨平台发布。
 
-- **比静态转发更聪明：** Moto 不会永远相信配置顺序。它用真实拨号结果持续更新 EWMA 延迟评分，通过 Top-2 竞速找到当下更快的线路，并定期探索其他节点，避免长期困在昨天的最优解里。
-- **比普通轮询更懂故障：** 连续失败会触发熔断，冷却期间自动跳过问题线路；半开探针确认恢复后再重新接流量，减少故障抖动对业务连接的影响。
-- **对应用完全透明：** 无需修改代码、接入 SDK 或改变协议。Moto 只转发 TCP 字节流，TLS、WebSocket 和私有协议都能保持端到端语义。
-- **部署足够轻：** 单个 Go 二进制加一份 JSON 即可运行，没有外部数据库和控制平面，适合多出口、多隧道、跨地域节点、边缘入口与本地加速。
-- **小而不简陋：** 严格配置校验、连接资源上限、CIDR 访问控制、优雅退出、Prometheus 指标、线路健康状态与可复现跨平台发布已经内置，不需要用生产可靠性换取轻量。
+## 30 秒启动
 
+```bash
+git clone https://github.com/cppla/moto.git
+cd moto
+
+# 校验配置，不监听端口
+go run . --config config/setting.json --check-config
+
+# 启动
+go run . --config config/setting.json
+```
+
+配置路径优先级为 `--config`、`MOTO_CONFIG`、`config/setting.json`。收到 `SIGINT` 或 `SIGTERM` 后，Moto 停止接收新连接，并为现有连接保留最多 10 秒的优雅退出时间。
+
+## 工作方式
+
+```mermaid
+flowchart LR
+    C[Client] --> M[Moto]
+    M -->|每条连接选择一个| W[当前 Target]
+    M -. 故障切换 / 周期探索 .-> S[其他 Targets]
+```
 
 ## 运行模式
 
@@ -29,89 +53,17 @@ Moto 给现有 TCP 应用加上一层聪明、克制、开箱即用的多线路�
 | `boost` | 按 EWMA 评分竞速 Top-2 目标，缓存胜出线路并定期探索其他线路 |
 | `roundrobin` | 按规则独立轮询；单个目标失败时回退到竞速选择 |
 
-域名拨号交给 Go TCP Dialer 处理 IPv4/IPv6 快速回退。可选预热池用于降低已知目标的后续建连时间；线路重新验证始终使用新连接，避免把池命中速度误认为线路速度。每条线路记录拨号延迟 EWMA；连续三次拨号失败或可明确归因于上游的转发失败后进入 5 秒熔断冷却，重复失败时指数增长到最多 60 秒，冷却结束仅允许一个半开探针。竞速取消的败者不会被误记为故障。
+<details>
+<summary><strong>选路、熔断与预热细节</strong></summary>
 
-预热受三层硬限制：每个目标最多 4 个并发补充拨号、进程最多 32 个并发预热拨号、单份配置最多 256 个唯一预热目标。Unix 在取用空闲连接前通过不消费数据的 `MSG_PEEK` 探测 socket，已收到 FIN/RST 或状态不确定的连接不会交给请求；Windows 及尚未实现安全探测的平台会保守禁用复用并使用新连接。线路熔断期间还会清空旧连接并暂停补充，避免后台任务绕过故障保护。预热仍是面向已知兼容协议的可选优化，不应替代新建连接的端到端健康验证。
+域名由 Go TCP Dialer 处理，并支持 IPv4/IPv6 快速回退。每条线路记录拨号延迟 EWMA；连续三次拨号失败或可明确归因于上游的转发失败后，线路进入 5 秒熔断冷却，重复失败时最长增加到 60 秒。冷却结束只允许一个半开探针，竞速取消的败者不会被误记为故障。
 
-## 安全默认
+预热池默认关闭。启用后，每个目标最多 4 个并发补充拨号、进程最多 32 个、单份配置最多 256 个唯一预热目标。Unix 会用非消费式 `MSG_PEEK` 拒绝已收到 FIN/RST 的空闲连接；无法安全探测的平台使用新连接。线路熔断时旧池会被清空并暂停补充。
 
-示例配置只监听 `127.0.0.1`，并限制每规则连接数和单 IP 连接数；服务进程另有 4,096 条客户端连接的硬上限。若要监听公网地址，请同时配置精确的 `allowlist`，并在主机防火墙或安全组中再次限制来源。
+</details>
 
-Moto 是透明 TCP 转发器，本身不替代 TLS、应用层认证或网络访问控制。
-
-示例配置默认关闭所有规则的预热，不会仅因启动就主动连接外部 `targets`。只有确认上游协议允许 TCP 连接在发送业务数据前保持空闲时，才应显式设置 `prewarm: true`。
-
-观测端点也只允许配置为数字形式的 loopback 地址，配置成公网地址或主机名会直接校验失败。
-
-## 运行
-
-```bash
-# 启动前只检查配置；不会监听端口
-go run . --config config/setting.json --check-config
-
-# 启动
-go run . --config config/setting.json
-```
-
-配置路径优先级为 `--config`、`MOTO_CONFIG`、`config/setting.json`。收到 `SIGINT` 或 `SIGTERM` 后，Moto 会停止接受新连接；现有连接最多获得 10 秒的优雅退出窗口，随后其处理上下文和 socket 会被强制关闭。
-
-## 配置
-
-```json
-{
-  "log": {
-    "level": "info",
-    "path": "./moto.log"
-  },
-  "metrics": {
-    "enabled": true,
-    "listen": "127.0.0.1:9090"
-  },
-  "rules": [
-    {
-      "name": "web-failover",
-      "listen": "127.0.0.1:8080",
-      "mode": "normal",
-      "prewarm": false,
-      "timeout": 3000,
-      "allowlist": ["127.0.0.0/8", "::1/128"],
-      "maxConnections": 4096,
-      "maxConnectionsPerIP": 1024,
-      "blacklist": null,
-      "targets": [
-        { "address": "server-a.example.com:80" },
-        { "address": "server-b.example.com:80" }
-      ]
-    }
-  ]
-}
-```
-
-配置加载采用严格校验：未知字段、未知模式、重复规则名、重复监听地址、非法 CIDR、空目标和非法正则都会阻止进程启动。所有监听地址会先一次性绑定；任意端口绑定失败时，不会留下部分规则继续运行。
-
-`timeout` 单位为毫秒：在 `normal` 模式中是整组目标的拨号期限；在 `regex` 模式中分别限制首包分类和匹配后整组目标的拨号（两个阶段各自计时）；在 `boost` 及轮询回退中是竞速决策期限。省略或设为 `0` 时，正则模式默认 500 毫秒，其余模式默认 3 秒。
-
-## WebSocket
-
-Moto 在 TCP 层透明支持 `ws://` 和 `wss://`：HTTP Upgrade/TLS 握手及后续 WebSocket 帧都不会被解析或改写，连接建立后的会话时长也不受上述拨号或首包 `timeout` 限制。仓库的端到端测试覆盖四种运行模式下的 Upgrade、文本帧回显、Ping/Pong，以及超过规则超时后继续传输。
-
-WebSocket 长连接会持续占用全局、规则和单 IP 的连接额度。Moto 关闭时仍遵循 10 秒优雅退出窗口，届时尚未结束的连接会被强制关闭，因此客户端应实现断线重连。
-
-`regex` 模式只能检查明文 WS 握手前 4 KiB；若要按 `Host`、路径或 `Upgrade: websocket` 分流，表达式必须等待对应 Header 到达，不能只写会提前命中的通用 `^GET`。WSS 握手经过 TLS 加密，Moto 不终止 TLS，也不能从中读取 HTTP Host/Path；这类分流需要专门的 SNI 解析或在 Moto 前终止 TLS。WebSocket 规则建议默认保持 `prewarm: false`，除非已确认上游允许业务握手前的空闲 TCP 连接。
-
-## 健康检查与指标
-
-启用 `metrics` 后提供三个仅本机可访问的 HTTP 端点：
-
-```bash
-curl -fsS http://127.0.0.1:9090/healthz
-curl -fsS http://127.0.0.1:9090/readyz
-curl -fsS http://127.0.0.1:9090/metrics
-```
-
-`healthz` 表示进程仍能响应；`readyz` 只在全部转发监听器启动且尚未进入关闭流程时返回成功。Prometheus 文本指标包含 goroutine 数量、连接接收/拒绝/活跃数、双向转发字节和错误、拨号成功率与耗时、Boost 缓存命中、线路 EWMA/熔断状态，以及预热池 idle/warming 数量。省略 `metrics` 或设置 `enabled: false` 时不会启动观测端口；启用但省略 `listen` 时默认使用 `127.0.0.1:9090`。
-
-### 首包匹配示例
+<details>
+<summary><strong>首包正则示例与限制</strong></summary>
 
 | 协议 | JSON 中的正则表达式 |
 | --- | --- |
@@ -121,32 +73,94 @@ curl -fsS http://127.0.0.1:9090/metrics
 | RDP | `^\\x03\\x00\\x00` |
 | SOCKS5 | `^\\x05` |
 
-TCP 是字节流，不保证一次读取就是一个完整“数据包”。Moto 会增量读取并在任一规则匹配后立即停止分类。该模式仍只适用于客户端先发送数据的协议；VNC、FTP、MySQL 等服务端先握手协议不能依靠客户端首包区分。TLS 域名分流更适合后续增加专门的 SNI 解析，而不是维护复杂二进制正则。
+TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量读取并在任一规则匹配后停止分类。`regex` 只适合客户端先发送数据的协议；VNC、FTP、MySQL 等服务端先握手协议不能依靠客户端首包区分。
+
+</details>
+
+## 配置
+
+```json
+{
+  "log": {
+    "level": "info",
+    "path": ""
+  },
+  "metrics": {
+    "enabled": true,
+    "listen": "127.0.0.1:9090"
+  },
+  "rules": [
+    {
+      "name": "web",
+      "listen": "127.0.0.1:8080",
+      "mode": "boost",
+      "prewarm": false,
+      "timeout": 3000,
+      "allowlist": ["127.0.0.0/8", "::1/128"],
+      "targets": [
+        { "address": "server-a.example.com:443" },
+        { "address": "server-b.example.com:443" }
+      ]
+    }
+  ]
+}
+```
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | 无 | `normal`、`regex`、`boost` 或 `roundrobin` |
+| `timeout` | `regex` 为 500 ms；其余为 3 s | 拨号或首包决策期限，不限制已建立连接的寿命 |
+| `prewarm` | `false` | 仅在上游允许业务握手前保持空闲 TCP 时启用 |
+| `allowlist` | 空 | CIDR 来源白名单；空值允许所有有效地址 |
+| `blacklist` | 空 | 兼容旧配置的精确 IP 拒绝表 |
+| `maxConnections` | `4096` | 单规则连接上限 |
+| `maxConnectionsPerIP` | `256` | 单 IP、单规则连接上限 |
+| `metrics` | 关闭 | 启用时默认监听 `127.0.0.1:9090` |
+
+配置采用严格校验：未知字段、未知模式、重复规则名或监听地址、非法 CIDR、空目标和非法正则都会阻止启动。所有监听地址会先一次性绑定，任一端口失败都不会留下部分服务继续运行。
+
+## 安全与可观测
+
+- 示例配置只监听 `127.0.0.1`，默认关闭预热，启动时不会主动连接外部目标。
+- 进程最多同时处理 4,096 条客户端连接；若监听公网地址，应同时配置精确 `allowlist`，并使用防火墙或安全组限制来源。
+- Moto 是透明 TCP 转发器，不替代 TLS、应用认证或网络访问控制；观测端点只能监听数字形式的 loopback 地址。
+
+```bash
+curl -fsS http://127.0.0.1:9090/healthz
+curl -fsS http://127.0.0.1:9090/readyz
+curl -fsS http://127.0.0.1:9090/metrics
+```
+
+`healthz` 表示进程可响应，`readyz` 只在全部转发监听器就绪且未进入关闭流程时成功。Prometheus 指标覆盖 goroutine、连接数、转发字节与错误、拨号成功率与耗时、Boost 缓存、线路 EWMA/熔断状态和预热池状态。
+
+## WebSocket
+
+Moto 在 TCP 层透明支持 `ws://` 和 `wss://`。HTTP Upgrade、TLS 握手和 WebSocket 帧不会被解析或改写，已建立会话也不受规则 `timeout` 限制；四种模式均有 Upgrade、文本帧、Ping/Pong 和长连接端到端测试。
+
+长连接会持续占用连接额度，并在 Moto 关闭超过 10 秒后被强制断开。`regex` 只能检查明文 WS 握手前 4 KiB；WSS 中的 Host 和路径已被 TLS 加密，无法用于正则分流。WebSocket 规则建议保持 `prewarm: false`。
 
 ## 构建与验证
 
-项目要求 Go 1.25.13 或更高的兼容版本；使用 `GOTOOLCHAIN=auto` 时 Go 命令会自动选择该补丁工具链。
+项目要求 Go 1.25.13 或更高的兼容版本。
 
 ```bash
-go build ./...
-go test ./...
-go test -race ./...
-go vet ./...
-
-# 完整本地分析门禁（含 workflow、模块完整性、staticcheck、govulncheck、示例配置、脚本语法与四模式本机闭环 smoke）
+# 完整本地门禁
 make check
 
-# 与 CI 等价：在上述门禁后再构建四个平台产物
+# 与 CI 等价，并交叉构建 Linux、macOS 和 Windows
 make ci
 
-# 带版本、提交和构建时间信息的二进制
+# 生成带版本信息的当前平台二进制
 make build
 ./bin/moto --version
 ```
 
-CI 固定使用 Go 1.25.13，并覆盖格式、模块完整性、测试、vet、race、staticcheck、可达漏洞、示例配置、四种模式的本机闭环基准门禁，以及 Linux amd64/arm64、macOS arm64、Windows amd64 构建。推送符合语义版本的 `v*` tag 会生成可复现的多平台压缩包、每个平台对应且时间归一化的 CycloneDX SBOM、SHA-256 校验文件和自动 release notes。
+CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达漏洞、示例配置和四模式本机闭环 smoke。推送 `v*` 语义版本 tag 会生成可复现的多平台压缩包、CycloneDX SBOM、SHA-256 校验文件和自动 release notes。
 
-完全本地的回归门禁会自动启动临时 HTTP 上游和 Moto，不访问外网；它分别报告直连、冷态、热态的吞吐与 p50/p95/p99，并采样 Moto 的 CPU、RSS、FD 和 goroutine 峰值：
+<details>
+<summary><strong>本地回归与性能采样</strong></summary>
+
+完全本地的回归门禁不访问外网，会报告直连、冷态和热态的吞吐与 p50/p95/p99，并采样 CPU、RSS、FD 和 goroutine：
 
 ```bash
 python3 test/bench.py --self-contained --mode boost \
@@ -154,7 +168,7 @@ python3 test/bench.py --self-contained --mode boost \
   --min-success-rate 99 --save /tmp/moto-bench.json
 ```
 
-SOCKS5 场景的并发检查脚本支持参数化地址和成功率门禁：
+SOCKS5 外部场景也可参数化运行：
 
 ```bash
 python3 test/bench.py \
@@ -164,7 +178,9 @@ python3 test/bench.py \
   --min-success-rate 99
 ```
 
-生产性能结论应同时记录冷/热连接、直连基线、成功率、p50/p95/p99、CPU、RSS、FD 和 goroutine 数量，避免只比较单次最快延迟。
+生产性能评估应同时记录直连基线、成功率、p50/p95/p99 和资源峰值，不能只比较单次最快延迟。
+
+</details>
 
 ## 参考
 
