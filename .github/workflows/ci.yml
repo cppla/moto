@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -34,6 +34,8 @@ jobs:
         run: make staticcheck
       - name: Test with race detector
         run: make race
+      - name: Stress routing, reload, and fault transitions
+        run: make fault-test
       - name: Check reachable vulnerabilities
         run: make vuln
       - name: Validate sample config

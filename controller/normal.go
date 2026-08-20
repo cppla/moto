@@ -12,6 +12,10 @@ import (
 
 // HandleNormal 会依次尝试各个目标，并在首个连接成功的目标上转发流量。
 func HandleNormal(ctx context.Context, conn net.Conn, rule *config.Rule) {
+	defaultRoutingRuntime.handleNormal(ctx, conn, rule)
+}
+
+func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, rule *config.Rule) {
 	if conn == nil || rule == nil || len(rule.Targets) == 0 {
 		return
 	}
@@ -29,7 +33,7 @@ func HandleNormal(ctx context.Context, conn net.Conn, rule *config.Rule) {
 	var target net.Conn
 	var targetAttempt routeAttempt
 	for _, candidate := range rule.Targets {
-		candidateConn, attempt, err := outboundDialRoute(dialCtx, rule, candidate.Address)
+		candidateConn, attempt, err := runtime.outboundDialRoute(dialCtx, rule, candidate.Address)
 		if err != nil {
 			utils.Logger.Error("无法建立连接，尝试下一个目标",
 				zap.String("ruleName", rule.Name),
@@ -39,6 +43,15 @@ func HandleNormal(ctx context.Context, conn net.Conn, rule *config.Rule) {
 			continue
 		}
 		configureTCP(candidateConn)
+		if err := writeOutboundProxyProtocol(candidateConn, conn, rule); err != nil {
+			routeReportFailure(attempt, err, time.Now())
+			_ = candidateConn.Close()
+			utils.Logger.Error("写入 PROXY protocol 头失败，尝试下一个目标",
+				zap.String("ruleName", rule.Name),
+				zap.String("targetAddr", candidate.Address),
+				zap.Error(err))
+			continue
+		}
 		target = candidateConn
 		targetAttempt = attempt
 		break

@@ -9,7 +9,23 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.25.13
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Run the complete release gate
+        run: make check
+
   build:
+    needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -47,15 +63,17 @@ jobs:
           package="moto_${GITHUB_REF_NAME}_${TARGET_OS}_${TARGET_ARCH}"
           binary="moto"
           if [[ "${TARGET_OS}" == "windows" ]]; then binary="moto.exe"; fi
-          mkdir -p dist stage/config
+          package_dir="stage/${package}"
+          mkdir -p dist "${package_dir}/config" "${package_dir}/packaging"
           CGO_ENABLED=0 GOOS="${TARGET_OS}" GOARCH="${TARGET_ARCH}" \
             go build -trimpath -buildvcs=false \
             -ldflags "-s -w -buildid= -X main.version=${GITHUB_REF_NAME} -X main.commit=${commit} -X main.buildDate=${build_date}" \
-            -o "stage/${binary}" .
-          install -m 0644 README.md LICENSE stage/
-          install -m 0644 config/setting.json stage/config/
+            -o "${package_dir}/${binary}" .
+          install -m 0644 README.md LICENSE "${package_dir}/"
+          install -m 0644 config/setting.json "${package_dir}/config/"
+          install -m 0644 packaging/moto.service "${package_dir}/packaging/"
           tar --sort=name --mtime="@${epoch}" --owner=0 --group=0 --numeric-owner \
-            -C stage -cf - . | gzip -n > "dist/${package}.tar.gz"
+            -C stage -cf - "${package}" | gzip -n > "dist/${package}.tar.gz"
 
           tool_dir="$(mktemp -d)"
           raw_sbom="${tool_dir}/${package}.raw.cdx.json"
@@ -98,7 +116,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -119,8 +137,23 @@ jobs:
           set -euo pipefail
           targets=(darwin_arm64 linux_amd64 linux_arm64 windows_amd64)
           for target in "${targets[@]}"; do
-            test -s "dist/moto_${GITHUB_REF_NAME}_${target}.tar.gz"
+            package="moto_${GITHUB_REF_NAME}_${target}"
+            archive="dist/${package}.tar.gz"
+            binary="moto"
+            if [[ "${target}" == windows_* ]]; then binary="moto.exe"; fi
+            test -s "${archive}"
             test -s "dist/moto_${GITHUB_REF_NAME}_${target}.sbom.cdx.json"
+
+            top_levels="$(tar -tzf "${archive}" | cut -d/ -f1 | LC_ALL=C sort -u)"
+            test "${top_levels}" = "${package}"
+            actual="$(tar -tzf "${archive}" | sed '/\/$/d' | LC_ALL=C sort)"
+            expected="$(printf '%s\n' \
+              "${package}/${binary}" \
+              "${package}/LICENSE" \
+              "${package}/README.md" \
+              "${package}/config/setting.json" \
+              "${package}/packaging/moto.service" | LC_ALL=C sort)"
+            test "${actual}" = "${expected}"
           done
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 8
       - name: Generate checksums

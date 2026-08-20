@@ -24,12 +24,6 @@ const (
 	prewarmMaintenancePeriod = 250 * time.Millisecond
 )
 
-var (
-	prewarmPoolsMu sync.Mutex
-	prewarmPools   = make(map[string]*prewarmPool)
-	prewarmDialSem = make(chan struct{}, prewarmGlobalDialLimit)
-)
-
 type idlePrewarmConn struct {
 	conn      net.Conn
 	idleSince time.Time
@@ -39,6 +33,7 @@ type idlePrewarmConn struct {
 // one target. A single reconciler owns replenishment decisions, while warming
 // tracks the small, bounded number of concurrent dials.
 type prewarmPool struct {
+	manager *prewarmManager
 	addr    string
 	desired int
 
@@ -59,6 +54,10 @@ type prewarmPool struct {
 
 // initPrewarm 会为规则中的每个目标开启后台保温。
 func initPrewarm(rule *config.Rule) {
+	defaultRoutingRuntime.prewarm.init(rule)
+}
+
+func (manager *prewarmManager) init(rule *config.Rule) {
 	if rule == nil || !rule.Prewarm {
 		return
 	}
@@ -68,7 +67,7 @@ func initPrewarm(rule *config.Rule) {
 		return
 	}
 	for _, target := range rule.Targets {
-		ensurePrewarmPoolForRule(rule, target.Address, prewarmInitialSize)
+		manager.ensureForRule(rule, target.Address, prewarmInitialSize)
 	}
 }
 
@@ -83,8 +82,13 @@ func clampPrewarmDesired(desired int) int {
 }
 
 func newPrewarmPool(addr string, desired int) *prewarmPool {
+	return defaultRoutingRuntime.prewarm.newPool(addr, desired)
+}
+
+func (manager *prewarmManager) newPool(addr string, desired int) *prewarmPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &prewarmPool{
+		manager: manager,
 		addr:    addr,
 		desired: clampPrewarmDesired(desired),
 		ctx:     ctx,
@@ -101,21 +105,21 @@ func (p *prewarmPool) start() {
 	p.signal()
 }
 
-func ensurePrewarmPoolForRule(rule *config.Rule, addr string, desired int) *prewarmPool {
+func (manager *prewarmManager) ensureForRule(rule *config.Rule, addr string, desired int) *prewarmPool {
 	desired = clampPrewarmDesired(desired)
-	prewarmPoolsMu.Lock()
-	pool := prewarmPools[addr]
+	manager.mu.Lock()
+	pool := manager.pools[addr]
 	if pool == nil {
-		pool = newPrewarmPool(addr, desired)
+		pool = manager.newPool(addr, desired)
 		if rule != nil {
 			pool.rules[boostRuleKey(rule)] = rule
 		}
-		prewarmPools[addr] = pool
+		manager.pools[addr] = pool
 		pool.start()
-		prewarmPoolsMu.Unlock()
+		manager.mu.Unlock()
 		return pool
 	}
-	prewarmPoolsMu.Unlock()
+	manager.mu.Unlock()
 
 	pool.mu.Lock()
 	if rule != nil {
@@ -173,7 +177,8 @@ func (p *prewarmPool) reconcile(now time.Time) {
 	// a fresh half-open probe.
 	routeUnavailable := false
 	for _, rule := range p.rules {
-		if routeSnapshot(rule, p.addr, now).CircuitOpen {
+		if p.manager.runtime.health.unhealthy(rule, p.addr) ||
+			p.manager.runtime.routes.snapshot(rule, p.addr, now).CircuitOpen {
 			routeUnavailable = true
 			break
 		}
@@ -196,7 +201,7 @@ func (p *prewarmPool) reconcile(now time.Time) {
 	reserved := 0
 	for reserved < need {
 		select {
-		case prewarmDialSem <- struct{}{}:
+		case p.manager.dialSem <- struct{}{}:
 			reserved++
 		default:
 			need = reserved
@@ -237,7 +242,7 @@ func prewarmBackoff(failures int) time.Duration {
 // the next retry deadline; no retry goroutine sleeps or recursively respawns.
 func (p *prewarmPool) dialOne() {
 	defer p.wg.Done()
-	defer func() { <-prewarmDialSem }()
+	defer func() { <-p.manager.dialSem }()
 
 	p.mu.Lock()
 	rules := make([]*config.Rule, 0, len(p.rules))
@@ -252,10 +257,11 @@ func (p *prewarmPool) dialOne() {
 	attempts := make([]trackedAttempt, 0, len(rules))
 	started := time.Now()
 	for _, rule := range rules {
-		if routeSnapshot(rule, p.addr, started).CircuitOpen {
+		if p.manager.runtime.health.unhealthy(rule, p.addr) ||
+			p.manager.runtime.routes.snapshot(rule, p.addr, started).CircuitOpen {
 			continue
 		}
-		attempt, err := routeBegin(rule, p.addr, started)
+		attempt, err := p.manager.runtime.routes.begin(rule, p.addr, started)
 		if err == nil {
 			attempts = append(attempts, trackedAttempt{rule: rule, attempt: attempt})
 		}
@@ -319,9 +325,13 @@ func (p *prewarmPool) dialOne() {
 // acquirePrewarmed removes expired idle connections before returning the most
 // recently established one.
 func acquirePrewarmed(addr string) (net.Conn, bool) {
-	prewarmPoolsMu.Lock()
-	pool := prewarmPools[addr]
-	prewarmPoolsMu.Unlock()
+	return defaultRoutingRuntime.prewarm.acquire(addr)
+}
+
+func (manager *prewarmManager) acquire(addr string) (net.Conn, bool) {
+	manager.mu.Lock()
+	pool := manager.pools[addr]
+	manager.mu.Unlock()
 	if pool == nil {
 		return nil, false
 	}
@@ -361,10 +371,14 @@ func acquirePrewarmed(addr string) (net.Conn, bool) {
 }
 
 func (p *prewarmPool) stop() {
+	p.beginStop()
+	p.wg.Wait()
+}
+
+func (p *prewarmPool) beginStop() {
 	p.mu.Lock()
 	if p.stopped {
 		p.mu.Unlock()
-		p.wg.Wait()
 		return
 	}
 	p.stopped = true
@@ -375,22 +389,28 @@ func (p *prewarmPool) stop() {
 	for _, entry := range idle {
 		_ = entry.conn.Close()
 	}
-	p.wg.Wait()
 }
 
 // shutdownPrewarm can be called repeatedly. It atomically detaches all pools,
 // cancels replenishment, closes every idle connection, and waits for in-flight
 // dials to observe cancellation.
 func shutdownPrewarm() {
-	prewarmPoolsMu.Lock()
-	pools := make([]*prewarmPool, 0, len(prewarmPools))
-	for addr, pool := range prewarmPools {
-		delete(prewarmPools, addr)
+	defaultRoutingRuntime.prewarm.shutdown()
+}
+
+func (manager *prewarmManager) shutdown() {
+	manager.mu.Lock()
+	pools := make([]*prewarmPool, 0, len(manager.pools))
+	for addr, pool := range manager.pools {
+		delete(manager.pools, addr)
 		pools = append(pools, pool)
 	}
-	prewarmPoolsMu.Unlock()
+	manager.mu.Unlock()
 	for _, pool := range pools {
-		pool.stop()
+		pool.beginStop()
+	}
+	for _, pool := range pools {
+		pool.wg.Wait()
 	}
 }
 
@@ -398,20 +418,27 @@ func shutdownPrewarm() {
 // enabled prewarming. Other rules always establish a fresh connection, even if
 // another rule happens to share the same target address.
 func outboundDial(ctx context.Context, rule *config.Rule, addr string) (net.Conn, error) {
-	conn, _, err := outboundDialRoute(ctx, rule, addr)
+	return defaultRoutingRuntime.outboundDial(ctx, rule, addr)
+}
+
+func (runtime *routingRuntime) outboundDial(ctx context.Context, rule *config.Rule, addr string) (net.Conn, error) {
+	conn, _, err := runtime.outboundDialRoute(ctx, rule, addr)
 	return conn, err
 }
 
-func outboundDialRoute(ctx context.Context, rule *config.Rule, addr string) (net.Conn, routeAttempt, error) {
+func (runtime *routingRuntime) outboundDialRoute(ctx context.Context, rule *config.Rule, addr string) (net.Conn, routeAttempt, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, routeAttempt{}, err
 	}
+	if runtime.health.unhealthy(rule, addr) {
+		return nil, routeAttempt{}, ErrActiveHealthUnhealthy
+	}
 	now := time.Now()
-	snapshot := routeSnapshot(rule, addr, now)
-	attempt, err := routeBegin(rule, addr, now)
+	snapshot := runtime.routes.snapshot(rule, addr, now)
+	attempt, err := runtime.routes.begin(rule, addr, now)
 	if err != nil {
 		return nil, routeAttempt{}, err
 	}
@@ -419,7 +446,7 @@ func outboundDialRoute(ctx context.Context, rule *config.Rule, addr string) (net
 	// pooled socket would make an expired circuit look healthy without testing
 	// the current network path.
 	if rule != nil && rule.Prewarm && prewarmReuseSupported && !snapshot.ProbeRequired {
-		if conn, ok := acquirePrewarmed(addr); ok {
+		if conn, ok := runtime.prewarm.acquire(addr); ok {
 			if err := ctx.Err(); err != nil {
 				_ = conn.Close()
 				return nil, attempt, err

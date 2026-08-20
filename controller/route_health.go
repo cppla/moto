@@ -68,16 +68,21 @@ type routeHealthKey struct {
 }
 
 type routeAttempt struct {
-	key   routeHealthKey
-	id    uint64
-	valid bool
+	registry *routeHealthRegistry
+	key      routeHealthKey
+	id       uint64
+	valid    bool
 }
 
-var routeHealth = struct {
+type routeHealthRegistry struct {
 	sync.Mutex
 	states      map[routeHealthKey]*routeHealthState
 	nextAttempt uint64
-}{states: make(map[routeHealthKey]*routeHealthState)}
+}
+
+func newRouteHealthRegistry() *routeHealthRegistry {
+	return &routeHealthRegistry{states: make(map[routeHealthKey]*routeHealthState)}
+}
 
 func routeKey(rule *config.Rule, addr string) (routeHealthKey, bool) {
 	if rule == nil || addr == "" {
@@ -90,23 +95,27 @@ func routeKey(rule *config.Rule, addr string) (routeHealthKey, bool) {
 // probe after a circuit's cooldown. Every admitted attempt should eventually
 // be paired with routeObserve.
 func routeBegin(rule *config.Rule, addr string, now time.Time) (routeAttempt, error) {
+	return defaultRoutingRuntime.routes.begin(rule, addr, now)
+}
+
+func (registry *routeHealthRegistry) begin(rule *config.Rule, addr string, now time.Time) (routeAttempt, error) {
 	key, ok := routeKey(rule, addr)
 	if !ok {
 		return routeAttempt{}, nil
 	}
 
-	routeHealth.Lock()
-	defer routeHealth.Unlock()
-	state := routeHealth.states[key]
+	registry.Lock()
+	defer registry.Unlock()
+	state := registry.states[key]
 	if state == nil {
 		state = newRouteHealthState(rule)
-		routeHealth.states[key] = state
+		registry.states[key] = state
 	}
 	if state.circuitOpen && (now.Before(state.openUntil) || state.halfOpen) {
 		return routeAttempt{}, ErrCircuitOpen
 	}
-	routeHealth.nextAttempt++
-	attempt := routeAttempt{key: key, id: routeHealth.nextAttempt, valid: true}
+	registry.nextAttempt++
+	attempt := routeAttempt{registry: registry, key: key, id: registry.nextAttempt, valid: true}
 	state.lastAttempt = now
 	if state.circuitOpen {
 		state.halfOpen = true
@@ -120,24 +129,25 @@ func routeBegin(rule *config.Rule, addr string, now time.Time) (routeAttempt, er
 // not make a healthy route look faulty. DeadlineExceeded remains a failure,
 // since a route that cannot meet its dial deadline is unhealthy for routing.
 func routeObserve(attempt routeAttempt, latency time.Duration, err error, now time.Time) {
-	if !attempt.valid {
+	registry := attempt.registry
+	if !attempt.valid || registry == nil {
 		return
 	}
 
 	if errors.Is(err, context.Canceled) {
-		routeHealth.Lock()
-		if state := routeHealth.states[attempt.key]; state != nil && state.circuitOpen &&
+		registry.Lock()
+		if state := registry.states[attempt.key]; state != nil && state.circuitOpen &&
 			state.halfOpen && state.halfOpenAttempt == attempt.id {
 			state.halfOpen = false
 			state.halfOpenAttempt = 0
 		}
-		routeHealth.Unlock()
+		registry.Unlock()
 		return
 	}
 
-	routeHealth.Lock()
-	defer routeHealth.Unlock()
-	state := routeHealth.states[attempt.key]
+	registry.Lock()
+	defer registry.Unlock()
+	state := registry.states[attempt.key]
 	if state == nil {
 		return
 	}
@@ -204,12 +214,13 @@ func routeObserve(attempt routeAttempt, latency time.Duration, err error, now ti
 // the circuit breaker. The originating attempt token prevents an old stream
 // from corrupting a newer recovery generation.
 func routeReportFailure(attempt routeAttempt, err error, now time.Time) {
-	if !attempt.valid || err == nil || errors.Is(err, context.Canceled) {
+	registry := attempt.registry
+	if !attempt.valid || registry == nil || err == nil || errors.Is(err, context.Canceled) {
 		return
 	}
-	routeHealth.Lock()
-	defer routeHealth.Unlock()
-	state := routeHealth.states[attempt.key]
+	registry.Lock()
+	defer registry.Unlock()
+	state := registry.states[attempt.key]
 	if state == nil || attempt.id < state.minValidAttempt || state.circuitOpen {
 		return
 	}
@@ -223,12 +234,13 @@ func routeReportFailure(attempt routeAttempt, err error, now time.Time) {
 }
 
 func routeReportSuccess(attempt routeAttempt) {
-	if !attempt.valid {
+	registry := attempt.registry
+	if !attempt.valid || registry == nil {
 		return
 	}
-	routeHealth.Lock()
-	defer routeHealth.Unlock()
-	state := routeHealth.states[attempt.key]
+	registry.Lock()
+	defer registry.Unlock()
+	state := registry.states[attempt.key]
 	if state == nil || attempt.id < state.minValidAttempt || state.circuitOpen {
 		return
 	}
@@ -254,14 +266,18 @@ func nextRouteCooldown(previous time.Duration) time.Duration {
 }
 
 func routeSnapshot(rule *config.Rule, addr string, now time.Time) routeHealthSnapshot {
+	return defaultRoutingRuntime.routes.snapshot(rule, addr, now)
+}
+
+func (registry *routeHealthRegistry) snapshot(rule *config.Rule, addr string, now time.Time) routeHealthSnapshot {
 	key, ok := routeKey(rule, addr)
 	if !ok {
 		return routeHealthSnapshot{}
 	}
 
-	routeHealth.Lock()
-	defer routeHealth.Unlock()
-	state := routeHealth.states[key]
+	registry.Lock()
+	defer registry.Unlock()
+	state := registry.states[key]
 	if state == nil {
 		return routeHealthSnapshot{}
 	}
@@ -279,20 +295,20 @@ func routeSnapshot(rule *config.Rule, addr string, now time.Time) routeHealthSna
 	}
 }
 
-func clearRouteHealth(rules []*config.Rule) {
+func (registry *routeHealthRegistry) clear(rules []*config.Rule) {
 	keys := make(map[string]struct{}, len(rules))
 	for _, rule := range rules {
 		if rule != nil {
 			keys[boostRuleKey(rule)] = struct{}{}
 		}
 	}
-	routeHealth.Lock()
-	for key := range routeHealth.states {
+	registry.Lock()
+	for key := range registry.states {
 		if _, ok := keys[key.rule]; ok {
-			delete(routeHealth.states, key)
+			delete(registry.states, key)
 		}
 	}
-	routeHealth.Unlock()
+	registry.Unlock()
 }
 
 type routeCandidate struct {
@@ -309,13 +325,12 @@ type routeCandidate struct {
 // EWMA latency plus a failure penalty and periodic exploration. Callers must
 // still use routeBegin, which atomically excludes duplicate half-open probes.
 func selectRouteTargets(rule *config.Rule, limit int, now time.Time) []*config.Target {
-	return selectRouteTargetsExcluding(rule, limit, now, nil)
+	return defaultRoutingRuntime.routes.selectTargetsExcluding(rule, limit, now, nil)
 }
 
-// selectRouteTargetsExcluding is the batching form used by Boost. Exclusions
-// are keyed by address so a target is attempted at most once for one inbound
-// connection even if the configuration accidentally repeats it.
-func selectRouteTargetsExcluding(rule *config.Rule, limit int, now time.Time, excluded map[string]struct{}) []*config.Target {
+// selectTargetsExcluding is the batching form used by Boost. Exclusions are
+// keyed by address so a target is attempted at most once per inbound stream.
+func (registry *routeHealthRegistry) selectTargetsExcluding(rule *config.Rule, limit int, now time.Time, excluded map[string]struct{}) []*config.Target {
 	if rule == nil || limit <= 0 || len(rule.Targets) == 0 {
 		return nil
 	}
@@ -324,7 +339,7 @@ func selectRouteTargetsExcluding(rule *config.Rule, limit int, now time.Time, ex
 	observed := make([]routeCandidate, 0, len(rule.Targets))
 	seenAddresses := make(map[string]struct{}, len(rule.Targets))
 
-	routeHealth.Lock()
+	registry.Lock()
 	for index, target := range rule.Targets {
 		if target == nil || target.Address == "" {
 			continue
@@ -336,7 +351,7 @@ func selectRouteTargetsExcluding(rule *config.Rule, limit int, now time.Time, ex
 			continue
 		}
 		seenAddresses[target.Address] = struct{}{}
-		state := routeHealth.states[routeHealthKey{rule: ruleID, addr: target.Address}]
+		state := registry.states[routeHealthKey{rule: ruleID, addr: target.Address}]
 		if state == nil || !state.observed {
 			candidate := routeCandidate{target: target, index: index}
 			if state != nil {
@@ -361,7 +376,7 @@ func selectRouteTargetsExcluding(rule *config.Rule, limit int, now time.Time, ex
 			hasEWMA:     state.hasEWMA,
 		})
 	}
-	routeHealth.Unlock()
+	registry.Unlock()
 
 	sort.SliceStable(observed, func(i, j int) bool {
 		if observed[i].score == observed[j].score {

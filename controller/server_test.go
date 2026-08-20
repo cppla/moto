@@ -123,36 +123,36 @@ func TestNewServerWithMetricsRejectsNonLoopbackAddress(t *testing.T) {
 	}
 }
 
-func TestListenerStateEnforcesPerIPAndRuleLimits(t *testing.T) {
+func TestListenerAdmissionEnforcesPerIPAndRuleLimits(t *testing.T) {
 	rule := &config.Rule{MaxConnections: 2, MaxConnectionsPerIP: 1}
-	state := &listenerState{
-		rule:  rule,
-		limit: make(chan struct{}, rule.MaxConnections),
-		perIP: make(map[netip.Addr]int),
-	}
+	admission := &listenerAdmission{perIP: make(map[netip.Addr]int)}
 	ip1 := netip.MustParseAddr("192.0.2.1")
 	ip2 := netip.MustParseAddr("192.0.2.2")
 	ip3 := netip.MustParseAddr("192.0.2.3")
 
-	if !state.admit(ip1) {
+	if !admission.reserveRule(rule) || !admission.assignReservedIP(rule, ip1) {
 		t.Fatal("first connection should be admitted")
 	}
-	if state.admit(ip1) {
+	if !admission.reserveRule(rule) {
+		t.Fatal("second pending connection should fit the rule limit")
+	}
+	if admission.assignReservedIP(rule, ip1) {
 		t.Fatal("second connection from the same IP should be rejected")
 	}
-	if !state.admit(ip2) {
+	admission.releasePending()
+	if !admission.reserveRule(rule) || !admission.assignReservedIP(rule, ip2) {
 		t.Fatal("second global connection should be admitted")
 	}
-	if state.admit(ip3) {
+	if admission.reserveRule(rule) {
 		t.Fatal("connection beyond the global limit should be rejected")
 	}
 
-	state.release(ip1)
-	if !state.admit(ip3) {
+	admission.releaseRule(ip1)
+	if !admission.reserveRule(rule) || !admission.assignReservedIP(rule, ip3) {
 		t.Fatal("released capacity should be reusable")
 	}
-	state.release(ip2)
-	state.release(ip3)
+	admission.releaseRule(ip2)
+	admission.releaseRule(ip3)
 }
 
 func TestServerEnforcesProcessConnectionLimit(t *testing.T) {

@@ -16,7 +16,7 @@ Moto 是轻量级、自适应的 TCP 网关。应用只连接一个稳定入口�
 
 ## 为什么是 Moto？
 
-- **自适应选路：** 顺序故障切换、首包分类、EWMA 延迟学习、Top-2 竞速、轮询、熔断和恢复探测都在一个进程内完成。
+- **自适应选路：** 顺序故障切换、首包与 TLS SNI/ALPN 分类、EWMA 延迟学习、Top-2 竞速、主动健康检查、熔断和恢复探测都在一个进程内完成。
 - **协议透明：** 不终止 TLS、不改写流量，也不要求接入 SDK；HTTP(S)、WebSocket、SSH、SOCKS5 和私有 TCP 协议均可直接使用。
 - **轻而可靠：** 单个 Go 二进制加一份 JSON 即可运行，同时内置严格配置校验、资源上限、访问控制、Prometheus 指标、优雅退出和跨平台发布。
 
@@ -33,7 +33,7 @@ go run . --config config/setting.json --check-config
 go run . --config config/setting.json
 ```
 
-配置路径优先级为 `--config`、`MOTO_CONFIG`、`config/setting.json`。收到 `SIGINT` 或 `SIGTERM` 后，Moto 停止接收新连接，并为现有连接保留最多 10 秒的优雅退出时间。
+配置路径优先级为 `--config`、`MOTO_CONFIG`、`config/setting.json`。Unix 下发送 `SIGHUP` 会校验并原子切换规则：旧连接继续使用旧规则，新连接只使用新规则；解析、校验或新端口绑定失败时继续运行原配置。最多允许 8 个旧 generation 同时排空，达到上限会拒绝下一次重载；Windows、日志或 metrics 监听变更需要重启。收到 `SIGINT` 或 `SIGTERM` 后，Moto 停止接收新连接，并为现有连接保留最多 10 秒的优雅退出时间。
 
 ## 工作方式
 
@@ -52,6 +52,7 @@ flowchart LR
 | `regex` | 在最多 4 KiB 的客户端首包中匹配规则，再转发完整字节流 |
 | `boost` | 按 EWMA 评分竞速 Top-2 目标，缓存胜出线路并定期探索其他线路 |
 | `roundrobin` | 按规则独立轮询；单个目标失败时回退到竞速选择 |
+| `tls` | 解析 ClientHello 的 SNI/ALPN 选路，再原样转发 TLS 字节流 |
 
 <details>
 <summary><strong>选路、熔断与预热细节</strong></summary>
@@ -108,16 +109,58 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `mode` | 无 | `normal`、`regex`、`boost` 或 `roundrobin` |
+| `mode` | 无 | `normal`、`regex`、`boost`、`roundrobin` 或 `tls` |
 | `timeout` | `regex` 为 500 ms；其余为 3 s | 拨号或首包决策期限，不限制已建立连接的寿命 |
 | `prewarm` | `false` | 仅在上游允许业务握手前保持空闲 TCP 时启用 |
+| `healthCheck` | 关闭 | 可选 TCP 或明文 HTTP 主动探测，达到阈值后暂时排除目标 |
+| `proxyProtocol` | 关闭 | 从可信 CIDR 接收 PROXY v1/v2，或向上游发送 v1/v2 |
 | `allowlist` | 空 | CIDR 来源白名单；空值允许所有有效地址 |
 | `blacklist` | 空 | 兼容旧配置的精确 IP 拒绝表 |
 | `maxConnections` | `4096` | 单规则连接上限 |
 | `maxConnectionsPerIP` | `256` | 单 IP、单规则连接上限 |
 | `metrics` | 关闭 | 启用时默认监听 `127.0.0.1:9090` |
 
-配置采用严格校验：未知字段、未知模式、重复规则名或监听地址、非法 CIDR、空目标和非法正则都会阻止启动。所有监听地址会先一次性绑定，任一端口失败都不会留下部分服务继续运行。
+配置采用严格校验：未知字段、重复 JSON 键、字段名大小写变体、未知模式、重复规则名或监听地址、非法 CIDR、空目标和非法正则都会阻止启动。所有监听地址会先一次性绑定，任一端口失败都不会留下部分服务继续运行。
+
+<details>
+<summary><strong>TLS、健康检查与 PROXY protocol 示例</strong></summary>
+
+```json
+{
+  "name": "tls-edge",
+  "listen": "127.0.0.1:8443",
+  "mode": "tls",
+  "timeout": 3000,
+  "healthCheck": {
+    "type": "tcp",
+    "interval": 10000,
+    "timeout": 2000,
+    "failureThreshold": 3,
+    "successThreshold": 2
+  },
+  "proxyProtocol": {
+    "accept": true,
+    "trustedCIDRs": ["127.0.0.0/8"],
+    "send": "v2"
+  },
+  "targets": [
+    {
+      "address": "127.0.0.1:9443",
+      "serverNames": ["api.example.com", "*.edge.example.com"],
+      "alpn": ["h2", "http/1.1"]
+    },
+    { "address": "127.0.0.1:9444" }
+  ]
+}
+```
+
+`tls` 不解密流量；`serverNames` 支持精确名称和单标签 `*.` 通配符，`alpn` 为精确匹配，未配置匹配条件的目标是 fallback。
+
+`healthCheck` 的时长单位均为毫秒：`interval` 默认 10 秒、范围 250 毫秒到 10 分钟；`timeout` 默认取 2 秒与 interval 的较小值、范围 50 毫秒到 30 秒且不得超过 interval；失败/恢复阈值默认 3/2，范围均为 1–20。HTTP 检查的 `path` 默认 `/`、只接受最长 2 KiB 的 origin-form，状态码默认接受 200–399，可配置在 100–599 内；不跟随重定向。单份配置最多启用 1,024 个 rule-target 检查任务，进程同时探测不超过 32 个目标。
+
+`trustedCIDRs` 只校验直连 Moto 的上一跳；`proxyProtocol.accept: true` 要求可信上一跳的每条连接都以完整、合法的 PROXY v1/v2 头开始，非可信来源、缺失或畸形头都会被拒绝。`send` 可为 `v1` 或 `v2`；启用 outbound PROXY 时不能同时启用 `prewarm`，因为建池时还不知道客户端地址。
+
+</details>
 
 ## 安全与可观测
 
@@ -131,13 +174,13 @@ curl -fsS http://127.0.0.1:9090/readyz
 curl -fsS http://127.0.0.1:9090/metrics
 ```
 
-`healthz` 表示进程可响应，`readyz` 只在全部转发监听器就绪且未进入关闭流程时成功。Prometheus 指标覆盖 goroutine、连接数、转发字节与错误、拨号成功率与耗时、Boost 缓存、线路 EWMA/熔断状态和预热池状态。
+`healthz` 表示进程可响应，`readyz` 只在全部转发监听器就绪且未进入关闭流程时成功。Prometheus 指标覆盖 goroutine、连接数、转发字节与错误、拨号成功率与耗时、Boost 缓存、线路 EWMA/熔断、主动健康状态、预热池及当前/排空中的配置 generation。
 
 ## WebSocket
 
-Moto 在 TCP 层透明支持 `ws://` 和 `wss://`。HTTP Upgrade、TLS 握手和 WebSocket 帧不会被解析或改写，已建立会话也不受规则 `timeout` 限制；四种模式均有 Upgrade、文本帧、Ping/Pong 和长连接端到端测试。
+Moto 在 TCP 层透明支持 `ws://` 和 `wss://`。HTTP Upgrade、TLS 握手和 WebSocket 帧不会被改写，已建立会话也不受规则 `timeout` 限制；通用四种模式均有 Upgrade、文本帧、Ping/Pong 和长连接端到端测试，`tls` 模式另有真实 ClientHello 分片与原字节重放测试。
 
-长连接会持续占用连接额度，并在 Moto 关闭超过 10 秒后被强制断开。`regex` 只能检查明文 WS 握手前 4 KiB；WSS 中的 Host 和路径已被 TLS 加密，无法用于正则分流。WebSocket 规则建议保持 `prewarm: false`。
+长连接会持续占用连接额度，并在 Moto 关闭超过 10 秒后被强制断开。`regex` 只能检查明文 WS 握手前 4 KiB；WSS 的 Host 和路径已加密，但 `tls` 模式可按 SNI/ALPN 分流。WebSocket 规则建议保持 `prewarm: false`。
 
 ## 构建与验证
 
@@ -155,7 +198,33 @@ make build
 ./bin/moto --version
 ```
 
-CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达漏洞、示例配置和四模式本机闭环 smoke。推送 `v*` 语义版本 tag 会生成可复现的多平台压缩包、CycloneDX SBOM、SHA-256 校验文件和自动 release notes。
+<details>
+<summary><strong>Docker 与 systemd</strong></summary>
+
+Docker 镜像以非 root 用户运行，并从 `/etc/moto/setting.json` 读取挂载的配置；TCP 网关在 Linux 上通常直接使用 host network：
+
+```bash
+docker build -t moto:local .
+docker run --rm --network host \
+  -v "$PWD/config/setting.json:/etc/moto/setting.json:ro" \
+  moto:local
+```
+
+systemd unit 使用动态用户、只读系统目录和最小网络能力，`systemctl reload moto` 会发送 `SIGHUP`：
+
+```bash
+make build
+sudo install -m 0755 bin/moto /usr/local/bin/moto
+sudo install -d -m 0755 /etc/moto
+sudo install -m 0644 config/setting.json /etc/moto/setting.json
+sudo install -m 0644 packaging/moto.service /etc/systemd/system/moto.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now moto
+```
+
+</details>
+
+CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达漏洞、示例配置、TLS/PROXY/热重载端到端测试和四种通用模式的本机闭环 smoke。推送 `v*` tag 会先通过完整门禁，再生成可复现的多平台压缩包、CycloneDX SBOM、SHA-256 校验文件和自动 release notes；归档内含二进制、README、LICENSE、示例配置和 systemd unit。
 
 <details>
 <summary><strong>本地回归与性能采样</strong></summary>

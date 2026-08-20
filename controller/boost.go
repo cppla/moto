@@ -8,7 +8,6 @@ import (
 	"moto/utils"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -22,20 +21,20 @@ const (
 )
 
 type boostWinnerEntry struct {
-	addr    string
-	expires time.Time
+	addr       string
+	expires    time.Time
+	generation uint64
 }
 
-var boostWinnerCache = struct {
-	sync.Mutex
-	entries map[string]boostWinnerEntry
-}{entries: make(map[string]boostWinnerEntry)}
+type boostWinnerToken struct {
+	key        string
+	addr       string
+	generation uint64
+}
 
 type boostRevalidation struct {
 	done chan struct{}
 }
-
-var boostRevalidating sync.Map // map[string]*boostRevalidation
 
 type dialResult struct {
 	conn    net.Conn
@@ -66,36 +65,87 @@ func boostRuleKey(rule *config.Rule) string {
 }
 
 func loadBoostWinner(key string) (string, bool, time.Time) {
+	return defaultRoutingRuntime.loadBoostWinner(key)
+}
+
+func (runtime *routingRuntime) loadBoostWinner(key string) (string, bool, time.Time) {
 	now := time.Now()
-	boostWinnerCache.Lock()
-	defer boostWinnerCache.Unlock()
-	entry, ok := boostWinnerCache.entries[key]
+	runtime.boost.cache.Lock()
+	defer runtime.boost.cache.Unlock()
+	entry, ok := runtime.boost.cache.entries[key]
 	if !ok {
 		return "", false, time.Time{}
 	}
 	if !now.Before(entry.expires) {
-		delete(boostWinnerCache.entries, key)
+		delete(runtime.boost.cache.entries, key)
 		return "", false, time.Time{}
 	}
 	return entry.addr, true, entry.expires
 }
 
-func storeBoostWinner(key, addr string) {
-	boostWinnerCache.Lock()
-	defer boostWinnerCache.Unlock()
-	if _, exists := boostWinnerCache.entries[key]; !exists && len(boostWinnerCache.entries) >= boostWinnerCacheMax {
-		for oldKey := range boostWinnerCache.entries {
-			delete(boostWinnerCache.entries, oldKey)
+func (runtime *routingRuntime) loadBoostWinnerToken(key string) (boostWinnerEntry, bool) {
+	now := time.Now()
+	runtime.boost.cache.Lock()
+	defer runtime.boost.cache.Unlock()
+	entry, ok := runtime.boost.cache.entries[key]
+	if !ok {
+		return boostWinnerEntry{}, false
+	}
+	if !now.Before(entry.expires) {
+		delete(runtime.boost.cache.entries, key)
+		return boostWinnerEntry{}, false
+	}
+	return entry, true
+}
+
+func storeBoostWinner(key, addr string) boostWinnerToken {
+	return defaultRoutingRuntime.storeBoostWinner(key, addr)
+}
+
+func (runtime *routingRuntime) storeBoostWinner(key, addr string) boostWinnerToken {
+	runtime.boost.cache.Lock()
+	defer runtime.boost.cache.Unlock()
+	if _, exists := runtime.boost.cache.entries[key]; !exists && len(runtime.boost.cache.entries) >= boostWinnerCacheMax {
+		for oldKey := range runtime.boost.cache.entries {
+			delete(runtime.boost.cache.entries, oldKey)
 			break
 		}
 	}
-	boostWinnerCache.entries[key] = boostWinnerEntry{addr: addr, expires: time.Now().Add(boostWinnerTTL)}
+	runtime.boost.cache.nextGeneration++
+	if runtime.boost.cache.nextGeneration == 0 {
+		runtime.boost.cache.nextGeneration++
+	}
+	token := boostWinnerToken{key: key, addr: addr, generation: runtime.boost.cache.nextGeneration}
+	runtime.boost.cache.entries[key] = boostWinnerEntry{
+		addr:       addr,
+		expires:    time.Now().Add(boostWinnerTTL),
+		generation: token.generation,
+	}
+	return token
 }
 
 func deleteBoostWinner(key string) {
-	boostWinnerCache.Lock()
-	delete(boostWinnerCache.entries, key)
-	boostWinnerCache.Unlock()
+	defaultRoutingRuntime.deleteBoostWinner(key)
+}
+
+func (runtime *routingRuntime) deleteBoostWinner(key string) {
+	runtime.boost.cache.Lock()
+	delete(runtime.boost.cache.entries, key)
+	runtime.boost.cache.Unlock()
+}
+
+func (runtime *routingRuntime) deleteBoostWinnerIfCurrent(token boostWinnerToken) bool {
+	if token.key == "" || token.generation == 0 {
+		return false
+	}
+	runtime.boost.cache.Lock()
+	defer runtime.boost.cache.Unlock()
+	entry, ok := runtime.boost.cache.entries[token.key]
+	if !ok || entry.generation != token.generation || entry.addr != token.addr {
+		return false
+	}
+	delete(runtime.boost.cache.entries, token.key)
+	return true
 }
 
 // raceBoostTargets uses fresh connections and keeps at most two candidates in
@@ -104,6 +154,10 @@ func deleteBoostWinner(key string) {
 // Top-2 concurrency bound without turning a healthy third target into an
 // avoidable request failure.
 func raceBoostTargets(ctx context.Context, rule *config.Rule, dial boostDialFunc) (dialResult, error) {
+	return defaultRoutingRuntime.raceBoostTargets(ctx, rule, dial)
+}
+
+func (runtime *routingRuntime) raceBoostTargets(ctx context.Context, rule *config.Rule, dial boostDialFunc) (dialResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -121,19 +175,29 @@ func raceBoostTargets(ctx context.Context, rule *config.Rule, dial boostDialFunc
 	results := make(chan dialResult, len(rule.Targets))
 	attempted := make(map[string]struct{}, len(rule.Targets))
 	active := 0
+	healthExcluded := false
 	launchAvailable := func() bool {
 		capacity := 2 - active
 		if capacity <= 0 {
 			return false
 		}
-		candidates := selectRouteTargetsExcluding(rule, capacity, time.Now(), attempted)
+		candidates := runtime.routes.selectTargetsExcluding(rule, len(rule.Targets), time.Now(), attempted)
+		launched := 0
 		for _, target := range candidates {
+			if launched == capacity {
+				break
+			}
 			addr := target.Address
 			attempted[addr] = struct{}{}
+			if runtime.health.unhealthy(rule, addr) {
+				healthExcluded = true
+				continue
+			}
 			active++
+			launched++
 			go func() {
 				started := time.Now()
-				attempt, err := routeBegin(rule, addr, started)
+				attempt, err := runtime.routes.begin(rule, addr, started)
 				if err != nil {
 					results <- dialResult{addr: addr, err: err}
 					return
@@ -148,7 +212,7 @@ func raceBoostTargets(ctx context.Context, rule *config.Rule, dial boostDialFunc
 				results <- dialResult{conn: conn, addr: addr, attempt: attempt, err: err}
 			}()
 		}
-		return len(candidates) > 0
+		return launched > 0
 	}
 	drainLate := func(remaining int) {
 		for i := 0; i < remaining; i++ {
@@ -199,6 +263,9 @@ func raceBoostTargets(ctx context.Context, rule *config.Rule, dial boostDialFunc
 		return dialResult{}, err
 	}
 	if len(dialErrors) == 0 {
+		if healthExcluded {
+			return dialResult{}, fmt.Errorf("all boost targets unavailable: %w", ErrActiveHealthUnhealthy)
+		}
 		return dialResult{}, fmt.Errorf("all boost targets unavailable: %w", ErrCircuitOpen)
 	}
 	return dialResult{}, fmt.Errorf("all boost targets failed: %w", errors.Join(dialErrors...))
@@ -207,47 +274,63 @@ func raceBoostTargets(ctx context.Context, rule *config.Rule, dial boostDialFunc
 // startLazyRevalidate deduplicates background races and publishes a completion
 // channel before the goroutine starts. Server shutdown can therefore wait for
 // every refresh associated with its rules before clearing routing state.
-func startLazyRevalidate(parent context.Context, rule *config.Rule) {
+func (runtime *routingRuntime) startLazyRevalidate(parent context.Context, rule *config.Rule) {
 	if rule == nil || len(rule.Targets) < 2 {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := runtime.ctx.Err(); err != nil {
 		return
 	}
 	key := boostRuleKey(rule)
 	job := &boostRevalidation{done: make(chan struct{})}
-	if _, loaded := boostRevalidating.LoadOrStore(key, job); loaded {
+	if _, loaded := runtime.boost.revalidating.LoadOrStore(key, job); loaded {
 		return
 	}
+	jobCtx, cancelJob := context.WithCancel(parent)
+	stopRuntimeCancel := context.AfterFunc(runtime.ctx, cancelJob)
 	go func() {
+		defer cancelJob()
+		defer stopRuntimeCancel()
 		defer close(job.done)
-		defer boostRevalidating.Delete(key)
-		lazyRevalidate(parent, rule, key)
+		defer runtime.boost.revalidating.Delete(key)
+		runtime.lazyRevalidate(jobCtx, rule, key)
 	}()
 }
 
 // lazyRevalidate runs one bounded background race without interrupting the
 // current stream. Deduplication and lifecycle tracking live in the starter.
-func lazyRevalidate(parent context.Context, rule *config.Rule, key string) {
+func (runtime *routingRuntime) lazyRevalidate(parent context.Context, rule *config.Rule, key string) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(parent, boostRevalidateLimit)
 	defer cancel()
-	winner, err := raceBoostTargets(ctx, rule, DialFastContext)
+	dial := boostDialFunc(DialFastContext)
+	if rule.ProxyProtocol != nil && rule.ProxyProtocol.Send != "" {
+		dial = func(dialCtx context.Context, addr string) (net.Conn, error) {
+			return dialActiveHealthTarget(dialCtx, "tcp", addr, rule.ProxyProtocol.Send)
+		}
+	}
+	winner, err := runtime.raceBoostTargets(ctx, rule, dial)
 	if err != nil {
 		return
 	}
 	defer winner.conn.Close()
-	storeBoostWinner(key, winner.addr)
+	runtime.storeBoostWinner(key, winner.addr)
 	utils.Logger.Debug("懒惰刷新winner",
 		zap.String("ruleName", rule.Name),
 		zap.String("targetAddr", winner.addr))
 }
 
-func waitBoostRevalidations(rules []*config.Rule) {
+func (runtime *routingRuntime) waitBoostRevalidations(rules []*config.Rule) {
 	for _, rule := range rules {
 		if rule == nil {
 			continue
 		}
-		if value, ok := boostRevalidating.Load(boostRuleKey(rule)); ok {
+		if value, ok := runtime.boost.revalidating.Load(boostRuleKey(rule)); ok {
 			if job, ok := value.(*boostRevalidation); ok {
 				<-job.done
 			}
@@ -265,6 +348,10 @@ func boostDecisionTimeout(rule *config.Rule) time.Duration {
 // HandleBoost races fresh dials, picks the first successful route, and relays
 // until either side finishes or ctx is cancelled.
 func HandleBoost(ctx context.Context, conn net.Conn, rule *config.Rule) {
+	defaultRoutingRuntime.handleBoost(ctx, conn, rule)
+}
+
+func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, rule *config.Rule) {
 	if conn == nil {
 		return
 	}
@@ -281,50 +368,71 @@ func HandleBoost(ctx context.Context, conn net.Conn, rule *config.Rule) {
 	defer cancelDecision()
 	key := boostRuleKey(rule)
 
-	if addr, ok, expires := loadBoostWinner(key); ok {
-		triggerLazy := time.Until(expires) < boostRevalidateAfter
-		cachedConn, cachedAttempt, err := outboundDialRoute(decisionCtx, rule, addr)
+	if cached, ok := runtime.loadBoostWinnerToken(key); ok {
+		cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
+		triggerLazy := time.Until(cached.expires) < boostRevalidateAfter
+		cachedConn, cachedAttempt, err := runtime.outboundDialRoute(decisionCtx, rule, cached.addr)
 		if err == nil {
-			metricBoostCache(rule.Name, true)
-			defer cachedConn.Close()
-			// A cache hit deliberately does not extend expires. Otherwise steady
-			// traffic would postpone lazy revalidation forever.
-			fields := []zap.Field{
-				zap.String("ruleName", rule.Name),
-				zap.String("remoteAddr", connAddr(conn)),
-				zap.String("targetAddr", connAddr(cachedConn)),
-				zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
-				zap.Bool("boostCacheHit", true),
+			if headerErr := writeOutboundProxyProtocol(cachedConn, conn, rule); headerErr != nil {
+				routeReportFailure(cachedAttempt, headerErr, time.Now())
+				_ = cachedConn.Close()
+				err = headerErr
+			} else {
+				metricBoostCache(rule.Name, true)
+				defer cachedConn.Close()
+				// A cache hit deliberately does not extend expires. Otherwise steady
+				// traffic would postpone lazy revalidation forever.
+				fields := []zap.Field{
+					zap.String("ruleName", rule.Name),
+					zap.String("remoteAddr", connAddr(conn)),
+					zap.String("targetAddr", connAddr(cachedConn)),
+					zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
+					zap.Bool("boostCacheHit", true),
+				}
+				if triggerLazy {
+					fields = append(fields, zap.Bool("boostLazyRefresh", true))
+					runtime.startLazyRevalidate(ctx, rule)
+				}
+				utils.Logger.Debug("建立连接", fields...)
+				cancelDecision()
+				result := relayBidirectional(ctx, conn, cachedConn)
+				logRelayResult(rule, conn, cachedConn, result)
+				reportRouteRelay(cachedAttempt, result)
+				if upstreamRelayError(result) != nil {
+					runtime.deleteBoostWinnerIfCurrent(cachedToken)
+				}
+				return
 			}
-			if triggerLazy {
-				fields = append(fields, zap.Bool("boostLazyRefresh", true))
-				startLazyRevalidate(ctx, rule)
-			}
-			utils.Logger.Debug("建立连接", fields...)
-			cancelDecision()
-			result := relayBidirectional(ctx, conn, cachedConn)
-			logRelayResult(rule, conn, cachedConn, result)
-			reportRouteRelay(cachedAttempt, result)
-			if upstreamRelayError(result) != nil {
-				deleteBoostWinner(key)
-			}
-			return
 		}
-		deleteBoostWinner(key)
+		runtime.deleteBoostWinnerIfCurrent(cachedToken)
 		if ctx.Err() != nil {
 			return
 		}
 	}
 	metricBoostCache(rule.Name, false)
 
-	winner, err := raceBoostTargets(decisionCtx, rule, DialFastContext)
+	dial := boostDialFunc(DialFastContext)
+	if rule.ProxyProtocol != nil && rule.ProxyProtocol.Send != "" {
+		dial = func(dialCtx context.Context, addr string) (net.Conn, error) {
+			candidate, dialErr := DialFastContext(dialCtx, addr)
+			if dialErr != nil {
+				return candidate, dialErr
+			}
+			if headerErr := writeOutboundProxyProtocol(candidate, conn, rule); headerErr != nil {
+				_ = candidate.Close()
+				return nil, headerErr
+			}
+			return candidate, nil
+		}
+	}
+	winner, err := runtime.raceBoostTargets(decisionCtx, rule, dial)
 	if err != nil {
 		utils.Logger.Error("加速决策失败：所有线路均不可用",
 			zap.String("ruleName", rule.Name), zap.Error(err))
 		return
 	}
 	defer winner.conn.Close()
-	storeBoostWinner(key, winner.addr)
+	winnerToken := runtime.storeBoostWinner(key, winner.addr)
 	utils.Logger.Debug("建立连接",
 		zap.String("ruleName", rule.Name),
 		zap.String("remoteAddr", connAddr(conn)),
@@ -336,6 +444,6 @@ func HandleBoost(ctx context.Context, conn net.Conn, rule *config.Rule) {
 	logRelayResult(rule, conn, winner.conn, result)
 	reportRouteRelay(winner.attempt, result)
 	if upstreamRelayError(result) != nil {
-		deleteBoostWinner(key)
+		runtime.deleteBoostWinnerIfCurrent(winnerToken)
 	}
 }

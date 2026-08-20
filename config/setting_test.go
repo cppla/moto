@@ -75,6 +75,40 @@ func TestMetricsConfigDefaultsToLoopback(t *testing.T) {
 	}
 }
 
+func TestLoadHealthCheckDefaults(t *testing.T) {
+	path := writeConfig(t, `{
+		"log": {"level": "info", "path": ""},
+		"rules": [{
+			"name": "checked",
+			"listen": "127.0.0.1:8080",
+			"mode": "normal",
+			"healthCheck": {"type": "HTTP", "path": "/ready?deep=1"},
+			"targets": [{"address": "example.com:80"}]
+		}]
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	check := cfg.Rules[0].HealthCheck
+	if check == nil {
+		t.Fatal("HealthCheck = nil, want enabled configuration")
+	}
+	if check.Type != HealthCheckHTTP || check.Path != "/ready?deep=1" {
+		t.Fatalf("HealthCheck type/path = %q/%q, want http origin-form path", check.Type, check.Path)
+	}
+	if check.Interval != DefaultHealthCheckInterval || check.Timeout != DefaultHealthCheckTimeout {
+		t.Fatalf("HealthCheck durations = %d/%d, want %d/%d", check.Interval, check.Timeout, DefaultHealthCheckInterval, DefaultHealthCheckTimeout)
+	}
+	if check.FailureThreshold != DefaultHealthCheckFailures || check.SuccessThreshold != DefaultHealthCheckSuccesses {
+		t.Fatalf("HealthCheck thresholds = %d/%d, want %d/%d", check.FailureThreshold, check.SuccessThreshold, DefaultHealthCheckFailures, DefaultHealthCheckSuccesses)
+	}
+	if check.StatusMin != 200 || check.StatusMax != 399 {
+		t.Fatalf("HealthCheck status range = %d-%d, want 200-399", check.StatusMin, check.StatusMax)
+	}
+}
+
 func TestMetricsConfigRejectsPublicAndConflictingListeners(t *testing.T) {
 	tests := map[string]struct {
 		metrics MetricsConfig
@@ -155,7 +189,14 @@ func TestLoadRejectsNonStrictJSON(t *testing.T) {
 		"unknown top-level field": `{` + validRule + `,"unknown":true}`,
 		"unknown nested field":    `{"log":{"level":"info","path":"","unknown":true},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
 		"unknown metrics field":   `{"log":{"level":"info","path":""},"metrics":{"enabled":true,"unknown":true},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
+		"unknown health field":    `{"log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","healthCheck":{"type":"tcp","unknown":true},"targets":[{"address":"example.com:80"}]}]}`,
 		"legacy snake-case limit": `{"log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","max_connections":100,"targets":[{"address":"example.com:80"}]}]}`,
+		"case-folded top-level":   `{"Log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
+		"case-folded nested":      `{"log":{"Level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
+		"case-folded target":      `{"log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"Address":"example.com:80"}]}]}`,
+		"duplicate top-level":     `{"log":{"level":"info","path":""},"log":{"level":"debug","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
+		"duplicate nested":        `{"log":{"level":"info","level":"debug","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
+		"duplicate arbitrary map": `{"log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","blacklist":{"192.0.2.1":true,"192.0.2.1":false},"targets":[{"address":"example.com:80"}]}]}`,
 		"second JSON value":       `{` + validRule + `} {}`,
 		"trailing junk":           `{` + validRule + `} nope`,
 		"null config":             `null`,
@@ -230,6 +271,65 @@ func TestValidateRejectsInvalidConfiguration(t *testing.T) {
 		"connection limit too large": {
 			mutate: func(c *Config) { c.Rules[0].MaxConnections = maxConnections + 1 },
 			want:   "maxConnections must not exceed",
+		},
+		"invalid health type": {
+			mutate: func(c *Config) { c.Rules[0].HealthCheck = &HealthCheckConfig{Type: "udp"} },
+			want:   "invalid type",
+		},
+		"health interval too short": {
+			mutate: func(c *Config) {
+				c.Rules[0].HealthCheck = &HealthCheckConfig{Interval: uint64(minHealthInterval/time.Millisecond) - 1}
+			},
+			want: "interval must be between",
+		},
+		"health interval overflow": {
+			mutate: func(c *Config) { c.Rules[0].HealthCheck = &HealthCheckConfig{Interval: ^uint64(0)} },
+			want:   "interval must be between",
+		},
+		"health timeout too short": {
+			mutate: func(c *Config) {
+				c.Rules[0].HealthCheck = &HealthCheckConfig{
+					Interval: uint64(minHealthInterval / time.Millisecond),
+					Timeout:  uint64(minHealthTimeout/time.Millisecond) - 1,
+				}
+			},
+			want: "timeout must be between",
+		},
+		"health timeout exceeds interval": {
+			mutate: func(c *Config) {
+				c.Rules[0].HealthCheck = &HealthCheckConfig{Interval: 250, Timeout: 251}
+			},
+			want: "timeout must not exceed interval",
+		},
+		"health failure threshold too large": {
+			mutate: func(c *Config) {
+				c.Rules[0].HealthCheck = &HealthCheckConfig{FailureThreshold: maxHealthThreshold + 1}
+			},
+			want: "failureThreshold must be between",
+		},
+		"health success threshold negative": {
+			mutate: func(c *Config) {
+				c.Rules[0].HealthCheck = &HealthCheckConfig{SuccessThreshold: -1}
+			},
+			want: "successThreshold must be between",
+		},
+		"tcp check with HTTP fields": {
+			mutate: func(c *Config) {
+				c.Rules[0].HealthCheck = &HealthCheckConfig{Type: HealthCheckTCP, Path: "/ready"}
+			},
+			want: "only valid for http checks",
+		},
+		"HTTP check with absolute URL": {
+			mutate: func(c *Config) {
+				c.Rules[0].HealthCheck = &HealthCheckConfig{Type: HealthCheckHTTP, Path: "http://example.net/ready"}
+			},
+			want: "origin-form",
+		},
+		"HTTP check with invalid status range": {
+			mutate: func(c *Config) {
+				c.Rules[0].HealthCheck = &HealthCheckConfig{Type: HealthCheckHTTP, StatusMin: 400, StatusMax: 399}
+			},
+			want: "statusMin must not exceed",
 		},
 	}
 
@@ -360,6 +460,25 @@ func TestPrepareRuntimeRulesAllowsEphemeralPortsAndKeepsCrossRuleLimits(t *testi
 	}
 	if err := PrepareRuntimeRules(tooMany); err == nil || !strings.Contains(err.Error(), "more than") {
 		t.Fatalf("PrepareRuntimeRules() error = %v, want rule-count cap", err)
+	}
+}
+
+func TestPrepareRuntimeRulesCapsActiveHealthJobs(t *testing.T) {
+	rules := make([]*Rule, 0, maxActiveHealthJobs/maxTargets+1)
+	for ruleIndex := 0; len(rules)*maxTargets <= maxActiveHealthJobs; ruleIndex++ {
+		rule := &Rule{
+			Name:        fmt.Sprintf("health-%d", ruleIndex),
+			Listen:      fmt.Sprintf("127.0.0.1:%d", 10_000+ruleIndex),
+			Mode:        ModeNormal,
+			HealthCheck: &HealthCheckConfig{Type: HealthCheckTCP},
+		}
+		for targetIndex := 0; targetIndex < maxTargets; targetIndex++ {
+			rule.Targets = append(rule.Targets, &Target{Address: fmt.Sprintf("127.0.0.1:%d", 20_000+targetIndex)})
+		}
+		rules = append(rules, rule)
+	}
+	if err := PrepareRuntimeRules(rules); err == nil || !strings.Contains(err.Error(), "active health checks") {
+		t.Fatalf("PrepareRuntimeRules() error = %v, want active-health job cap", err)
 	}
 }
 

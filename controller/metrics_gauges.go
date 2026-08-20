@@ -27,11 +27,23 @@ type prewarmGauge struct {
 	failures int
 }
 
+type activeHealthGauge struct {
+	rule      string
+	mode      string
+	target    string
+	unhealthy bool
+}
+
 // renderOperationalGauges snapshots route-health and prewarm state without
 // holding their locks while Prometheus text is written.
 func renderOperationalGauges(output *strings.Builder) {
-	routes := snapshotRouteGauges()
-	prewarm := snapshotPrewarmGauges()
+	defaultRoutingRuntime.renderOperationalGauges(output)
+}
+
+func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) {
+	routes := runtime.routes.snapshotGauges()
+	prewarm := runtime.prewarm.snapshotGauges()
+	activeHealth := snapshotActiveHealthGauges(runtime.health)
 
 	writeMetricHeader(output, "moto_route_latency_ewma_seconds", "EWMA dial latency for a configured route in seconds.", "gauge")
 	for _, route := range routes {
@@ -84,6 +96,41 @@ func renderOperationalGauges(output *strings.Builder) {
 	for _, pool := range prewarm {
 		writeMetricSample(output, "moto_prewarm_consecutive_failures", []prometheusLabel{{"target", pool.target}}, strconv.Itoa(pool.failures))
 	}
+
+	writeMetricHeader(output, "moto_active_health_unhealthy", "Whether a target is excluded by threshold-confirmed active health checks.", "gauge")
+	for _, target := range activeHealth {
+		writeMetricSample(output, "moto_active_health_unhealthy", []prometheusLabel{{"rule", target.rule}, {"mode", target.mode}, {"target", target.target}}, boolMetric(target.unhealthy))
+	}
+}
+
+func snapshotActiveHealthGauges(manager *activeHealthManager) []activeHealthGauge {
+	if manager == nil {
+		return nil
+	}
+	manager.mu.RLock()
+	snapshots := make([]activeHealthGauge, 0, len(manager.states))
+	for key, state := range manager.states {
+		if key.rule == nil || state == nil {
+			continue
+		}
+		snapshots = append(snapshots, activeHealthGauge{
+			rule:      key.rule.Name,
+			mode:      key.rule.Mode,
+			target:    key.address,
+			unhealthy: state.unhealthy,
+		})
+	}
+	manager.mu.RUnlock()
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].rule != snapshots[j].rule {
+			return snapshots[i].rule < snapshots[j].rule
+		}
+		if snapshots[i].mode != snapshots[j].mode {
+			return snapshots[i].mode < snapshots[j].mode
+		}
+		return snapshots[i].target < snapshots[j].target
+	})
+	return snapshots
 }
 
 func routeGaugeLabels(route routeGauge) []prometheusLabel {
@@ -97,10 +144,10 @@ func boolMetric(value bool) string {
 	return "0"
 }
 
-func snapshotRouteGauges() []routeGauge {
-	routeHealth.Lock()
-	routes := make([]routeGauge, 0, len(routeHealth.states))
-	for key, state := range routeHealth.states {
+func (registry *routeHealthRegistry) snapshotGauges() []routeGauge {
+	registry.Lock()
+	routes := make([]routeGauge, 0, len(registry.states))
+	for key, state := range registry.states {
 		routes = append(routes, routeGauge{
 			rule:                state.ruleName,
 			mode:                state.mode,
@@ -113,7 +160,7 @@ func snapshotRouteGauges() []routeGauge {
 			lastAttempt:         state.lastAttempt,
 		})
 	}
-	routeHealth.Unlock()
+	registry.Unlock()
 	sort.Slice(routes, func(i, j int) bool {
 		if routes[i].rule != routes[j].rule {
 			return routes[i].rule < routes[j].rule
@@ -126,13 +173,13 @@ func snapshotRouteGauges() []routeGauge {
 	return routes
 }
 
-func snapshotPrewarmGauges() []prewarmGauge {
-	prewarmPoolsMu.Lock()
-	pools := make([]*prewarmPool, 0, len(prewarmPools))
-	for _, pool := range prewarmPools {
+func (manager *prewarmManager) snapshotGauges() []prewarmGauge {
+	manager.mu.Lock()
+	pools := make([]*prewarmPool, 0, len(manager.pools))
+	for _, pool := range manager.pools {
 		pools = append(pools, pool)
 	}
-	prewarmPoolsMu.Unlock()
+	manager.mu.Unlock()
 
 	snapshots := make([]prewarmGauge, 0, len(pools))
 	for _, pool := range pools {

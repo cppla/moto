@@ -54,9 +54,6 @@ func run() error {
 		return nil
 	}
 
-	if err := config.SetGlobal(cfg); err != nil {
-		return fmt.Errorf("应用配置: %w", err)
-	}
 	if err := utils.Configure(cfg.Log); err != nil {
 		return fmt.Errorf("初始化日志: %w", err)
 	}
@@ -74,6 +71,8 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	reloadSignals, stopReloadSignals := notifyReloadSignals()
+	defer stopReloadSignals()
 
 	utils.Logger.Info("MOTO 启动",
 		zap.String("version", version),
@@ -83,9 +82,49 @@ func run() error {
 		zap.Int("rules", len(cfg.Rules)),
 		zap.Bool("metricsEnabled", cfg.Metrics.Enabled),
 		zap.String("metricsListen", metricsListen))
-	if err := server.Serve(ctx); err != nil {
-		return err
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(ctx) }()
+	current := cfg
+	for {
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				return err
+			}
+			utils.Logger.Info("MOTO 关闭")
+			return nil
+		case <-reloadSignals:
+			next, loadErr := config.Load(path)
+			if loadErr != nil {
+				utils.Logger.Error("配置热重载失败，继续使用当前配置",
+					zap.String("config", path), zap.Error(loadErr))
+				continue
+			}
+			if next.Log != current.Log {
+				utils.Logger.Error("配置热重载被拒绝：日志配置变更需要重启",
+					zap.String("config", path))
+				continue
+			}
+			if next.Metrics != current.Metrics {
+				utils.Logger.Error("配置热重载被拒绝：观测监听配置变更需要重启",
+					zap.String("config", path))
+				continue
+			}
+			result, reloadErr := server.ReloadRules(ctx, next.Rules)
+			if reloadErr != nil {
+				utils.Logger.Error("配置热重载失败，继续使用当前配置",
+					zap.String("config", path), zap.Error(reloadErr))
+				continue
+			}
+			current = next
+			utils.Logger.Info("配置热重载完成",
+				zap.String("config", path),
+				zap.Uint64("fromGeneration", result.FromGeneration),
+				zap.Uint64("toGeneration", result.ToGeneration),
+				zap.Bool("noop", result.Noop),
+				zap.Int("rules", len(next.Rules)),
+				zap.Strings("listenersAdded", result.Added),
+				zap.Strings("listenersRemoved", result.Removed))
+		}
 	}
-	utils.Logger.Info("MOTO 关闭")
-	return nil
 }

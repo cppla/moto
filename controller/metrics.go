@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"moto/config"
 	"net/http"
 	"runtime"
 	"sort"
@@ -43,7 +44,10 @@ type dialMetricKey struct {
 // deliberately cheap and dependency-free; rendering takes a snapshot so a
 // slow scrape never holds the write lock used by traffic paths.
 type metricRegistry struct {
-	mu sync.RWMutex
+	mu             sync.RWMutex
+	ruleRefs       map[string]int
+	connectionRefs map[connectionMetricKey]int
+	dialRefs       map[dialMetricKey]int
 
 	connectionsAccepted map[connectionMetricKey]uint64
 	connectionsRejected map[rejectionMetricKey]uint64
@@ -82,6 +86,9 @@ type metricSnapshot struct {
 
 func newMetricRegistry() *metricRegistry {
 	return &metricRegistry{
+		ruleRefs:            make(map[string]int),
+		connectionRefs:      make(map[connectionMetricKey]int),
+		dialRefs:            make(map[dialMetricKey]int),
 		connectionsAccepted: make(map[connectionMetricKey]uint64),
 		connectionsRejected: make(map[rejectionMetricKey]uint64),
 		connectionsActive:   make(map[connectionMetricKey]int64),
@@ -98,6 +105,97 @@ func newMetricRegistry() *metricRegistry {
 		boostCacheHits:      make(map[string]uint64),
 		boostCacheMisses:    make(map[string]uint64),
 	}
+}
+
+// registerRules pins every label family a routing generation may emit. The
+// reference counts let multiple servers and draining generations share labels
+// while still reclaiming names and targets that disappear across hot reloads.
+func (registry *metricRegistry) registerRules(rules []*config.Rule) {
+	ruleNames, connectionKeys, dialKeys := metricRuleKeys(rules)
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	for rule := range ruleNames {
+		registry.ruleRefs[rule]++
+	}
+	for key := range connectionKeys {
+		registry.connectionRefs[key]++
+	}
+	for key := range dialKeys {
+		registry.dialRefs[key]++
+	}
+}
+
+func (registry *metricRegistry) unregisterRules(rules []*config.Rule) {
+	ruleNames, connectionKeys, dialKeys := metricRuleKeys(rules)
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	for key := range dialKeys {
+		if registry.dialRefs[key] > 1 {
+			registry.dialRefs[key]--
+			continue
+		}
+		delete(registry.dialRefs, key)
+		delete(registry.dialAttempts, key)
+		delete(registry.dialSuccess, key)
+		delete(registry.dialFailures, key)
+		delete(registry.dialCanceled, key)
+		delete(registry.dialLatencyNanos, key)
+		delete(registry.dialLatencyCount, key)
+	}
+	for key := range connectionKeys {
+		if registry.connectionRefs[key] > 1 {
+			registry.connectionRefs[key]--
+			continue
+		}
+		delete(registry.connectionRefs, key)
+		delete(registry.connectionsAccepted, key)
+		delete(registry.connectionsActive, key)
+		for rejected := range registry.connectionsRejected {
+			if rejected.rule == key.rule && rejected.mode == key.mode {
+				delete(registry.connectionsRejected, rejected)
+			}
+		}
+	}
+	for rule := range ruleNames {
+		if registry.ruleRefs[rule] > 1 {
+			registry.ruleRefs[rule]--
+			continue
+		}
+		delete(registry.ruleRefs, rule)
+		delete(registry.relayDurationNanos, rule)
+		delete(registry.relayDurationCount, rule)
+		delete(registry.boostCacheHits, rule)
+		delete(registry.boostCacheMisses, rule)
+		for key := range registry.relayBytes {
+			if key.rule == rule {
+				delete(registry.relayBytes, key)
+			}
+		}
+		for key := range registry.relayErrors {
+			if key.rule == rule {
+				delete(registry.relayErrors, key)
+			}
+		}
+	}
+}
+
+func metricRuleKeys(rules []*config.Rule) (map[string]struct{}, map[connectionMetricKey]struct{}, map[dialMetricKey]struct{}) {
+	ruleNames := make(map[string]struct{})
+	connections := make(map[connectionMetricKey]struct{})
+	dials := make(map[dialMetricKey]struct{})
+	for _, rule := range rules {
+		if rule == nil {
+			continue
+		}
+		ruleNames[rule.Name] = struct{}{}
+		connections[connectionMetricKey{rule: rule.Name, mode: rule.Mode}] = struct{}{}
+		for _, target := range rule.Targets {
+			if target != nil {
+				dials[dialMetricKey{rule: rule.Name, target: target.Address}] = struct{}{}
+			}
+		}
+	}
+	return ruleNames, connections, dials
 }
 
 var processMetrics = newMetricRegistry()
@@ -254,14 +352,22 @@ func currentMetricsGaugeRenderer() func(*strings.Builder) {
 }
 
 type observabilityHandler struct {
-	ready   func() bool
-	scrapes chan struct{}
+	ready             func() bool
+	renderGauges      func(*strings.Builder)
+	useGlobalRenderer bool
+	scrapes           chan struct{}
 }
 
-func newObservabilityHandler(ready func() bool) http.Handler {
+func newObservabilityHandler(ready func() bool, renderGauges ...func(*strings.Builder)) http.Handler {
+	var render func(*strings.Builder)
+	if len(renderGauges) > 0 {
+		render = renderGauges[0]
+	}
 	return observabilityHandler{
-		ready:   ready,
-		scrapes: make(chan struct{}, metricsMaxConcurrentScrapes),
+		ready:             ready,
+		renderGauges:      render,
+		useGlobalRenderer: len(renderGauges) == 0,
+		scrapes:           make(chan struct{}, metricsMaxConcurrentScrapes),
 	}
 }
 
@@ -295,7 +401,11 @@ func (handler observabilityHandler) ServeHTTP(writer http.ResponseWriter, reques
 		writer.Header().Set("Cache-Control", "no-store")
 		writer.WriteHeader(http.StatusOK)
 		if request.Method != http.MethodHead {
-			_, _ = writer.Write([]byte(renderPrometheusMetrics()))
+			if handler.useGlobalRenderer {
+				_, _ = writer.Write([]byte(renderPrometheusMetrics()))
+			} else {
+				_, _ = writer.Write([]byte(renderPrometheusMetrics(handler.renderGauges)))
+			}
 		}
 	default:
 		http.NotFound(writer, request)
@@ -316,7 +426,7 @@ type prometheusLabel struct {
 	value string
 }
 
-func renderPrometheusMetrics() string {
+func renderPrometheusMetrics(renderGauges ...func(*strings.Builder)) string {
 	snapshot := processMetrics.snapshot()
 	var output strings.Builder
 
@@ -382,7 +492,13 @@ func renderPrometheusMetrics() string {
 	writeMetricHeader(&output, "moto_boost_cache_misses_total", "Boost winner-cache misses by rule.", "counter")
 	writeRuleCounterSamples(&output, "moto_boost_cache_misses_total", snapshot.boostCacheMisses)
 
-	if render := currentMetricsGaugeRenderer(); render != nil {
+	var render func(*strings.Builder)
+	if len(renderGauges) > 0 {
+		render = renderGauges[0]
+	} else {
+		render = currentMetricsGaugeRenderer()
+	}
+	if render != nil {
 		render(&output)
 	}
 	return output.String()

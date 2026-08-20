@@ -1,12 +1,14 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,20 +24,38 @@ const (
 
 	// These limits are intentionally conservative defaults. A rule may opt in
 	// to larger limits explicitly, while a missing value never means unlimited.
-	DefaultMaxConnections      = 4096
-	DefaultMaxConnectionsPerIP = 256
-	DefaultMetricsListen       = "127.0.0.1:9090"
+	DefaultMaxConnections       = 4096
+	DefaultMaxConnectionsPerIP  = 256
+	DefaultMetricsListen        = "127.0.0.1:9090"
+	DefaultHealthCheckInterval  = 10_000
+	DefaultHealthCheckTimeout   = 2_000
+	DefaultHealthCheckFailures  = 3
+	DefaultHealthCheckSuccesses = 2
 
-	ModeNormal        = "normal"
-	ModeRegex         = "regex"
-	ModeBoost         = "boost"
-	ModeRoundRobin    = "roundrobin"
-	maxRuleTimeout    = 5 * time.Minute
-	maxRules          = 256
-	maxTargets        = 128
-	maxPrewarmTargets = 256
-	maxConnections    = 1_000_000
-	maxAccessItems    = 4096
+	ModeNormal          = "normal"
+	ModeRegex           = "regex"
+	ModeBoost           = "boost"
+	ModeRoundRobin      = "roundrobin"
+	ModeTLS             = "tls"
+	HealthCheckTCP      = "tcp"
+	HealthCheckHTTP     = "http"
+	ProxyProtocolV1     = "v1"
+	ProxyProtocolV2     = "v2"
+	maxRuleTimeout      = 5 * time.Minute
+	minHealthInterval   = 250 * time.Millisecond
+	maxHealthInterval   = 10 * time.Minute
+	minHealthTimeout    = 50 * time.Millisecond
+	maxHealthTimeout    = 30 * time.Second
+	maxHealthThreshold  = 20
+	maxHealthPath       = 2 << 10
+	maxRules            = 256
+	maxTargets          = 128
+	maxPrewarmTargets   = 256
+	maxActiveHealthJobs = 1024
+	maxConnections      = 1_000_000
+	maxAccessItems      = 4096
+	maxTLSMatchers      = 64
+	maxConfigFileBytes  = 16 << 20
 )
 
 var validLogLevels = map[string]struct{}{
@@ -53,6 +73,7 @@ var validModes = map[string]struct{}{
 	ModeRegex:      {},
 	ModeBoost:      {},
 	ModeRoundRobin: {},
+	ModeTLS:        {},
 }
 
 // Config is the complete Moto configuration.
@@ -82,23 +103,52 @@ type LogConfig struct {
 // Target is one upstream endpoint. Regexp is used by regex-mode rules and Re
 // holds its validated, compiled form.
 type Target struct {
-	Regexp  string         `json:"regexp"`
-	Re      *regexp.Regexp `json:"-"`
-	Address string         `json:"address"`
+	Regexp      string         `json:"regexp"`
+	Re          *regexp.Regexp `json:"-"`
+	Address     string         `json:"address"`
+	ServerNames []string       `json:"serverNames,omitempty"`
+	ALPN        []string       `json:"alpn,omitempty"`
+}
+
+// ProxyProtocolConfig enables trusted inbound PROXY v1/v2 metadata and/or a
+// canonical outbound header. Inbound parsing is restricted to explicit CIDRs;
+// untrusted peers are rejected before client-controlled addresses are used.
+type ProxyProtocolConfig struct {
+	Accept       bool     `json:"accept"`
+	TrustedCIDRs []string `json:"trustedCIDRs,omitempty"`
+	Send         string   `json:"send,omitempty"`
+
+	trustedPrefixes []netip.Prefix
+}
+
+// HealthCheckConfig enables active probes for every target in one rule. The
+// duration fields are milliseconds, matching Rule.Timeout. A nil HealthCheck
+// leaves active checking disabled and preserves passive-only routing.
+type HealthCheckConfig struct {
+	Type             string `json:"type"`
+	Interval         uint64 `json:"interval"`
+	Timeout          uint64 `json:"timeout"`
+	FailureThreshold int    `json:"failureThreshold"`
+	SuccessThreshold int    `json:"successThreshold"`
+	Path             string `json:"path,omitempty"`
+	StatusMin        int    `json:"statusMin,omitempty"`
+	StatusMax        int    `json:"statusMax,omitempty"`
 }
 
 // Rule describes one listener and its routing policy.
 type Rule struct {
-	Name                string          `json:"name"`
-	Listen              string          `json:"listen"`
-	Mode                string          `json:"mode"`
-	Prewarm             bool            `json:"prewarm"`
-	Targets             []*Target       `json:"targets"`
-	Timeout             uint64          `json:"timeout"`
-	Blacklist           map[string]bool `json:"blacklist"`
-	Allowlist           []string        `json:"allowlist,omitempty"`
-	MaxConnections      int             `json:"maxConnections,omitempty"`
-	MaxConnectionsPerIP int             `json:"maxConnectionsPerIP,omitempty"`
+	Name                string               `json:"name"`
+	Listen              string               `json:"listen"`
+	Mode                string               `json:"mode"`
+	Prewarm             bool                 `json:"prewarm"`
+	Targets             []*Target            `json:"targets"`
+	Timeout             uint64               `json:"timeout"`
+	Blacklist           map[string]bool      `json:"blacklist"`
+	Allowlist           []string             `json:"allowlist,omitempty"`
+	MaxConnections      int                  `json:"maxConnections,omitempty"`
+	MaxConnectionsPerIP int                  `json:"maxConnectionsPerIP,omitempty"`
+	HealthCheck         *HealthCheckConfig   `json:"healthCheck,omitempty"`
+	ProxyProtocol       *ProxyProtocolConfig `json:"proxyProtocol,omitempty"`
 
 	allowPrefixes []netip.Prefix
 	blockedIPs    map[netip.Addr]struct{}
@@ -121,8 +171,18 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("open config %q: %w", path, err)
 	}
 	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxConfigFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read config %q: %w", path, err)
+	}
+	if len(raw) > maxConfigFileBytes {
+		return nil, fmt.Errorf("read config %q: file exceeds %d bytes", path, maxConfigFileBytes)
+	}
+	if err := validateStrictConfigJSON(raw); err != nil {
+		return nil, fmt.Errorf("decode config %q: %w", path, err)
+	}
 
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 
 	var cfg *Config
@@ -196,6 +256,7 @@ func validateRules(rules []*Rule, allowEphemeralListen bool) error {
 	}
 	listeners := make([]listenerUse, 0, len(rules))
 	prewarmTargets := make(map[string]struct{})
+	activeHealthJobs := 0
 	for i, rule := range rules {
 		if rule == nil {
 			return fmt.Errorf("rules[%d]: rule is null", i)
@@ -224,6 +285,16 @@ func validateRules(rules []*Rule, allowEphemeralListen bool) error {
 			}
 			if len(prewarmTargets) > maxPrewarmTargets {
 				return fmt.Errorf("prewarm targets must not contain more than %d unique addresses", maxPrewarmTargets)
+			}
+		}
+		if rule.HealthCheck != nil {
+			uniqueTargets := make(map[string]struct{}, len(rule.Targets))
+			for _, target := range rule.Targets {
+				uniqueTargets[target.Address] = struct{}{}
+			}
+			activeHealthJobs += len(uniqueTargets)
+			if activeHealthJobs > maxActiveHealthJobs {
+				return fmt.Errorf("active health checks must not contain more than %d unique rule-target jobs", maxActiveHealthJobs)
 			}
 		}
 	}
@@ -356,6 +427,20 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 	if r.Timeout > uint64(maxRuleTimeout/time.Millisecond) {
 		return fmt.Errorf("timeout must not exceed %s", maxRuleTimeout)
 	}
+	if r.HealthCheck != nil {
+		if err := r.HealthCheck.Validate(); err != nil {
+			return fmt.Errorf("healthCheck: %w", err)
+		}
+	}
+	if r.ProxyProtocol != nil {
+		if err := r.ProxyProtocol.Validate(); err != nil {
+			return fmt.Errorf("proxyProtocol: %w", err)
+		}
+		if r.Prewarm && r.ProxyProtocol.Send != "" {
+			return errors.New("prewarm cannot be combined with outbound PROXY protocol because the client address is not known when pooled connections are created")
+		}
+	}
+	tlsFallbacks := 0
 	for i, target := range r.Targets {
 		if target == nil {
 			return fmt.Errorf("targets[%d]: target is null", i)
@@ -370,6 +455,22 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 				return fmt.Errorf("targets[%d]: invalid regexp %q: %w", i, target.Regexp, err)
 			}
 			target.Re = compiled
+		}
+		if r.Mode == ModeTLS {
+			if target.Regexp != "" {
+				return fmt.Errorf("targets[%d]: regexp is not valid in tls mode", i)
+			}
+			if err := target.validateTLSMatchers(); err != nil {
+				return fmt.Errorf("targets[%d]: %w", i, err)
+			}
+			if len(target.ServerNames) == 0 && len(target.ALPN) == 0 {
+				tlsFallbacks++
+				if tlsFallbacks > 1 {
+					return errors.New("tls mode permits at most one fallback target without serverNames or alpn")
+				}
+			}
+		} else if len(target.ServerNames) != 0 || len(target.ALPN) != 0 {
+			return fmt.Errorf("targets[%d]: serverNames and alpn are only valid in tls mode", i)
 		}
 	}
 
@@ -400,6 +501,204 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		}
 	}
 	r.blockedIPs = blocked
+	return nil
+}
+
+func (target *Target) validateTLSMatchers() error {
+	if len(target.ServerNames) > maxTLSMatchers {
+		return fmt.Errorf("serverNames must not contain more than %d entries", maxTLSMatchers)
+	}
+	if len(target.ALPN) > maxTLSMatchers {
+		return fmt.Errorf("alpn must not contain more than %d entries", maxTLSMatchers)
+	}
+	seenNames := make(map[string]struct{}, len(target.ServerNames))
+	for index, value := range target.ServerNames {
+		if value != strings.TrimSpace(value) {
+			return fmt.Errorf("serverNames[%d] must not have leading or trailing whitespace", index)
+		}
+		value = strings.ToLower(value)
+		if err := validateTLSServerNamePattern(value); err != nil {
+			return fmt.Errorf("serverNames[%d]: %w", index, err)
+		}
+		if _, duplicate := seenNames[value]; duplicate {
+			return fmt.Errorf("serverNames[%d]: duplicate value %q", index, value)
+		}
+		seenNames[value] = struct{}{}
+		target.ServerNames[index] = value
+	}
+	seenALPN := make(map[string]struct{}, len(target.ALPN))
+	for index, protocol := range target.ALPN {
+		if len(protocol) == 0 || len(protocol) > 255 {
+			return fmt.Errorf("alpn[%d] length must be between 1 and 255 bytes", index)
+		}
+		for _, b := range []byte(protocol) {
+			if b < 0x21 || b > 0x7e {
+				return fmt.Errorf("alpn[%d] must contain printable ASCII without spaces", index)
+			}
+		}
+		if _, duplicate := seenALPN[protocol]; duplicate {
+			return fmt.Errorf("alpn[%d]: duplicate value %q", index, protocol)
+		}
+		seenALPN[protocol] = struct{}{}
+	}
+	return nil
+}
+
+func validateTLSServerNamePattern(value string) error {
+	if value == "" || len(value) > 253 {
+		return errors.New("must be a non-empty DNS name no longer than 253 bytes")
+	}
+	if strings.HasPrefix(value, "*.") {
+		value = value[2:]
+		if value == "" {
+			return errors.New("wildcard must have a DNS suffix")
+		}
+	} else if strings.Contains(value, "*") {
+		return errors.New("wildcard is only allowed as the complete left-most label")
+	}
+	if strings.HasPrefix(value, ".") || strings.HasSuffix(value, ".") {
+		return errors.New("must not begin or end with a dot")
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("invalid DNS label %q", label)
+		}
+		for _, b := range []byte(label) {
+			if (b < 'a' || b > 'z') && (b < '0' || b > '9') && b != '-' {
+				return fmt.Errorf("invalid DNS label %q", label)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *ProxyProtocolConfig) Validate() error {
+	if c == nil {
+		return errors.New("proxy protocol config is nil")
+	}
+	c.Send = strings.ToLower(strings.TrimSpace(c.Send))
+	if c.Send != "" && c.Send != ProxyProtocolV1 && c.Send != ProxyProtocolV2 {
+		return fmt.Errorf("send must be empty, %q, or %q", ProxyProtocolV1, ProxyProtocolV2)
+	}
+	if !c.Accept && len(c.TrustedCIDRs) != 0 {
+		return errors.New("trustedCIDRs requires accept=true")
+	}
+	if c.Accept && len(c.TrustedCIDRs) == 0 {
+		return errors.New("accept=true requires at least one trustedCIDR")
+	}
+	if len(c.TrustedCIDRs) > maxAccessItems {
+		return fmt.Errorf("trustedCIDRs must not contain more than %d entries", maxAccessItems)
+	}
+	prefixes := make([]netip.Prefix, 0, len(c.TrustedCIDRs))
+	for index, value := range c.TrustedCIDRs {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return fmt.Errorf("trustedCIDRs[%d]: invalid CIDR %q: %w", index, value, err)
+		}
+		if prefix.Addr().Is4In6() {
+			if prefix.Bits() < 96 {
+				return fmt.Errorf("trustedCIDRs[%d]: IPv4-mapped CIDR %q must use a prefix length of at least 96", index, value)
+			}
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	c.trustedPrefixes = prefixes
+	return nil
+}
+
+func (c *ProxyProtocolConfig) Trusts(addr netip.Addr) bool {
+	if c == nil || !c.Accept || !addr.IsValid() {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range c.trustedPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// Validate applies conservative active-check defaults and rejects settings
+// that could create tight retry loops or turn an HTTP path into another
+// network destination.
+func (c *HealthCheckConfig) Validate() error {
+	if c == nil {
+		return errors.New("health check config is nil")
+	}
+	if c.Type == "" {
+		c.Type = HealthCheckTCP
+	}
+	if c.Type != strings.TrimSpace(c.Type) {
+		return errors.New("type must not have leading or trailing whitespace")
+	}
+	c.Type = strings.ToLower(c.Type)
+	if c.Type != HealthCheckTCP && c.Type != HealthCheckHTTP {
+		return fmt.Errorf("invalid type %q", c.Type)
+	}
+
+	if c.Interval == 0 {
+		c.Interval = DefaultHealthCheckInterval
+	}
+	if c.Interval < uint64(minHealthInterval/time.Millisecond) || c.Interval > uint64(maxHealthInterval/time.Millisecond) {
+		return fmt.Errorf("interval must be between %s and %s", minHealthInterval, maxHealthInterval)
+	}
+	if c.Timeout == 0 {
+		c.Timeout = DefaultHealthCheckTimeout
+		if c.Timeout > c.Interval {
+			c.Timeout = c.Interval
+		}
+	}
+	if c.Timeout < uint64(minHealthTimeout/time.Millisecond) || c.Timeout > uint64(maxHealthTimeout/time.Millisecond) {
+		return fmt.Errorf("timeout must be between %s and %s", minHealthTimeout, maxHealthTimeout)
+	}
+	if c.Timeout > c.Interval {
+		return errors.New("timeout must not exceed interval")
+	}
+
+	if c.FailureThreshold == 0 {
+		c.FailureThreshold = DefaultHealthCheckFailures
+	}
+	if c.FailureThreshold < 1 || c.FailureThreshold > maxHealthThreshold {
+		return fmt.Errorf("failureThreshold must be between 1 and %d", maxHealthThreshold)
+	}
+	if c.SuccessThreshold == 0 {
+		c.SuccessThreshold = DefaultHealthCheckSuccesses
+	}
+	if c.SuccessThreshold < 1 || c.SuccessThreshold > maxHealthThreshold {
+		return fmt.Errorf("successThreshold must be between 1 and %d", maxHealthThreshold)
+	}
+
+	if c.Type == HealthCheckTCP {
+		if c.Path != "" || c.StatusMin != 0 || c.StatusMax != 0 {
+			return errors.New("path and status range are only valid for http checks")
+		}
+		return nil
+	}
+	if c.Path == "" {
+		c.Path = "/"
+	}
+	if len(c.Path) > maxHealthPath {
+		return fmt.Errorf("path must not exceed %d bytes", maxHealthPath)
+	}
+	parsed, err := url.ParseRequestURI(c.Path)
+	if err != nil || !strings.HasPrefix(c.Path, "/") || strings.HasPrefix(c.Path, "//") ||
+		parsed.IsAbs() || parsed.Host != "" || parsed.Fragment != "" {
+		return fmt.Errorf("path %q must be an HTTP origin-form request target", c.Path)
+	}
+	if c.StatusMin == 0 {
+		c.StatusMin = 200
+	}
+	if c.StatusMax == 0 {
+		c.StatusMax = 399
+	}
+	if c.StatusMin < 100 || c.StatusMin > 599 || c.StatusMax < 100 || c.StatusMax > 599 {
+		return errors.New("status range must be between 100 and 599")
+	}
+	if c.StatusMin > c.StatusMax {
+		return errors.New("statusMin must not exceed statusMax")
+	}
 	return nil
 }
 

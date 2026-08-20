@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,21 +22,31 @@ const (
 	gracefulDrainTimeout        = 10 * time.Second
 	metricsHandlerDrainTimeout  = 5 * time.Second
 	serverGlobalConnectionLimit = 4_096
+	serverErrorBufferSize       = 257
 )
 
 type listenerState struct {
-	rule     *config.Rule
-	listener net.Listener
-	limit    chan struct{}
+	key       string
+	listener  net.Listener
+	admission *listenerAdmission
+}
 
-	mu    sync.Mutex
-	perIP map[netip.Addr]int
+// listenerAdmission outlives an individual listening socket. Keeping quota
+// accounting separate prevents remove/re-add reloads from resetting limits
+// while connections accepted by the previous socket are still active.
+type listenerAdmission struct {
+	mu     sync.Mutex
+	perIP  map[netip.Addr]int
+	active int
 }
 
 // Server owns every listener and active client connection. NewServer binds all
 // configured addresses before any traffic is accepted, so startup is atomic.
 type Server struct {
+	current         atomic.Pointer[routingGeneration]
 	listeners       []*listenerState
+	listenersByKey  map[string]*listenerState
+	admissionsByKey map[string]*listenerAdmission
 	metricsListener net.Listener
 	metricsServer   *http.Server
 	metricsHandler  http.Handler
@@ -44,7 +55,11 @@ type Server struct {
 	globalLimit     chan struct{}
 	forceCtx        context.Context
 	forceCancel     context.CancelFunc
+	prewarmDialSem  chan struct{}
+	serveCtx        context.Context
+	errCh           chan error
 
+	reloadMu             sync.Mutex
 	lifecycleMu          sync.Mutex
 	serveStarted         bool
 	closed               bool
@@ -54,6 +69,9 @@ type Server struct {
 	metricsHandlerWG     sync.WaitGroup
 	wg                   sync.WaitGroup
 	active               sync.Map // net.Conn -> context.CancelFunc
+	retiredMu            sync.Mutex
+	retired              map[uint64]*routingGeneration
+	retiredWatcherWG     sync.WaitGroup
 }
 
 // NewServer binds all rules. If one bind fails, every listener opened so far is
@@ -75,11 +93,16 @@ func NewServerWithMetrics(rules []*config.Rule, metricsListen string) (*Server, 
 	}
 	forceCtx, forceCancel := context.WithCancel(context.Background())
 	s := &Server{
-		stopCh:      make(chan struct{}),
-		globalLimit: make(chan struct{}, serverGlobalConnectionLimit),
-		forceCtx:    forceCtx,
-		forceCancel: forceCancel,
+		stopCh:          make(chan struct{}),
+		globalLimit:     make(chan struct{}, serverGlobalConnectionLimit),
+		forceCtx:        forceCtx,
+		forceCancel:     forceCancel,
+		prewarmDialSem:  make(chan struct{}, prewarmGlobalDialLimit),
+		listenersByKey:  make(map[string]*listenerState, len(rules)),
+		admissionsByKey: make(map[string]*listenerAdmission, len(rules)),
+		retired:         make(map[uint64]*routingGeneration),
 	}
+	listenerKeys := make([]string, 0, len(rules))
 	for _, rule := range rules {
 		listener, err := net.Listen("tcp", rule.Listen)
 		if err != nil {
@@ -87,25 +110,36 @@ func NewServerWithMetrics(rules []*config.Rule, metricsListen string) (*Server, 
 			return nil, fmt.Errorf("listen rule %q at %s: %w", rule.Name, rule.Listen, err)
 		}
 
+		admission := &listenerAdmission{perIP: make(map[netip.Addr]int)}
 		state := &listenerState{
-			rule:     rule,
-			listener: listener,
-			perIP:    make(map[netip.Addr]int),
+			key:       runtimeListenerKey(rule.Listen, listener.Addr().String()),
+			listener:  listener,
+			admission: admission,
 		}
-		if rule.MaxConnections > 0 {
-			state.limit = make(chan struct{}, min(rule.MaxConnections, serverGlobalConnectionLimit))
+		if _, duplicate := s.listenersByKey[state.key]; duplicate {
+			_ = listener.Close()
+			s.Close()
+			return nil, fmt.Errorf("duplicate runtime listener key %q", state.key)
 		}
 		s.listeners = append(s.listeners, state)
+		s.listenersByKey[state.key] = state
+		s.admissionsByKey[state.key] = admission
+		listenerKeys = append(listenerKeys, state.key)
 	}
+	generation, err := newRoutingGeneration(1, rules, listenerKeys, s.prewarmDialSem)
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("prepare routing generation: %w", err)
+	}
+	s.current.Store(generation)
 	if metricsListen != "" {
 		listener, err := net.Listen("tcp", metricsListen)
 		if err != nil {
 			s.Close()
 			return nil, fmt.Errorf("listen metrics at %s: %w", metricsListen, err)
 		}
-		setMetricsGaugeRenderer(renderOperationalGauges)
 		s.metricsListener = listener
-		s.metricsHandler = newObservabilityHandler(s.Ready)
+		s.metricsHandler = newObservabilityHandler(s.Ready, s.renderOperationalGauges)
 		s.metricsServer = &http.Server{
 			Handler:           http.HandlerFunc(s.serveObservability),
 			ReadHeaderTimeout: 2 * time.Second,
@@ -140,10 +174,10 @@ func (s *Server) Serve(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	errCh := make(chan error, len(s.listeners)+1)
 	s.lifecycleMu.Lock()
 	if s.closed {
 		s.lifecycleMu.Unlock()
+		s.waitForRetiredGenerations()
 		return nil
 	}
 	if s.serveStarted {
@@ -151,9 +185,12 @@ func (s *Server) Serve(ctx context.Context) error {
 		return errors.New("server Serve may only be called once")
 	}
 	s.serveStarted = true
+	s.serveCtx = ctx
+	s.errCh = make(chan error, max(len(s.listeners)+1, serverErrorBufferSize))
 	if ctx.Err() != nil {
 		s.lifecycleMu.Unlock()
 		s.Close()
+		s.waitForRetiredGenerations()
 		return nil
 	}
 
@@ -171,30 +208,26 @@ func (s *Server) Serve(ctx context.Context) error {
 			if err := s.metricsServer.Serve(s.metricsListener); err != nil &&
 				!errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 				select {
-				case errCh <- fmt.Errorf("serve metrics: %w", err):
+				case s.errCh <- fmt.Errorf("serve metrics: %w", err):
 				default:
 				}
 			}
 		}()
 	}
+	generation := s.current.Load()
+	if generation != nil {
+		generation.startBackground()
+	}
 	for _, state := range s.listeners {
-		if state.rule.Prewarm {
-			initPrewarm(state.rule)
+		binding := generation.bindings[state.key]
+		if binding == nil {
+			continue
 		}
 		utils.Logger.Info("开始监听",
-			zap.String("ruleName", state.rule.Name),
+			zap.String("ruleName", binding.rule.Name),
 			zap.String("listen", state.listener.Addr().String()),
-			zap.String("mode", state.rule.Mode))
-		s.wg.Add(1)
-		go func(st *listenerState) {
-			defer s.wg.Done()
-			if err := s.acceptLoop(ctx, st); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-			}
-		}(state)
+			zap.String("mode", binding.rule.Mode))
+		s.startListenerLocked(state)
 	}
 	s.ready.Store(true)
 	s.lifecycleMu.Unlock()
@@ -203,12 +236,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 	case <-s.stopCh:
-	case serveErr = <-errCh:
+	case serveErr = <-s.errCh:
 	}
 
 	s.ready.Store(false)
 	s.Close()
-	shutdownPrewarm()
+	if generation := s.current.Load(); generation != nil {
+		generation.retire()
+	}
 
 	drained := make(chan struct{})
 	go func() {
@@ -231,7 +266,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	if !s.waitForMetricsHandlers(metricsHandlerDrainTimeout) {
 		utils.Logger.Warn("等待观测请求退出超时")
 	}
-	clearRuntimeRoutingState(s.rules())
+	s.waitForRetiredGenerations()
 
 	return serveErr
 }
@@ -243,66 +278,228 @@ func (s *Server) acceptLoop(ctx context.Context, state *listenerState) error {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return fmt.Errorf("accept rule %q: %w", state.rule.Name, err)
+			return fmt.Errorf("accept listener %q: %w", state.key, err)
 		}
+		generation, binding := s.acquireBinding(state.key)
+		if generation == nil || binding == nil {
+			_ = conn.Close()
+			continue
+		}
+		rule := binding.rule
 
 		clientIP, err := remoteIP(conn.RemoteAddr())
 		if err != nil {
-			metricConnectionRejected(state.rule.Name, state.rule.Mode, "invalid_remote_address")
+			metricConnectionRejected(rule.Name, rule.Mode, "invalid_remote_address")
+			generation.release()
 			utils.Logger.Warn("拒绝无法识别来源地址的连接",
-				zap.String("ruleName", state.rule.Name),
+				zap.String("ruleName", rule.Name),
 				zap.String("remoteAddr", conn.RemoteAddr().String()),
 				zap.Error(err))
 			_ = conn.Close()
 			continue
 		}
-		if state.rule.Blocked(clientIP) || !state.rule.Allows(clientIP) {
-			metricConnectionRejected(state.rule.Name, state.rule.Mode, "access_policy")
-			utils.Logger.Info("拒绝访问策略命中的连接",
-				zap.String("ruleName", state.rule.Name),
-				zap.String("clientIP", clientIP.String()))
+		if rule.ProxyProtocol != nil && rule.ProxyProtocol.Accept && !rule.ProxyProtocol.Trusts(clientIP) {
+			metricConnectionRejected(rule.Name, rule.Mode, "proxy_protocol")
+			generation.release()
+			utils.Logger.Warn("拒绝不可信的 PROXY protocol 上游",
+				zap.String("ruleName", rule.Name),
+				zap.String("peerIP", clientIP.String()))
 			_ = conn.Close()
 			continue
 		}
 		if !s.admitGlobal() {
-			metricConnectionRejected(state.rule.Name, state.rule.Mode, "global_connection_limit")
+			metricConnectionRejected(rule.Name, rule.Mode, "global_connection_limit")
+			generation.release()
 			utils.Logger.Warn("拒绝超过进程连接上限的连接",
-				zap.String("ruleName", state.rule.Name),
+				zap.String("ruleName", rule.Name),
 				zap.String("clientIP", clientIP.String()))
 			_ = conn.Close()
 			continue
 		}
-		if !state.admit(clientIP) {
+		if !state.admission.reserveRule(rule) {
 			s.releaseGlobal()
-			metricConnectionRejected(state.rule.Name, state.rule.Mode, "connection_limit")
+			metricConnectionRejected(rule.Name, rule.Mode, "connection_limit")
+			generation.release()
 			utils.Logger.Warn("拒绝超过连接上限的连接",
-				zap.String("ruleName", state.rule.Name),
+				zap.String("ruleName", rule.Name),
 				zap.String("clientIP", clientIP.String()))
 			_ = conn.Close()
 			continue
 		}
 
-		metricConnectionAccepted(state.rule.Name, state.rule.Mode)
-		metricConnectionActive(state.rule.Name, state.rule.Mode, 1)
 		// Listener shutdown leaves established streams alone during the graceful
 		// window. Keep an independent cancellation handle so the forced-shutdown
 		// path can also interrupt target selection and outbound dialing, not only
 		// reads and writes on the inbound socket.
-		connectionCtx, cancelConnection, stopForcedClose := s.newConnectionContext(ctx, conn)
-		s.active.Store(conn, context.CancelFunc(cancelConnection))
+		rawConn := conn
+		connectionCtx, cancelConnection, stopForcedClose := s.newConnectionContext(ctx, rawConn)
+		s.active.Store(rawConn, context.CancelFunc(cancelConnection))
 		s.wg.Add(1)
-		go func() {
+		go func(peerIP netip.Addr) {
 			defer s.wg.Done()
+			defer generation.release()
 			defer stopForcedClose()
 			defer cancelConnection()
 			defer s.releaseGlobal()
-			defer metricConnectionActive(state.rule.Name, state.rule.Mode, -1)
-			defer s.active.Delete(conn)
-			defer state.release(clientIP)
-			defer conn.Close()
-			dispatch(connectionCtx, conn, state.rule)
-		}()
+			defer s.active.Delete(rawConn)
+			defer rawConn.Close()
+			assigned := false
+			clientIP := peerIP
+			defer func() {
+				if assigned {
+					state.admission.releaseRule(clientIP)
+				} else {
+					state.admission.releasePending()
+				}
+				s.maybeCleanupAdmission(state.key, state.admission)
+			}()
+
+			preparedConn, effectiveIP, proxyErr := prepareInboundProxyProtocol(rawConn, rule, peerIP)
+			if proxyErr != nil {
+				metricConnectionRejected(rule.Name, rule.Mode, "proxy_protocol")
+				utils.Logger.Warn("拒绝无效的 PROXY protocol 连接",
+					zap.String("ruleName", rule.Name),
+					zap.String("peerIP", peerIP.String()),
+					zap.Error(proxyErr))
+				return
+			}
+			clientIP = effectiveIP
+			if rule.Blocked(clientIP) || !rule.Allows(clientIP) {
+				metricConnectionRejected(rule.Name, rule.Mode, "access_policy")
+				utils.Logger.Info("拒绝访问策略命中的连接",
+					zap.String("ruleName", rule.Name),
+					zap.String("clientIP", clientIP.String()))
+				return
+			}
+			if !state.admission.assignReservedIP(rule, clientIP) {
+				metricConnectionRejected(rule.Name, rule.Mode, "connection_limit")
+				utils.Logger.Warn("拒绝超过单 IP 连接上限的连接",
+					zap.String("ruleName", rule.Name),
+					zap.String("clientIP", clientIP.String()))
+				return
+			}
+			assigned = true
+			metricConnectionAccepted(rule.Name, rule.Mode)
+			metricConnectionActive(rule.Name, rule.Mode, 1)
+			defer metricConnectionActive(rule.Name, rule.Mode, -1)
+			generation.runtime.dispatch(connectionCtx, preparedConn, rule)
+		}(clientIP)
 	}
+}
+
+func (s *Server) startListenerLocked(state *listenerState) {
+	if s == nil || state == nil || s.serveCtx == nil || s.errCh == nil {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := s.acceptLoop(s.serveCtx, state); err != nil {
+			select {
+			case s.errCh <- err:
+			default:
+			}
+		}
+	}()
+}
+
+func (s *Server) acquireBinding(key string) (*routingGeneration, *ruleBinding) {
+	for {
+		generation := s.current.Load()
+		if generation == nil {
+			return nil, nil
+		}
+		binding := generation.bindings[key]
+		if binding == nil {
+			return nil, nil
+		}
+		if !generation.tryAcquire() {
+			if s.current.Load() == generation {
+				return nil, nil
+			}
+			continue
+		}
+		if s.current.Load() == generation {
+			return generation, binding
+		}
+		generation.release()
+	}
+}
+
+func (s *Server) renderOperationalGauges(output *strings.Builder) {
+	if s == nil {
+		return
+	}
+	// Take a generation lease while lifecycleMu prevents the reload commit
+	// point from moving. Keep that lock through the bounded gauge snapshot so
+	// retirement cannot stop/clear the selected runtime halfway through it.
+	s.lifecycleMu.Lock()
+	generation := s.current.Load()
+	acquired := !s.closed && generation != nil && generation.tryAcquire()
+	retired := s.retiredCount()
+	if acquired {
+		generation.runtime.renderOperationalGauges(output)
+		writeMetricHeader(output, "moto_routing_generation", "Currently published routing configuration generation.", "gauge")
+		writeMetricSample(output, "moto_routing_generation", nil, strconv.FormatUint(generation.id, 10))
+		generation.release()
+	}
+	s.lifecycleMu.Unlock()
+	writeMetricHeader(output, "moto_routing_retired_generations", "Routing generations still draining established connections.", "gauge")
+	writeMetricSample(output, "moto_routing_retired_generations", nil, strconv.Itoa(retired))
+}
+
+func (s *Server) trackRetired(generation *routingGeneration) {
+	if s == nil || generation == nil {
+		return
+	}
+	s.retiredMu.Lock()
+	s.retired[generation.id] = generation
+	s.retiredMu.Unlock()
+	s.retiredWatcherWG.Add(1)
+	go func() {
+		defer s.retiredWatcherWG.Done()
+		<-generation.done
+		s.retiredMu.Lock()
+		delete(s.retired, generation.id)
+		s.retiredMu.Unlock()
+		s.pruneAdmissions()
+	}()
+}
+
+func (s *Server) retiredCount() int {
+	if s == nil {
+		return 0
+	}
+	s.retiredMu.Lock()
+	s.pruneCompletedRetiredLocked()
+	count := len(s.retired)
+	s.retiredMu.Unlock()
+	return count
+}
+
+func (s *Server) waitForRetiredGenerations() {
+	if s == nil {
+		return
+	}
+	for {
+		s.retiredMu.Lock()
+		s.pruneCompletedRetiredLocked()
+		generations := make([]*routingGeneration, 0, len(s.retired))
+		for _, generation := range s.retired {
+			generations = append(generations, generation)
+		}
+		s.retiredMu.Unlock()
+		if len(generations) == 0 {
+			break
+		}
+		for _, generation := range generations {
+			<-generation.done
+		}
+	}
+	if generation := s.current.Load(); generation != nil {
+		<-generation.done
+	}
+	s.retiredWatcherWG.Wait()
 }
 
 func (s *Server) admitGlobal() bool {
@@ -323,16 +520,18 @@ func (s *Server) releaseGlobal() {
 	}
 }
 
-func dispatch(ctx context.Context, conn net.Conn, rule *config.Rule) {
+func (runtime *routingRuntime) dispatch(ctx context.Context, conn net.Conn, rule *config.Rule) {
 	switch rule.Mode {
 	case "normal":
-		HandleNormal(ctx, conn, rule)
+		runtime.handleNormal(ctx, conn, rule)
 	case "regex":
-		HandleRegexp(ctx, conn, rule)
+		runtime.handleRegexp(ctx, conn, rule)
 	case "boost":
-		HandleBoost(ctx, conn, rule)
+		runtime.handleBoost(ctx, conn, rule)
 	case "roundrobin":
-		HandleRoundrobin(ctx, conn, rule)
+		runtime.handleRoundrobin(ctx, conn, rule)
+	case "tls":
+		runtime.handleTLS(ctx, conn, rule)
 	default:
 		utils.Logger.Error("拒绝未知运行模式",
 			zap.String("ruleName", rule.Name),
@@ -347,7 +546,7 @@ func (s *Server) Close() {
 		return
 	}
 	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
+	var generation *routingGeneration
 	s.closeOnce.Do(func() {
 		s.closed = true
 		s.ready.Store(false)
@@ -367,7 +566,12 @@ func (s *Server) Close() {
 		if s.metricsListener != nil {
 			_ = s.metricsListener.Close()
 		}
+		generation = s.current.Load()
 	})
+	s.lifecycleMu.Unlock()
+	if generation != nil {
+		generation.retire()
+	}
 }
 
 func (s *Server) serveObservability(writer http.ResponseWriter, request *http.Request) {
@@ -409,16 +613,6 @@ func (s *Server) waitForMetricsHandlers(timeout time.Duration) bool {
 	case <-time.After(timeout):
 		return false
 	}
-}
-
-func (s *Server) rules() []*config.Rule {
-	rules := make([]*config.Rule, 0, len(s.listeners))
-	for _, state := range s.listeners {
-		if state != nil && state.rule != nil {
-			rules = append(rules, state.rule)
-		}
-	}
-	return rules
 }
 
 // Ready reports whether all configured listeners have started and shutdown has
@@ -466,38 +660,149 @@ func (s *Server) newConnectionContext(parent context.Context, conn net.Conn) (co
 	return ctx, cancel, stopForcedClose
 }
 
-func (s *listenerState) admit(ip netip.Addr) bool {
-	if s.limit != nil {
-		select {
-		case s.limit <- struct{}{}:
-		default:
-			return false
-		}
+func (s *listenerAdmission) reserveRule(rule *config.Rule) bool {
+	if s == nil || rule == nil {
+		return false
 	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if max := s.rule.MaxConnectionsPerIP; max > 0 && s.perIP[ip] >= max {
-		if s.limit != nil {
-			<-s.limit
-		}
+	if rule.MaxConnections > 0 && s.active >= rule.MaxConnections {
+		return false
+	}
+	s.active++
+	return true
+}
+
+func (s *listenerAdmission) assignReservedIP(rule *config.Rule, ip netip.Addr) bool {
+	if s == nil || rule == nil || !ip.IsValid() {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if max := rule.MaxConnectionsPerIP; max > 0 && s.perIP[ip] >= max {
 		return false
 	}
 	s.perIP[ip]++
 	return true
 }
 
-func (s *listenerState) release(ip netip.Addr) {
+func (s *listenerAdmission) releasePending() {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
+	if s.active > 0 {
+		s.active--
+	}
+	s.mu.Unlock()
+}
+
+func (s *listenerAdmission) releaseRule(ip netip.Addr) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.active > 0 {
+		s.active--
+	}
 	if s.perIP[ip] <= 1 {
 		delete(s.perIP, ip)
 	} else {
 		s.perIP[ip]--
 	}
 	s.mu.Unlock()
-	if s.limit != nil {
-		<-s.limit
+}
+
+func (s *listenerAdmission) idle() bool {
+	if s == nil {
+		return true
 	}
+	s.mu.Lock()
+	idle := s.active == 0
+	s.mu.Unlock()
+	return idle
+}
+
+func (s *Server) maybeCleanupAdmission(key string, admission *listenerAdmission) {
+	if s == nil || admission == nil {
+		return
+	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.admissionsByKey[key] != admission || !admission.idle() {
+		return
+	}
+	if current := s.current.Load(); current != nil {
+		if _, used := current.bindings[key]; used {
+			return
+		}
+	}
+	s.retiredMu.Lock()
+	defer s.retiredMu.Unlock()
+	for _, generation := range s.retired {
+		select {
+		case <-generation.done:
+			continue
+		default:
+		}
+		if _, used := generation.bindings[key]; used {
+			return
+		}
+	}
+	delete(s.admissionsByKey, key)
+}
+
+func (s *Server) pruneAdmissions() {
+	if s == nil {
+		return
+	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	used := make(map[string]struct{})
+	if current := s.current.Load(); current != nil {
+		for key := range current.bindings {
+			used[key] = struct{}{}
+		}
+	}
+	s.retiredMu.Lock()
+	for _, generation := range s.retired {
+		select {
+		case <-generation.done:
+			continue
+		default:
+		}
+		for key := range generation.bindings {
+			used[key] = struct{}{}
+		}
+	}
+	s.retiredMu.Unlock()
+	for key, admission := range s.admissionsByKey {
+		if _, keep := used[key]; !keep && admission.idle() {
+			delete(s.admissionsByKey, key)
+		}
+	}
+}
+
+func (s *Server) pruneCompletedRetiredLocked() {
+	for id, generation := range s.retired {
+		select {
+		case <-generation.done:
+			delete(s.retired, id)
+		default:
+		}
+	}
+}
+
+func runtimeListenerKey(configured, actual string) string {
+	_, portText, err := net.SplitHostPort(configured)
+	if err != nil {
+		return configured
+	}
+	port, err := strconv.Atoi(portText)
+	if err == nil && port == 0 {
+		return actual
+	}
+	return configured
 }
 
 func remoteIP(addr net.Addr) (netip.Addr, error) {

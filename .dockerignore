@@ -1,0 +1,10 @@
+.git
+.github
+.idea
+bin
+docs
+*.log
+*.out
+*.test
+moto
+nohup.out

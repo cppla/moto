@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"moto/config"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -17,6 +18,9 @@ import (
 // pointer while application goroutines may still refer to it.
 func resetProcessMetricsForTest() {
 	processMetrics.mu.Lock()
+	processMetrics.ruleRefs = make(map[string]int)
+	processMetrics.connectionRefs = make(map[connectionMetricKey]int)
+	processMetrics.dialRefs = make(map[dialMetricKey]int)
 	processMetrics.connectionsAccepted = make(map[connectionMetricKey]uint64)
 	processMetrics.connectionsRejected = make(map[rejectionMetricKey]uint64)
 	processMetrics.connectionsActive = make(map[connectionMetricKey]int64)
@@ -202,6 +206,48 @@ func TestMetricsOutputIsDeterministic(t *testing.T) {
 	acceptedZ := strings.Index(first, `moto_connections_accepted_total{rule="z-rule"`)
 	if acceptedA < 0 || acceptedZ < 0 || acceptedA >= acceptedZ {
 		t.Fatalf("accepted series are not sorted by label:\n%s", first)
+	}
+}
+
+func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
+	resetProcessMetricsForTest()
+	oldRules := []*config.Rule{{
+		Name: "reload-rule", Mode: config.ModeNormal,
+		Targets: []*config.Target{{Address: "old.example:443"}},
+	}}
+	newRules := []*config.Rule{{
+		Name: "reload-rule", Mode: config.ModeBoost,
+		Targets: []*config.Target{{Address: "new.example:443"}},
+	}}
+	processMetrics.registerRules(oldRules)
+	processMetrics.registerRules(newRules)
+	metricConnectionAccepted("reload-rule", config.ModeNormal)
+	metricConnectionAccepted("reload-rule", config.ModeBoost)
+	metricDial("reload-rule", "old.example:443", time.Millisecond, nil)
+	metricDial("reload-rule", "new.example:443", time.Millisecond, nil)
+	metricRelay("reload-rule", "client_to_target", 1, nil)
+
+	processMetrics.unregisterRules(oldRules)
+	snapshot := processMetrics.snapshot()
+	if _, exists := snapshot.connectionsAccepted[connectionMetricKey{rule: "reload-rule", mode: config.ModeNormal}]; exists {
+		t.Fatal("retired mode label was retained")
+	}
+	if _, exists := snapshot.dialAttempts[dialMetricKey{rule: "reload-rule", target: "old.example:443"}]; exists {
+		t.Fatal("retired target label was retained")
+	}
+	if snapshot.connectionsAccepted[connectionMetricKey{rule: "reload-rule", mode: config.ModeBoost}] != 1 ||
+		snapshot.dialAttempts[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 {
+		t.Fatal("current generation metrics were removed")
+	}
+	if snapshot.relayBytes[relayMetricKey{rule: "reload-rule", direction: "client_to_target"}] != 1 {
+		t.Fatal("shared rule metric was removed while still referenced")
+	}
+
+	processMetrics.unregisterRules(newRules)
+	snapshot = processMetrics.snapshot()
+	if len(snapshot.connectionsAccepted) != 0 || len(snapshot.dialAttempts) != 0 || len(snapshot.relayBytes) != 0 {
+		t.Fatalf("retired labels remain: connections=%d dials=%d relay=%d",
+			len(snapshot.connectionsAccepted), len(snapshot.dialAttempts), len(snapshot.relayBytes))
 	}
 }
 
