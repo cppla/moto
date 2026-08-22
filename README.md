@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <img src="docs/assets/moto-logo.png" alt="Moto 加速摩托与网络线路 Logo" width="480">
 </p>
@@ -224,7 +226,7 @@ sudo systemctl enable --now moto
 
 </details>
 
-CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达漏洞、示例配置、TLS/PROXY/热重载端到端测试和四种通用模式的本机闭环 smoke。推送 `v*` tag 会先通过完整门禁，再生成可复现的多平台压缩包、CycloneDX SBOM、SHA-256 校验文件和自动 release notes；归档内含二进制、README、LICENSE、示例配置和 systemd unit。
+CI 覆盖格式、工作流校验、模块完整性、测试、race、vet、staticcheck、可达漏洞、示例配置、TLS/PROXY/热重载端到端测试和四种通用模式的本机闭环 smoke。推送 `v*` tag 会先通过完整门禁，再生成可复现的多平台压缩包、CycloneDX SBOM、SHA-256 校验文件和自动 release notes；归档内含二进制、README、LICENSE、示例配置和 systemd unit。
 
 <details>
 <summary><strong>本地回归与性能采样</strong></summary>
