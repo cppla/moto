@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"moto/config"
 	"net"
 	"testing"
 	"time"
@@ -78,33 +79,53 @@ func TestRelayBidirectionalPreservesResponseAfterRequestEOF(t *testing.T) {
 	}
 }
 
-func TestUpstreamRelayErrorOnlyClassifiesUpstreamOperations(t *testing.T) {
-	upstreamWrite := errors.New("upstream write reset")
-	upstreamRead := errors.New("upstream read reset")
-	clientWrite := errors.New("client write reset")
-	clientRead := errors.New("client read reset")
+func TestCopyConnFallsBackForNonTCPConnections(t *testing.T) {
+	sender, relaySource := net.Pipe()
+	relayDestination, receiver := net.Pipe()
+	defer sender.Close()
+	defer relaySource.Close()
+	defer relayDestination.Close()
+	defer receiver.Close()
 
-	tests := []struct {
-		name   string
-		result relayResult
-		want   bool
-	}{
-		{name: "target write", result: relayResult{ClientToTarget: relayDirectionResult{Err: upstreamWrite, upstreamFailure: true}}, want: true},
-		{name: "target read", result: relayResult{TargetToClient: relayDirectionResult{Err: upstreamRead, upstreamFailure: true}}, want: true},
-		{name: "client read", result: relayResult{ClientToTarget: relayDirectionResult{Err: clientRead}}, want: false},
-		{name: "client write", result: relayResult{TargetToClient: relayDirectionResult{Err: clientWrite}}, want: false},
-		{name: "ambiguous", result: relayResult{TargetToClient: relayDirectionResult{Err: errors.New("closed")}}, want: false},
+	payload := []byte("portable buffered relay")
+	resultCh := make(chan relayDirectionResult, 1)
+	go func() {
+		copied, err := copyConn(relayDestination, relaySource)
+		resultCh <- relayDirectionResult{Bytes: copied, Err: err}
+	}()
+
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := sender.Write(payload)
+		_ = sender.Close()
+		writeErr <- err
+	}()
+
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(receiver, got); err != nil {
+		t.Fatal(err)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := upstreamRelayError(test.result) != nil; got != test.want {
-				t.Fatalf("upstreamRelayError() classified=%v, want %v", got, test.want)
-			}
-		})
+	if string(got) != string(payload) {
+		t.Fatalf("receiver payload = %q, want %q", got, payload)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-resultCh:
+		if result.Err != nil {
+			t.Fatalf("copyConn() error = %v", result.Err)
+		}
+		if result.Bytes != int64(len(payload)) {
+			t.Fatalf("copyConn() bytes = %d, want %d", result.Bytes, len(payload))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("copyConn did not finish after source close")
 	}
 }
 
-func TestRelayBidirectionalClassifiesRealUpstreamReset(t *testing.T) {
+func TestRelayBidirectionalStopsOnUpstreamReset(t *testing.T) {
 	client, proxyClient := newTCPPair(t)
 	proxyTarget, backend := newTCPPair(t)
 	defer client.Close()
@@ -135,18 +156,12 @@ func TestRelayBidirectionalClassifiesRealUpstreamReset(t *testing.T) {
 		if result.TargetToClient.Err == nil {
 			t.Fatal("upstream reset did not produce a target read error")
 		}
-		if !result.TargetToClient.upstreamFailure {
-			t.Fatalf("target read error not attributed upstream: %v", result.TargetToClient.Err)
-		}
-		if upstreamRelayError(result) == nil {
-			t.Fatal("real upstream reset was not reported to route health")
-		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("relay did not stop after upstream reset")
 	}
 }
 
-func TestRelayBidirectionalDoesNotClassifyRealClientResetAsUpstream(t *testing.T) {
+func TestRelayBidirectionalStopsOnClientReset(t *testing.T) {
 	client, proxyClient := newTCPPair(t)
 	proxyTarget, backend := newTCPPair(t)
 	defer proxyClient.Close()
@@ -177,14 +192,76 @@ func TestRelayBidirectionalDoesNotClassifyRealClientResetAsUpstream(t *testing.T
 		if result.ClientToTarget.Err == nil {
 			t.Fatal("client reset did not produce a client read error")
 		}
-		if result.ClientToTarget.upstreamFailure {
-			t.Fatalf("client reset attributed upstream: %v", result.ClientToTarget.Err)
-		}
-		if upstreamRelayError(result) != nil {
-			t.Fatalf("client reset poisoned route health: %v", upstreamRelayError(result))
-		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("relay did not stop after client reset")
+	}
+}
+
+func TestReportRouteRelayIgnoresAmbiguousCopyErrors(t *testing.T) {
+	registry := newRouteHealthRegistry()
+	rule := &config.Rule{Name: "copy-errors", Mode: config.ModeBoost}
+	now := time.Now()
+	attempt, err := registry.begin(rule, "127.0.0.1:443", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(attempt, time.Millisecond, nil, now)
+
+	result := relayResult{
+		ClientToTarget: relayDirectionResult{Err: errors.New("ambiguous io.Copy error")},
+	}
+	for range routeFailureThreshold {
+		reportRouteRelay(attempt, result)
+	}
+
+	snapshot := registry.snapshot(rule, "127.0.0.1:443", now)
+	if snapshot.CircuitOpen || snapshot.ConsecutiveFailures != 0 {
+		t.Fatalf("ambiguous copy errors changed route health: %+v", snapshot)
+	}
+}
+
+func TestReportRouteRelayDoesNotTreatErroredBytesAsRecovery(t *testing.T) {
+	registry := newRouteHealthRegistry()
+	rule := &config.Rule{Name: "copy-error-recovery", Mode: config.ModeBoost}
+	now := time.Now()
+	attempt, err := registry.begin(rule, "127.0.0.1:443", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(attempt, time.Millisecond, errors.New("dial failed"), now)
+
+	reportRouteRelay(attempt, relayResult{
+		ClientToTarget: relayDirectionResult{
+			Bytes: 1,
+			Err:   errors.New("ambiguous io.Copy error"),
+		},
+	})
+
+	snapshot := registry.snapshot(rule, "127.0.0.1:443", now)
+	if snapshot.ConsecutiveFailures != 1 {
+		t.Fatalf("errored relay reset route failures: %+v", snapshot)
+	}
+}
+
+func TestRelayBidirectionalContextCancellationStopsIdleCopies(t *testing.T) {
+	client, proxyClient := newTCPPair(t)
+	proxyTarget, backend := newTCPPair(t)
+	defer client.Close()
+	defer proxyClient.Close()
+	defer proxyTarget.Close()
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan relayResult, 1)
+	go func() {
+		resultCh <- relayBidirectional(ctx, proxyClient, proxyTarget)
+	}()
+	cancel()
+
+	select {
+	case <-resultCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("idle io.Copy calls did not stop after context cancellation")
 	}
 }
 

@@ -43,7 +43,7 @@ func (s *Server) ReloadRules(ctx context.Context, rules []*config.Rule) (ReloadR
 	if nextID <= old.id {
 		return ReloadResult{}, errors.New("routing generation counter overflow")
 	}
-	next, err := newRoutingGeneration(nextID, rules, listenerKeys, s.prewarmDialSem)
+	next, err := newRoutingGeneration(nextID, rules, listenerKeys, s.prewarmDialSem, s.trafficDials)
 	if err != nil {
 		return ReloadResult{}, fmt.Errorf("prepare reload: %w", err)
 	}
@@ -142,6 +142,7 @@ func (s *Server) ReloadRules(ctx context.Context, rules []*config.Rule) (ReloadR
 
 	// This store is the only commit point. Nothing after it can fail in a way
 	// that requires publishing the old generation again.
+	next.runtime.inheritUnchangedState(old.runtime, old.rules, next.rules)
 	s.current.Store(next)
 	if s.serveStarted {
 		next.startBackground()

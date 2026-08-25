@@ -32,9 +32,27 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 
 	var target net.Conn
 	var targetAttempt routeAttempt
+	tryCapacityFallback := false
 	for _, candidate := range rule.Targets {
-		candidateConn, attempt, err := runtime.outboundDialRoute(dialCtx, rule, candidate.Address)
+		candidateConn, attempt, err := runtime.outboundDialRouteWithOptions(
+			dialCtx, rule, candidate.Address, tryCapacityFallback, nil,
+		)
 		if err != nil {
+			if isDialBulkheadError(err) {
+				if isDialTargetBulkheadSaturation(err) {
+					tryCapacityFallback = true
+					utils.Logger.Debug("目标拨号容量已满，尝试其他目标",
+						zap.String("ruleName", rule.Name),
+						zap.String("targetAddr", candidate.Address))
+					continue
+				}
+				utils.Logger.Debug("前台拨号容量暂时不可用，结束当前连接",
+					zap.String("ruleName", rule.Name),
+					zap.String("remoteAddr", connAddr(conn)),
+					zap.String("targetAddr", candidate.Address),
+					zap.Error(err))
+				return
+			}
 			utils.Logger.Error("无法建立连接，尝试下一个目标",
 				zap.String("ruleName", rule.Name),
 				zap.String("remoteAddr", connAddr(conn)),
@@ -43,7 +61,7 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 			continue
 		}
 		configureTCP(candidateConn)
-		if err := writeOutboundProxyProtocol(candidateConn, conn, rule); err != nil {
+		if err := writeOutboundProxyProtocolContext(dialCtx, candidateConn, conn, rule); err != nil {
 			routeReportFailure(attempt, err, time.Now())
 			_ = candidateConn.Close()
 			utils.Logger.Error("写入 PROXY protocol 头失败，尝试下一个目标",

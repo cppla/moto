@@ -75,7 +75,13 @@ func cloneRuntimeRules(rules []*config.Rule, allowEphemeral bool) ([]*config.Rul
 	return clone, sha256.Sum256(canonical), nil
 }
 
-func newRoutingGeneration(id uint64, rules []*config.Rule, listenerKeys []string, sharedDialSem chan struct{}) (*routingGeneration, error) {
+func newRoutingGeneration(
+	id uint64,
+	rules []*config.Rule,
+	listenerKeys []string,
+	sharedPrewarmDialSem chan struct{},
+	sharedTrafficDials *dialBulkhead,
+) (*routingGeneration, error) {
 	if len(listenerKeys) != len(rules) {
 		return nil, fmt.Errorf("listener key count %d does not match rule count %d", len(listenerKeys), len(rules))
 	}
@@ -88,7 +94,7 @@ func newRoutingGeneration(id uint64, rules []*config.Rule, listenerKeys []string
 		fingerprint: fingerprint,
 		rules:       clone,
 		bindings:    make(map[string]*ruleBinding, len(clone)),
-		runtime:     newRoutingRuntimeWithDialSem(sharedDialSem),
+		runtime:     newRoutingRuntimeWithDialResources(sharedPrewarmDialSem, sharedTrafficDials),
 		done:        make(chan struct{}),
 	}
 	for index, rule := range clone {

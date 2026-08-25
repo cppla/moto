@@ -427,6 +427,34 @@ func (runtime *routingRuntime) outboundDial(ctx context.Context, rule *config.Ru
 }
 
 func (runtime *routingRuntime) outboundDialRoute(ctx context.Context, rule *config.Rule, addr string) (net.Conn, routeAttempt, error) {
+	return runtime.outboundDialRouteWithStart(ctx, rule, addr, nil)
+}
+
+// outboundDialRouteWithStart reports the point at which local admission and
+// route checks have completed and the selected connection can make progress.
+// Fresh connections invoke onStart immediately before the network dial; a
+// reusable prewarmed connection invokes it immediately before returning. This
+// lets optional hedging exclude bulkhead wait time from its delay budget.
+func (runtime *routingRuntime) outboundDialRouteWithStart(
+	ctx context.Context,
+	rule *config.Rule,
+	addr string,
+	onStart func(),
+) (net.Conn, routeAttempt, error) {
+	return runtime.outboundDialRouteWithOptions(ctx, rule, addr, false, onStart)
+}
+
+// outboundDialRouteWithOptions lets opportunistic work use immediate-only
+// admission while preserving the normal bounded wait for required foreground
+// dials. tryOnly is used by delayed Hedge backups so they never add a second
+// queue of waiters while the server is already under local dial pressure.
+func (runtime *routingRuntime) outboundDialRouteWithOptions(
+	ctx context.Context,
+	rule *config.Rule,
+	addr string,
+	tryOnly bool,
+	onStart func(),
+) (net.Conn, routeAttempt, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -438,24 +466,60 @@ func (runtime *routingRuntime) outboundDialRoute(ctx context.Context, rule *conf
 	}
 	now := time.Now()
 	snapshot := runtime.routes.snapshot(rule, addr, now)
-	attempt, err := runtime.routes.begin(rule, addr, now)
-	if err != nil {
-		return nil, routeAttempt{}, err
-	}
 	// A half-open route must prove itself with a fresh TCP handshake. Reusing a
 	// pooled socket would make an expired circuit look healthy without testing
 	// the current network path.
+	var pooled net.Conn
 	if rule != nil && rule.Prewarm && prewarmReuseSupported && !snapshot.ProbeRequired {
 		if conn, ok := runtime.prewarm.acquire(addr); ok {
 			if err := ctx.Err(); err != nil {
 				_ = conn.Close()
-				return nil, attempt, err
+				return nil, routeAttempt{}, err
 			}
-			return conn, attempt, nil
+			pooled = conn
 		}
 	}
+
+	var permit *dialPermit
+	if pooled == nil {
+		var err error
+		if tryOnly {
+			permit, err = runtime.tryAcquireTrafficDial(ctx, rule, addr)
+		} else {
+			permit, err = runtime.acquireTrafficDial(ctx, rule, addr)
+		}
+		if err != nil {
+			return nil, routeAttempt{}, err
+		}
+		// Health can change while a request waits briefly for local dial capacity.
+		// Recheck it before claiming a route attempt or touching the network.
+		if runtime.health.unhealthy(rule, addr) {
+			permit.release()
+			return nil, routeAttempt{}, ErrActiveHealthUnhealthy
+		}
+	}
+
+	attempt, err := runtime.routes.begin(rule, addr, time.Now())
+	if err != nil {
+		if pooled != nil {
+			_ = pooled.Close()
+		}
+		permit.release()
+		return nil, routeAttempt{}, err
+	}
+	if pooled != nil {
+		if onStart != nil {
+			onStart()
+		}
+		return pooled, attempt, nil
+	}
+
 	started := time.Now()
+	if onStart != nil {
+		onStart()
+	}
 	conn, err := DialFastContext(ctx, addr)
+	permit.release()
 	if err == nil && conn == nil {
 		err = errors.New("dial returned a nil connection")
 	}

@@ -18,6 +18,7 @@ Moto 是轻量级、自适应的 TCP 网关。应用只连接一个稳定入口�
 
 - **自适应选路：** 顺序故障切换、首包与 TLS SNI/ALPN 分类、EWMA 延迟学习、Top-2 竞速、主动健康检查、熔断和恢复探测都在一个进程内完成。
 - **协议透明：** 不终止 TLS、不改写流量，也不要求接入 SDK；HTTP(S)、WebSocket、SSH、SOCKS5 和私有 TCP 协议均可直接使用。
+- **高效转发：** 稳定字节流直接交给 `io.Copy`；Linux 上符合条件的 TCP→TCP 路径通常由 Go 运行时自动使用 `splice(2)` 零拷贝，不支持时自动回退。
 - **轻而可靠：** 单个 Go 二进制加一份 JSON 即可运行，同时内置严格配置校验、资源上限、访问控制、Prometheus 指标、优雅退出和跨平台发布。
 
 ## 30 秒启动
@@ -50,16 +51,22 @@ flowchart LR
 | --- | --- |
 | `normal` | 按配置顺序连接目标，直到成功 |
 | `regex` | 在最多 4 KiB 的客户端首包中匹配规则，再转发完整字节流 |
-| `boost` | 按 EWMA 评分竞速 Top-2 目标，缓存胜出线路并定期探索其他线路 |
+| `boost` | 按 EWMA 评分竞速 Top-2 目标，缓存胜出线路并定期探索；可选自适应延迟备用拨号 |
 | `roundrobin` | 按规则独立轮询；单个目标失败时回退到竞速选择 |
 | `tls` | 解析 ClientHello 的 SNI/ALPN 选路，再原样转发 TLS 字节流 |
 
 <details>
 <summary><strong>选路、熔断与预热细节</strong></summary>
 
-域名由 Go TCP Dialer 处理，并支持 IPv4/IPv6 快速回退。每条线路记录拨号延迟 EWMA；连续三次拨号失败或可明确归因于上游的转发失败后，线路进入 5 秒熔断冷却，重复失败时最长增加到 60 秒。冷却结束只允许一个半开探针，竞速取消的败者不会被误记为故障。
+域名由 Go TCP Dialer 处理，并支持 IPv4/IPv6 快速回退。每条线路记录拨号延迟 EWMA；连续三次拨号失败或连接准备、首包写入等可明确归因于上游的失败后，线路进入 5 秒熔断冷却，重复失败时最长增加到 60 秒。冷却结束只允许一个半开探针，竞速取消的败者不会被误记为故障。稳定转发使用 `io.Copy`，其错误无法可靠区分客户端和上游，因此只进入日志与指标，不参与熔断；这类故障由后续拨号和主动健康检查发现。
 
-预热池默认关闭。启用后，每个目标最多 4 个并发补充拨号、进程最多 32 个、单份配置最多 256 个唯一预热目标。Unix 会用非消费式 `MSG_PEEK` 拒绝已收到 FIN/RST 的空闲连接；无法安全探测的平台使用新连接。线路熔断时旧池会被清空并暂停补充。
+`boost` 冷缓存仍然只同时竞速 Top-2。配置 `hedge` 后，热缓存先拨缓存线路；若它在 `clamp(2 × EWMA, minDelay, maxDelay)` 内未完成，再启动一个备用目标，同时在途数仍不超过 2。缓存线路明确失败时不等待延迟，立即补齐备用目标。Hedge 计时从缓存线路通过健康、熔断和前台隔离舱准入后开始；延迟备用只使用立即可得的拨号额度，拿不到时保留主线路且不新增排队者。若主线路随后失败，备用会转为必要故障切换并恢复正常的有界准入等待。省略 `hedge` 完全保留原来的单线路热缓存行为。
+
+Hedge 只竞速 Moto 到上游的 TCP 建连与连接准备，不观察 SOCKS CONNECT、应用首字节或已建立连接的传输速度。命中预热连接时 TCP 建连已经完成，因此该请求通常不会再启动 Hedge；两者分别优化“已有可用连接”和“新建连接尾延迟”，收益不能直接相加。
+
+预热池默认关闭。启用后，每个目标最多 4 个并发补充拨号、进程最多 32 个、单份配置最多 256 个唯一预热目标。Unix 会用非消费式 `MSG_PEEK` 拒绝已收到 FIN/RST 的空闲连接；无法安全探测的平台使用新连接。`MSG_PEEK` 只能判断 TCP 是否已明确关闭，不能识别“socket 仍 open，但应用会话已过期”；启用前必须在同一条连接上等待接近 30 秒后完成真实协议请求，不能只测 TCP connect。线路熔断时旧池会被清空并暂停补充。
+
+前台新建上游连接经过 Server 级拨号隔离舱：同时最多 256 个真实拨号、同一配置目标最多 64 个，额度不足时最多等待 250 ms。热重载前后的 generation 共用同一份额度；预热连接命中不占前台额度，预热补池与 Boost 懒刷新合计使用 32 个独立后台拨号槽，主动健康检查另有 32 个探测槽。本地额度超时不会更新线路失败或抢占半开探针；全局容量已满时立即结束，仅单目标容量已满且全局仍有余量时，才会对其他已配置目标做无排队的立即准入尝试。详见 [拨号隔离舱](docs/dial-bulkhead.md)。
 
 </details>
 
@@ -68,13 +75,12 @@ flowchart LR
 
 | 协议 | JSON 中的正则表达式 |
 | --- | --- |
-| HTTP | `^(GET|POST|HEAD|DELETE|PUT|CONNECT|OPTIONS|TRACE)` |
-| SSH | `^SSH` |
+| HTTP | `^(GET|POST|HEAD|DELETE|PUT|PATCH|CONNECT|OPTIONS|TRACE) ` |
 | TLS | `^\\x16\\x03` |
 | RDP | `^\\x03\\x00\\x00` |
 | SOCKS5 | `^\\x05` |
 
-TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量读取并在任一规则匹配后停止分类。`regex` 只适合客户端先发送数据的协议；VNC、FTP、MySQL 等服务端先握手协议不能依靠客户端首包区分。
+TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量读取并在任一规则匹配后停止分类。`regex` 只适合客户端先发送数据的协议；常见 SSH 客户端会等待服务端 banner，VNC、FTP、MySQL 也是服务端先握手，这些协议应使用 `normal`、`boost` 或 `roundrobin` 直接转发。
 
 </details>
 
@@ -97,6 +103,10 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
       "mode": "boost",
       "prewarm": false,
       "timeout": 3000,
+      "hedge": {
+        "minDelay": 25,
+        "maxDelay": 250
+      },
       "allowlist": ["127.0.0.0/8", "::1/128"],
       "targets": [
         { "address": "server-a.example.com:443" },
@@ -112,6 +122,7 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
 | `mode` | 无 | `normal`、`regex`、`boost`、`roundrobin` 或 `tls` |
 | `timeout` | `regex` 为 500 ms；其余为 3 s | 拨号或首包决策期限，不限制已建立连接的寿命 |
 | `prewarm` | `false` | 仅在上游允许业务握手前保持空闲 TCP 时启用 |
+| `hedge` | 关闭 | 仅用于至少两个唯一目标的 `boost`；空对象默认延迟范围 25–250 ms，且 `maxDelay` 必须小于规则 `timeout` |
 | `healthCheck` | 关闭 | 可选 TCP 或明文 HTTP 主动探测，达到阈值后暂时排除目标 |
 | `proxyProtocol` | 关闭 | 从可信 CIDR 接收 PROXY v1/v2，或向上游发送 v1/v2 |
 | `allowlist` | 空 | CIDR 来源白名单；空值允许所有有效地址 |
@@ -164,7 +175,7 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
 
 ## 安全与可观测
 
-- 示例配置只监听 `127.0.0.1`，默认关闭预热，启动时不会主动连接外部目标。
+- 示例配置只监听 `127.0.0.1` 并关闭预热，但各模式已启用 TCP 健康检查；启动后仍会周期连接配置的外部目标，部署前必须替换为自己的上游。
 - 进程最多同时处理 4,096 条客户端连接；若监听公网地址，应同时配置精确 `allowlist`，并使用防火墙或安全组限制来源。
 - Moto 是透明 TCP 转发器，不替代 TLS、应用认证或网络访问控制；观测端点只能监听数字形式的 loopback 地址。
 
@@ -174,7 +185,7 @@ curl -fsS http://127.0.0.1:9090/readyz
 curl -fsS http://127.0.0.1:9090/metrics
 ```
 
-`healthz` 表示进程可响应，`readyz` 只在全部转发监听器就绪且未进入关闭流程时成功。Prometheus 指标覆盖 goroutine、连接数、转发字节与错误、拨号成功率与耗时、Boost 缓存、线路 EWMA/熔断、主动健康状态、预热池及当前/排空中的配置 generation。
+`healthz` 表示进程可响应，`readyz` 只在全部转发监听器就绪且未进入关闭流程时成功。Prometheus 指标覆盖 goroutine、连接数、转发字节与错误、拨号成功率与耗时、拨号隔离舱当前占用/等待/拒绝/等待耗时、Boost 缓存与 Hedge 调度/胜出/延迟/决策耗时、线路 EWMA/熔断、主动健康状态、预热池及当前/排空中的配置 generation。
 
 ## WebSocket
 
@@ -229,13 +240,26 @@ CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达�
 <details>
 <summary><strong>本地回归与性能采样</strong></summary>
 
-完全本地的回归门禁不访问外网，会报告直连、冷态和热态的吞吐与 p50/p95/p99，并采样 CPU、RSS、FD 和 goroutine：
+完全本地的回归门禁不访问外网，会报告直连、启动初期（输出中保留名称 `cold`，但同一阶段后续请求会逐渐变热）和热态的成功吞吐与 p50/p95/p99，并采样 CPU、RSS、FD 和 goroutine。这是功能与回归 smoke，不是绝对容量结论：
 
 ```bash
 python3 test/bench.py --self-contained --mode boost \
   --concurrency 50 --total 500 --warmup 50 \
   --min-success-rate 99 --save /tmp/moto-bench.json
 ```
+
+大流量双向转发另有逐字节校验的直连/代理同负载基准；它会同时采样 CPU、RSS、FD，并可在 Linux 网络命名空间中加入延迟、抖动、丢包和带宽限制：
+
+```bash
+python3 test/bulk_relay_bench.py --direction both \
+  --concurrency 4 --connections 8 \
+  --bytes-per-direction 256MiB \
+  --min-success-rate 100 --save /tmp/moto-bulk.json
+```
+
+正式 A/B 应至少重复 5 轮，在相同预热条件下交替默认顺序与 `--proxy-first`，报告中位数、离散程度和全部原始结果。自包含 fixture 与负载生成器共享 Python 进程，适合回归和相对对比；绝对容量测试应把客户端、Moto 和上游分离并绑定 CPU。
+
+Linux 的 `splice` 每个转发方向会占用一根内核 pipe，因此一条双向连接除客户端、上游 socket 外还需要 4 个 pipe FD。按进程 4,096 条连接上限部署时，建议 `LimitNOFILE`/`ulimit -n` 至少为 65,536；随仓库提供的 systemd unit 已配置更高上限。高并发大流量测试应同时观察 FD、RSS 和内核 pipe 内存，而不只看吞吐。
 
 SOCKS5 外部场景也可参数化运行：
 
@@ -248,6 +272,8 @@ python3 test/bench.py \
 ```
 
 生产性能评估应同时记录直连基线、成功率、p50/p95/p99 和资源峰值，不能只比较单次最快延迟。
+
+跨地域且有丢包的 Linux 链路可单独 A/B 测试 BBR 等拥塞控制算法，但它们是宿主机或网络命名空间级的全局策略。Moto 不会在进程内加载内核模块或修改 `sysctl`；上线前应使用与业务方向、RTT、丢包率和带宽相同的可回滚测试验证收益。
 
 </details>
 

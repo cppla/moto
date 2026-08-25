@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"moto/config"
 	"strings"
@@ -15,6 +16,34 @@ func TestOperationalGaugesExposeRouteAndPrewarmState(t *testing.T) {
 	defer resetRouteHealthForTest()
 	shutdownPrewarm()
 	defer shutdownPrewarm()
+	originalBulkhead := defaultRoutingRuntime.trafficDials
+	bulkhead := newDialBulkhead(2, 1, time.Second)
+	defaultRoutingRuntime.trafficDials = bulkhead
+	defer func() { defaultRoutingRuntime.trafficDials = originalBulkhead }()
+	permit, _, err := bulkhead.acquire(context.Background(), "upstream:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer permit.release()
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		_, _, _ = bulkhead.acquire(waitCtx, "upstream:443")
+	}()
+	deadline := time.Now().Add(time.Second)
+	for bulkhead.snapshot().Waiting != 1 {
+		if time.Now().After(deadline) {
+			cancelWait()
+			<-waitDone
+			t.Fatal("dial bulkhead waiter did not queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	defer func() {
+		cancelWait()
+		<-waitDone
+	}()
 
 	rule := &config.Rule{
 		Name:    "gauges",
@@ -22,7 +51,7 @@ func TestOperationalGaugesExposeRouteAndPrewarmState(t *testing.T) {
 		Mode:    config.ModeBoost,
 		Targets: []*config.Target{{Address: "upstream:443"}},
 	}
-	now := time.Unix(1_800_000_000, 0)
+	now := time.Now().Add(-10 * time.Second)
 	observeRoute(t, rule, "upstream:443", 25*time.Millisecond, nil, now)
 	observeRoute(t, rule, "upstream:443", 10*time.Millisecond, errors.New("dial failed"), now.Add(time.Second))
 
@@ -44,6 +73,11 @@ func TestOperationalGaugesExposeRouteAndPrewarmState(t *testing.T) {
 		`moto_prewarm_desired_connections{target="upstream:443"} 3`,
 		`moto_prewarm_warming_connections{target="upstream:443"} 1`,
 		`moto_prewarm_consecutive_failures{target="upstream:443"} 2`,
+		`moto_dial_bulkhead_in_flight 1`,
+		`moto_dial_bulkhead_waiting 1`,
+		`moto_dial_bulkhead_global_limit 2`,
+		`moto_dial_bulkhead_per_target_limit 1`,
+		`moto_dial_bulkhead_target_in_flight{target="upstream:443"} 1`,
 	}
 	for _, want := range wants {
 		if !strings.Contains(body, want) {

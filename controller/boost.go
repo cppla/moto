@@ -8,6 +8,8 @@ import (
 	"moto/utils"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,6 +21,8 @@ const (
 	boostRevalidateLimit = 2 * time.Second
 	boostWinnerCacheMax  = 256
 )
+
+var errBoostMaintenanceSaturated = errors.New("boost maintenance dial capacity saturated")
 
 type boostWinnerEntry struct {
 	addr       string
@@ -41,9 +45,27 @@ type dialResult struct {
 	addr    string
 	attempt routeAttempt
 	err     error
+	delayed bool
 }
 
 type boostDialFunc func(context.Context, string) (net.Conn, error)
+type boostPrepareFunc func(context.Context, net.Conn, string) error
+type boostDialRelease func()
+type boostDialAcquireFunc func(context.Context, *config.Rule, string, bool) (boostDialRelease, error)
+
+type boostRouteDialOptions struct {
+	tryOnly bool
+	onStart func()
+}
+
+type boostRouteDialFunc func(context.Context, *config.Rule, string, boostRouteDialOptions) (net.Conn, routeAttempt, error)
+
+type cachedBoostOutcome struct {
+	winner          dialResult
+	cachedFailed    bool
+	fallbackStarted bool
+	hedged          bool
+}
 
 // boostRuleKey includes the listener and the ordered target set. Rules with the
 // same display name must not share a winner after a reload or across listeners.
@@ -148,6 +170,346 @@ func (runtime *routingRuntime) deleteBoostWinnerIfCurrent(token boostWinnerToken
 	return true
 }
 
+// finishBoostRelay never attributes an io.Copy error to either endpoint, so it
+// cannot open a route circuit. It does, however, discard the exact cached
+// winner that produced an abnormal stream. The next connection can then race
+// all candidates instead of repeatedly pinning traffic to a possibly broken
+// route. A generation token prevents an old stream from deleting a newer lazy
+// refresh or hedge winner.
+func (runtime *routingRuntime) finishBoostRelay(token boostWinnerToken, attempt routeAttempt, result relayResult) {
+	if relayHasError(result) {
+		runtime.deleteBoostWinnerIfCurrent(token)
+	}
+	reportRouteRelay(attempt, result)
+}
+
+// cachedBoostHedgeDelay turns the cached route's foreground dial EWMA into the
+// configured tail-latency threshold. Configuration validation guarantees the
+// bounds fit inside the rule decision timeout.
+func (runtime *routingRuntime) cachedBoostHedgeDelay(rule *config.Rule, addr string) time.Duration {
+	if rule == nil || rule.Hedge == nil {
+		return 0
+	}
+	minimum := time.Duration(rule.Hedge.MinDelay) * time.Millisecond
+	maximum := time.Duration(rule.Hedge.MaxDelay) * time.Millisecond
+	delay := minimum
+	if runtime != nil && runtime.routes != nil {
+		snapshot := runtime.routes.snapshot(rule, addr, time.Now())
+		if snapshot.HasEWMA {
+			delay = 2 * snapshot.EWMA
+		}
+	}
+	if delay < minimum {
+		delay = minimum
+	}
+	if delay > maximum {
+		delay = maximum
+	}
+	return delay
+}
+
+func (runtime *routingRuntime) raceCachedBoostTarget(
+	ctx context.Context,
+	rule *config.Rule,
+	cachedAddr string,
+	prepare boostPrepareFunc,
+) (cachedBoostOutcome, error) {
+	delay := runtime.cachedBoostHedgeDelay(rule, cachedAddr)
+	dial := func(dialCtx context.Context, dialRule *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+		return runtime.outboundDialRouteWithOptions(dialCtx, dialRule, addr, options.tryOnly, options.onStart)
+	}
+	return runtime.raceCachedBoostTargetWithDial(
+		ctx,
+		rule,
+		cachedAddr,
+		dial,
+		prepare,
+		delay,
+		nil,
+	)
+}
+
+// raceCachedBoostTargetWithDial starts only the cached route initially. A hard
+// failure immediately fills the normal Top-2 decision window from other
+// routes, while a merely slow dial starts one hedge only after hedgeReady. All
+// candidates use the supplied route dialer; production wraps
+// outboundDialRouteWithOptions, which owns active-health checks, route attempts,
+// prewarm, metrics, foreground dial-bulkhead admission, and precise start
+// notifications. Delayed alternatives use immediate-only admission.
+func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
+	ctx context.Context,
+	rule *config.Rule,
+	cachedAddr string,
+	dial boostRouteDialFunc,
+	prepare boostPrepareFunc,
+	hedgeDelay time.Duration,
+	hedgeReady <-chan time.Time,
+) (outcome cachedBoostOutcome, returnErr error) {
+	var delayedStarted atomic.Bool
+	defer func() { outcome.hedged = delayedStarted.Load() }()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if rule == nil || len(rule.Targets) == 0 {
+		return outcome, errors.New("cached boost rule has no targets")
+	}
+	if cachedAddr == "" {
+		return outcome, errors.New("cached boost target is empty")
+	}
+	if dial == nil {
+		dial = func(dialCtx context.Context, dialRule *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+			return runtime.outboundDialRouteWithOptions(dialCtx, dialRule, addr, options.tryOnly, options.onStart)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return outcome, err
+	}
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	timerCtx, cancelTimer := context.WithCancel(ctx)
+	defer cancelTimer()
+	results := make(chan dialResult, len(rule.Targets))
+	attempted := map[string]struct{}{cachedAddr: {}}
+	active := 0
+	hedgingEnabled := false
+	delayedHedge := false
+	primaryFailed := false
+	healthExcluded := false
+	globalCapacityLimited := false
+	capacityFallbackTryOnly := false
+	var capacityErr error
+	var dialErrors []error
+
+	controlledHedgeSignal := hedgeReady != nil
+	var internalHedgeSignal chan time.Time
+	if rule.Hedge != nil && !controlledHedgeSignal {
+		internalHedgeSignal = make(chan time.Time, 1)
+		hedgeReady = internalHedgeSignal
+	}
+
+	var hedgeScheduled atomic.Bool
+	var primaryStartOnce sync.Once
+	onPrimaryStart := func() {
+		primaryStartOnce.Do(func() {
+			if rule.Hedge == nil {
+				return
+			}
+			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= hedgeDelay {
+				metricBoostHedgeEvent(rule.Name, boostHedgeSkippedDeadline)
+				return
+			}
+			hedgeScheduled.Store(true)
+			metricBoostHedgeEvent(rule.Name, boostHedgeScheduled)
+			metricBoostHedgeDelay(rule.Name, hedgeDelay)
+			if controlledHedgeSignal {
+				return
+			}
+			go func() {
+				timer := time.NewTimer(hedgeDelay)
+				defer timer.Stop()
+				select {
+				case fired := <-timer.C:
+					select {
+					case internalHedgeSignal <- fired:
+					case <-timerCtx.Done():
+					}
+				case <-timerCtx.Done():
+				}
+			}()
+		})
+	}
+
+	var delayedStartOnce sync.Once
+	onDelayedStart := func() {
+		delayedStartOnce.Do(func() {
+			delayedStarted.Store(true)
+			metricBoostHedgeEvent(rule.Name, boostHedgeLaunched)
+		})
+	}
+
+	launch := func(addr string, primary, delayed, tryOnly bool) {
+		active++
+		go func() {
+			options := boostRouteDialOptions{tryOnly: tryOnly}
+			if primary {
+				options.onStart = onPrimaryStart
+			} else if delayed {
+				options.onStart = onDelayedStart
+			}
+			connection, attempt, err := dial(raceCtx, rule, addr, options)
+			if err == nil && connection == nil {
+				err = errors.New("cached boost dial returned a nil connection")
+			}
+			if err != nil && connection != nil {
+				_ = connection.Close()
+				connection = nil
+			}
+			if err == nil && prepare != nil {
+				if prepareErr := prepare(raceCtx, connection, addr); prepareErr != nil {
+					routeReportFailure(attempt, prepareErr, time.Now())
+					_ = connection.Close()
+					connection = nil
+					err = prepareErr
+				}
+			}
+			results <- dialResult{conn: connection, addr: addr, attempt: attempt, err: err, delayed: delayed}
+		}()
+	}
+
+	launchAlternatives := func(limit int, delayed, tryOnly bool) int {
+		if limit <= 0 || globalCapacityLimited {
+			return 0
+		}
+		candidates := runtime.routes.selectTargetsExcluding(rule, len(rule.Targets), time.Now(), attempted)
+		launched := 0
+		for _, target := range candidates {
+			if launched == limit {
+				break
+			}
+			addr := target.Address
+			attempted[addr] = struct{}{}
+			if runtime.health.unhealthy(rule, addr) {
+				healthExcluded = true
+				continue
+			}
+			launch(addr, false, delayed, tryOnly)
+			launched++
+		}
+		if launched > 0 {
+			outcome.fallbackStarted = true
+		}
+		return launched
+	}
+
+	observeDelayedResult := func(result dialResult) {
+		if !result.delayed || result.addr == cachedAddr {
+			return
+		}
+		if errors.Is(result.err, errDialBulkheadSaturated) {
+			metricBoostHedgeEvent(rule.Name, boostHedgeSkippedCapacity)
+		}
+	}
+
+	drainLate := func(remaining int) {
+		for i := 0; i < remaining; i++ {
+			result := <-results
+			observeDelayedResult(result)
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+		}
+	}
+
+	launch(cachedAddr, true, false, false)
+	for active > 0 {
+		select {
+		case result := <-results:
+			active--
+			if result.err == nil && result.conn != nil {
+				observeDelayedResult(result)
+				if hedgeScheduled.Load() && result.addr == cachedAddr && !hedgingEnabled {
+					metricBoostHedgeEvent(rule.Name, boostHedgeAvoided)
+				}
+				if result.delayed && result.addr != cachedAddr {
+					metricBoostHedgeEvent(rule.Name, boostHedgeWon)
+				}
+				cancel()
+				drainLate(active)
+				outcome.winner = result
+				return outcome, nil
+			}
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+			observeDelayedResult(result)
+
+			isCached := result.addr == cachedAddr
+			if isDialBulkheadError(result.err) {
+				if result.delayed && !isCached {
+					// A delayed hedge is optional and uses immediate-only admission.
+					// If it cannot start, keep the primary alive without turning the
+					// transient miss into a terminal capacity error. Should the primary
+					// later fail, this address becomes eligible again as a required
+					// fallback using the normal bounded admission wait.
+					delete(attempted, result.addr)
+					if primaryFailed {
+						delayedHedge = false
+						launchAlternatives(2-active, false, capacityFallbackTryOnly)
+					}
+					continue
+				}
+				capacityErr = result.err
+				if isDialTargetBulkheadSaturation(result.err) {
+					// A per-target limit leaves unrelated foreground capacity usable.
+					// Fill the open Top-2 slot only with immediate admission so this
+					// degraded request cannot create another waiter.
+					capacityFallbackTryOnly = true
+					delayedHedge = false
+					hedgingEnabled = true
+					hedgeReady = nil
+					launchAlternatives(2-active, false, true)
+					continue
+				}
+				// Global (or unknown) saturation means another target cannot make
+				// progress without amplifying local pressure. Keep any independent
+				// candidate already in flight, but stop further fan-out.
+				globalCapacityLimited = true
+				hedgeReady = nil
+				continue
+			}
+			if result.err != nil && !errors.Is(result.err, context.Canceled) {
+				dialErrors = append(dialErrors, fmt.Errorf("%s: %w", result.addr, result.err))
+				if isCached {
+					outcome.cachedFailed = true
+					primaryFailed = true
+				}
+			}
+			if isCached && !globalCapacityLimited {
+				// Do not wait for the hedge timer after a confirmed cached-route
+				// failure. Match the cache-miss path's Top-2 concurrency immediately.
+				delayedHedge = false
+				hedgingEnabled = true
+				hedgeReady = nil
+			}
+			if hedgingEnabled && !globalCapacityLimited {
+				launchAlternatives(2-active, delayedHedge, delayedHedge || capacityFallbackTryOnly)
+			}
+		case <-hedgeReady:
+			hedgeReady = nil
+			if !hedgeScheduled.Load() {
+				continue
+			}
+			hedgingEnabled = true
+			delayedHedge = true
+			if launchAlternatives(2-active, true, true) == 0 {
+				metricBoostHedgeEvent(rule.Name, boostHedgeNoCandidate)
+			}
+		case <-ctx.Done():
+			cancel()
+			drainLate(active)
+			return outcome, ctx.Err()
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return outcome, err
+	}
+	if capacityErr != nil {
+		if len(dialErrors) > 0 {
+			return outcome, errors.Join(append(dialErrors, capacityErr)...)
+		}
+		return outcome, capacityErr
+	}
+	if len(dialErrors) > 0 {
+		return outcome, fmt.Errorf("cached boost targets failed: %w", errors.Join(dialErrors...))
+	}
+	if healthExcluded {
+		return outcome, fmt.Errorf("all cached boost alternatives unavailable: %w", ErrActiveHealthUnhealthy)
+	}
+	return outcome, fmt.Errorf("all cached boost alternatives unavailable: %w", ErrCircuitOpen)
+}
+
 // raceBoostTargets uses fresh connections and keeps at most two candidates in
 // flight. A failed or concurrently claimed slot is immediately filled from a
 // target not yet attempted by this inbound connection. This preserves the
@@ -158,6 +520,25 @@ func raceBoostTargets(ctx context.Context, rule *config.Rule, dial boostDialFunc
 }
 
 func (runtime *routingRuntime) raceBoostTargets(ctx context.Context, rule *config.Rule, dial boostDialFunc) (dialResult, error) {
+	return runtime.raceBoostTargetsPrepared(ctx, rule, dial, nil)
+}
+
+func (runtime *routingRuntime) raceBoostTargetsPrepared(
+	ctx context.Context,
+	rule *config.Rule,
+	dial boostDialFunc,
+	prepare boostPrepareFunc,
+) (dialResult, error) {
+	return runtime.raceBoostTargetsPreparedWithAdmission(ctx, rule, dial, prepare, runtime.acquireBoostTrafficDial)
+}
+
+func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
+	ctx context.Context,
+	rule *config.Rule,
+	dial boostDialFunc,
+	prepare boostPrepareFunc,
+	acquire boostDialAcquireFunc,
+) (dialResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -166,6 +547,9 @@ func (runtime *routingRuntime) raceBoostTargets(ctx context.Context, rule *confi
 	}
 	if dial == nil {
 		dial = DialFastContext
+	}
+	if acquire == nil {
+		acquire = runtime.acquireBoostTrafficDial
 	}
 	if err := ctx.Err(); err != nil {
 		return dialResult{}, err
@@ -176,7 +560,11 @@ func (runtime *routingRuntime) raceBoostTargets(ctx context.Context, rule *confi
 	attempted := make(map[string]struct{}, len(rule.Targets))
 	active := 0
 	healthExcluded := false
-	launchAvailable := func() bool {
+	maintenanceCapacityLimited := false
+	foregroundGlobalCapacityLimited := false
+	foregroundFallbackTryOnly := false
+	var foregroundCapacityErr error
+	launchAvailable := func(tryOnly bool) bool {
 		capacity := 2 - active
 		if capacity <= 0 {
 			return false
@@ -196,15 +584,38 @@ func (runtime *routingRuntime) raceBoostTargets(ctx context.Context, rule *confi
 			active++
 			launched++
 			go func() {
+				releaseDial, acquireErr := acquire(raceCtx, rule, addr, tryOnly)
+				if acquireErr != nil {
+					results <- dialResult{addr: addr, err: acquireErr}
+					return
+				}
+				if runtime.health.unhealthy(rule, addr) {
+					releaseDial()
+					results <- dialResult{addr: addr, err: ErrActiveHealthUnhealthy}
+					return
+				}
 				started := time.Now()
 				attempt, err := runtime.routes.begin(rule, addr, started)
 				if err != nil {
+					releaseDial()
 					results <- dialResult{addr: addr, err: err}
 					return
 				}
-				conn, err := dial(raceCtx, addr)
+				// The selected admission budget protects the socket-creating operation.
+				// Any protocol setup runs after release under the decision context.
+				conn, err := func() (net.Conn, error) {
+					defer releaseDial()
+					return dial(raceCtx, addr)
+				}()
 				if err == nil && conn == nil {
 					err = errors.New("dial returned a nil connection")
+				}
+				if err == nil && prepare != nil {
+					if prepareErr := prepare(raceCtx, conn, addr); prepareErr != nil {
+						_ = conn.Close()
+						conn = nil
+						err = prepareErr
+					}
 				}
 				latency := time.Since(started)
 				routeObserve(attempt, latency, err, time.Now())
@@ -224,7 +635,7 @@ func (runtime *routingRuntime) raceBoostTargets(ctx context.Context, rule *confi
 	}
 
 	var dialErrors []error
-	launchAvailable()
+	launchAvailable(false)
 	for active > 0 {
 		select {
 		case result := <-results:
@@ -249,10 +660,31 @@ func (runtime *routingRuntime) raceBoostTargets(ctx context.Context, rule *confi
 			if result.conn != nil {
 				_ = result.conn.Close()
 			}
+			// Local overload is not evidence that another route is healthier. Stop
+			// launching new candidates, but let an independent candidate that is
+			// already in flight finish instead of canceling a likely success.
+			if isDialBulkheadError(result.err) {
+				foregroundCapacityErr = result.err
+				if isDialTargetBulkheadSaturation(result.err) {
+					foregroundFallbackTryOnly = true
+					launchAvailable(true)
+					continue
+				}
+				foregroundGlobalCapacityLimited = true
+				continue
+			}
+			if errors.Is(result.err, errBoostMaintenanceSaturated) {
+				// A lazy refresh uses only idle background capacity. Let any candidate
+				// that already acquired a slot finish, but do not fan out further.
+				maintenanceCapacityLimited = true
+				continue
+			}
 			if result.err != nil && !errors.Is(result.err, context.Canceled) {
 				dialErrors = append(dialErrors, fmt.Errorf("%s: %w", result.addr, result.err))
 			}
-			launchAvailable()
+			if !maintenanceCapacityLimited && !foregroundGlobalCapacityLimited {
+				launchAvailable(foregroundFallbackTryOnly)
+			}
 		case <-ctx.Done():
 			cancel()
 			drainLate(active)
@@ -263,10 +695,22 @@ func (runtime *routingRuntime) raceBoostTargets(ctx context.Context, rule *confi
 		return dialResult{}, err
 	}
 	if len(dialErrors) == 0 {
+		if foregroundCapacityErr != nil {
+			return dialResult{}, foregroundCapacityErr
+		}
+		if maintenanceCapacityLimited {
+			return dialResult{}, errBoostMaintenanceSaturated
+		}
 		if healthExcluded {
 			return dialResult{}, fmt.Errorf("all boost targets unavailable: %w", ErrActiveHealthUnhealthy)
 		}
 		return dialResult{}, fmt.Errorf("all boost targets unavailable: %w", ErrCircuitOpen)
+	}
+	if foregroundCapacityErr != nil {
+		return dialResult{}, errors.Join(
+			fmt.Errorf("all attempted boost targets failed: %w", errors.Join(dialErrors...)),
+			foregroundCapacityErr,
+		)
 	}
 	return dialResult{}, fmt.Errorf("all boost targets failed: %w", errors.Join(dialErrors...))
 }
@@ -309,12 +753,19 @@ func (runtime *routingRuntime) lazyRevalidate(parent context.Context, rule *conf
 	ctx, cancel := context.WithTimeout(parent, boostRevalidateLimit)
 	defer cancel()
 	dial := boostDialFunc(DialFastContext)
+	var prepare boostPrepareFunc
 	if rule.ProxyProtocol != nil && rule.ProxyProtocol.Send != "" {
-		dial = func(dialCtx context.Context, addr string) (net.Conn, error) {
-			return dialActiveHealthTarget(dialCtx, "tcp", addr, rule.ProxyProtocol.Send)
+		prepare = func(prepareCtx context.Context, connection net.Conn, _ string) error {
+			return writeActiveHealthProxyProtocolContext(prepareCtx, connection, rule.ProxyProtocol.Send)
 		}
 	}
-	winner, err := runtime.raceBoostTargets(ctx, rule, dial)
+	winner, err := runtime.raceBoostTargetsPreparedWithAdmission(
+		ctx,
+		rule,
+		dial,
+		prepare,
+		runtime.acquireBoostMaintenanceDial,
+	)
 	if err != nil {
 		return
 	}
@@ -364,69 +815,97 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 	}
 
 	decisionBegin := time.Now()
+	decisionFinished := false
+	finishDecision := func() {
+		if decisionFinished {
+			return
+		}
+		decisionFinished = true
+		metricBoostDecisionDuration(rule.Name, time.Since(decisionBegin))
+	}
+	defer finishDecision()
 	decisionCtx, cancelDecision := context.WithTimeout(ctx, boostDecisionTimeout(rule))
 	defer cancelDecision()
 	key := boostRuleKey(rule)
+	var prepare boostPrepareFunc
+	if rule.ProxyProtocol != nil && rule.ProxyProtocol.Send != "" {
+		prepare = func(prepareCtx context.Context, candidate net.Conn, _ string) error {
+			return writeOutboundProxyProtocolContext(prepareCtx, candidate, conn, rule)
+		}
+	}
 
 	if cached, ok := runtime.loadBoostWinnerToken(key); ok {
 		cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
 		triggerLazy := time.Until(cached.expires) < boostRevalidateAfter
-		cachedConn, cachedAttempt, err := runtime.outboundDialRoute(decisionCtx, rule, cached.addr)
+		outcome, err := runtime.raceCachedBoostTarget(decisionCtx, rule, cached.addr, prepare)
 		if err == nil {
-			if headerErr := writeOutboundProxyProtocol(cachedConn, conn, rule); headerErr != nil {
-				routeReportFailure(cachedAttempt, headerErr, time.Now())
-				_ = cachedConn.Close()
-				err = headerErr
-			} else {
+			cacheHit := outcome.winner.addr == cached.addr
+			winnerToken := cachedToken
+			if cacheHit {
 				metricBoostCache(rule.Name, true)
-				defer cachedConn.Close()
-				// A cache hit deliberately does not extend expires. Otherwise steady
-				// traffic would postpone lazy revalidation forever.
-				fields := []zap.Field{
-					zap.String("ruleName", rule.Name),
-					zap.String("remoteAddr", connAddr(conn)),
-					zap.String("targetAddr", connAddr(cachedConn)),
-					zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
-					zap.Bool("boostCacheHit", true),
-				}
-				if triggerLazy {
-					fields = append(fields, zap.Bool("boostLazyRefresh", true))
-					runtime.startLazyRevalidate(ctx, rule)
-				}
-				utils.Logger.Debug("建立连接", fields...)
-				cancelDecision()
-				result := relayBidirectional(ctx, conn, cachedConn)
-				logRelayResult(rule, conn, cachedConn, result)
-				reportRouteRelay(cachedAttempt, result)
-				if upstreamRelayError(result) != nil {
-					runtime.deleteBoostWinnerIfCurrent(cachedToken)
-				}
-				return
+			} else {
+				metricBoostCache(rule.Name, false)
+				winnerToken = runtime.storeBoostWinner(key, outcome.winner.addr)
 			}
+			defer outcome.winner.conn.Close()
+			// A true cache hit deliberately does not extend expires. Otherwise
+			// steady traffic would postpone lazy revalidation forever. A fallback or
+			// hedge win is fresh route evidence and replaces the cached winner.
+			fields := []zap.Field{
+				zap.String("ruleName", rule.Name),
+				zap.String("remoteAddr", connAddr(conn)),
+				zap.String("targetAddr", connAddr(outcome.winner.conn)),
+				zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
+				zap.Bool("boostCacheHit", cacheHit),
+				zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
+				zap.Bool("boostHedged", outcome.hedged),
+			}
+			if cacheHit && triggerLazy {
+				fields = append(fields, zap.Bool("boostLazyRefresh", true))
+				runtime.startLazyRevalidate(ctx, rule)
+			}
+			utils.Logger.Debug("建立连接", fields...)
+			cancelDecision()
+			finishDecision()
+			result := relayBidirectional(ctx, conn, outcome.winner.conn)
+			logRelayResult(rule, conn, outcome.winner.conn, result)
+			runtime.finishBoostRelay(winnerToken, outcome.winner.attempt, result)
+			return
 		}
-		runtime.deleteBoostWinnerIfCurrent(cachedToken)
+		if outcome.cachedFailed {
+			runtime.deleteBoostWinnerIfCurrent(cachedToken)
+		}
+		if isDialBulkheadError(err) && !outcome.cachedFailed {
+			// Local dial pressure says nothing about the cached route's health. Keep
+			// the winner so a later connection can reuse it after capacity drains.
+			utils.Logger.Debug("前台拨号容量暂时不可用，保留 Boost winner 并结束当前连接",
+				zap.String("ruleName", rule.Name),
+				zap.String("targetAddr", cached.addr),
+				zap.Error(err))
+			return
+		}
+		metricBoostCache(rule.Name, false)
 		if ctx.Err() != nil {
 			return
 		}
+		utils.Logger.Error("缓存线路及备选均不可用",
+			zap.String("ruleName", rule.Name),
+			zap.String("targetAddr", cached.addr),
+			zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
+			zap.Bool("boostHedged", outcome.hedged),
+			zap.Error(err))
+		return
 	}
 	metricBoostCache(rule.Name, false)
 
 	dial := boostDialFunc(DialFastContext)
-	if rule.ProxyProtocol != nil && rule.ProxyProtocol.Send != "" {
-		dial = func(dialCtx context.Context, addr string) (net.Conn, error) {
-			candidate, dialErr := DialFastContext(dialCtx, addr)
-			if dialErr != nil {
-				return candidate, dialErr
-			}
-			if headerErr := writeOutboundProxyProtocol(candidate, conn, rule); headerErr != nil {
-				_ = candidate.Close()
-				return nil, headerErr
-			}
-			return candidate, nil
-		}
-	}
-	winner, err := runtime.raceBoostTargets(decisionCtx, rule, dial)
+	winner, err := runtime.raceBoostTargetsPrepared(decisionCtx, rule, dial, prepare)
 	if err != nil {
+		if isDialBulkheadError(err) {
+			utils.Logger.Debug("前台拨号容量暂时不可用，结束当前 Boost 连接",
+				zap.String("ruleName", rule.Name), zap.Error(err))
+			return
+		}
 		utils.Logger.Error("加速决策失败：所有线路均不可用",
 			zap.String("ruleName", rule.Name), zap.Error(err))
 		return
@@ -440,10 +919,8 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
 		zap.Bool("boostCacheHit", false))
 	cancelDecision()
+	finishDecision()
 	result := relayBidirectional(ctx, conn, winner.conn)
 	logRelayResult(rule, conn, winner.conn, result)
-	reportRouteRelay(winner.attempt, result)
-	if upstreamRelayError(result) != nil {
-		runtime.deleteBoostWinnerIfCurrent(winnerToken)
-	}
+	runtime.finishBoostRelay(winnerToken, winner.attempt, result)
 }

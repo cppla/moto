@@ -31,6 +31,8 @@ const (
 	DefaultHealthCheckTimeout   = 2_000
 	DefaultHealthCheckFailures  = 3
 	DefaultHealthCheckSuccesses = 2
+	DefaultHedgeMinDelay        = 25
+	DefaultHedgeMaxDelay        = 250
 
 	ModeNormal          = "normal"
 	ModeRegex           = "regex"
@@ -47,6 +49,8 @@ const (
 	minHealthTimeout    = 50 * time.Millisecond
 	maxHealthTimeout    = 30 * time.Second
 	maxHealthThreshold  = 20
+	minHedgeDelay       = 10
+	maxHedgeDelay       = 5_000
 	maxHealthPath       = 2 << 10
 	maxRules            = 256
 	maxTargets          = 128
@@ -94,10 +98,8 @@ type MetricsConfig struct {
 // LogConfig controls the minimum log level and the optional rolling log file.
 // Logs are always written to stdout; Path adds a second, rolling destination.
 type LogConfig struct {
-	Level   string `json:"level"`
-	Path    string `json:"path"`
-	Version string `json:"version"`
-	Date    string `json:"date"`
+	Level string `json:"level"`
+	Path  string `json:"path"`
 }
 
 // Target is one upstream endpoint. Regexp is used by regex-mode rules and Re
@@ -135,6 +137,14 @@ type HealthCheckConfig struct {
 	StatusMax        int    `json:"statusMax,omitempty"`
 }
 
+// HedgeConfig enables delayed fallback dialing for a Boost rule. Durations are
+// milliseconds. A nil Rule.Hedge preserves the historical cache-hit behavior;
+// a non-nil object opts the rule into hedged scheduling.
+type HedgeConfig struct {
+	MinDelay uint64 `json:"minDelay"`
+	MaxDelay uint64 `json:"maxDelay"`
+}
+
 // Rule describes one listener and its routing policy.
 type Rule struct {
 	Name                string               `json:"name"`
@@ -148,6 +158,7 @@ type Rule struct {
 	MaxConnections      int                  `json:"maxConnections,omitempty"`
 	MaxConnectionsPerIP int                  `json:"maxConnectionsPerIP,omitempty"`
 	HealthCheck         *HealthCheckConfig   `json:"healthCheck,omitempty"`
+	Hedge               *HedgeConfig         `json:"hedge,omitempty"`
 	ProxyProtocol       *ProxyProtocolConfig `json:"proxyProtocol,omitempty"`
 
 	allowPrefixes []netip.Prefix
@@ -427,6 +438,14 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 	if r.Timeout > uint64(maxRuleTimeout/time.Millisecond) {
 		return fmt.Errorf("timeout must not exceed %s", maxRuleTimeout)
 	}
+	if r.Hedge != nil {
+		if r.Mode != ModeBoost {
+			return errors.New("hedge is only valid in boost mode")
+		}
+		if err := r.Hedge.Validate(r.Timeout); err != nil {
+			return fmt.Errorf("hedge: %w", err)
+		}
+	}
 	if r.HealthCheck != nil {
 		if err := r.HealthCheck.Validate(); err != nil {
 			return fmt.Errorf("healthCheck: %w", err)
@@ -441,6 +460,7 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		}
 	}
 	tlsFallbacks := 0
+	uniqueTargets := make(map[string]struct{}, len(r.Targets))
 	for i, target := range r.Targets {
 		if target == nil {
 			return fmt.Errorf("targets[%d]: target is null", i)
@@ -448,6 +468,7 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		if err := validateEndpoint("address", target.Address); err != nil {
 			return fmt.Errorf("targets[%d]: %w", i, err)
 		}
+		uniqueTargets[target.Address] = struct{}{}
 		target.Re = nil
 		if r.Mode == ModeRegex {
 			compiled, err := regexp.Compile(target.Regexp)
@@ -472,6 +493,9 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		} else if len(target.ServerNames) != 0 || len(target.ALPN) != 0 {
 			return fmt.Errorf("targets[%d]: serverNames and alpn are only valid in tls mode", i)
 		}
+	}
+	if r.Hedge != nil && len(uniqueTargets) < 2 {
+		return errors.New("hedge requires at least two unique target addresses")
 	}
 
 	if len(r.Allowlist) > maxAccessItems {
@@ -501,6 +525,34 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		}
 	}
 	r.blockedIPs = blocked
+	return nil
+}
+
+// Validate applies hedge defaults and checks the rule decision budget. The
+// caller verifies mode and unique-target requirements because those belong to
+// the enclosing rule.
+func (c *HedgeConfig) Validate(ruleTimeout uint64) error {
+	if c == nil {
+		return errors.New("hedge config is nil")
+	}
+	if c.MinDelay == 0 {
+		c.MinDelay = DefaultHedgeMinDelay
+	}
+	if c.MaxDelay == 0 {
+		c.MaxDelay = DefaultHedgeMaxDelay
+	}
+	if c.MinDelay < minHedgeDelay || c.MinDelay > maxHedgeDelay {
+		return fmt.Errorf("minDelay must be between %d and %d milliseconds", minHedgeDelay, maxHedgeDelay)
+	}
+	if c.MaxDelay < minHedgeDelay || c.MaxDelay > maxHedgeDelay {
+		return fmt.Errorf("maxDelay must be between %d and %d milliseconds", minHedgeDelay, maxHedgeDelay)
+	}
+	if c.MinDelay > c.MaxDelay {
+		return errors.New("minDelay must not exceed maxDelay")
+	}
+	if c.MaxDelay >= ruleTimeout {
+		return errors.New("maxDelay must be less than rule timeout")
+	}
 	return nil
 }
 

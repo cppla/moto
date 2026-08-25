@@ -44,6 +44,7 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 	routes := runtime.routes.snapshotGauges()
 	prewarm := runtime.prewarm.snapshotGauges()
 	activeHealth := snapshotActiveHealthGauges(runtime.health)
+	dialCapacity := runtime.trafficDials.snapshot()
 
 	writeMetricHeader(output, "moto_route_latency_ewma_seconds", "EWMA dial latency for a configured route in seconds.", "gauge")
 	for _, route := range routes {
@@ -100,6 +101,19 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 	writeMetricHeader(output, "moto_active_health_unhealthy", "Whether a target is excluded by threshold-confirmed active health checks.", "gauge")
 	for _, target := range activeHealth {
 		writeMetricSample(output, "moto_active_health_unhealthy", []prometheusLabel{{"rule", target.rule}, {"mode", target.mode}, {"target", target.target}}, boolMetric(target.unhealthy))
+	}
+
+	writeMetricHeader(output, "moto_dial_bulkhead_in_flight", "Foreground network dials currently holding capacity.", "gauge")
+	writeMetricSample(output, "moto_dial_bulkhead_in_flight", nil, strconv.Itoa(dialCapacity.Active))
+	writeMetricHeader(output, "moto_dial_bulkhead_waiting", "Foreground dials currently waiting for bounded local capacity.", "gauge")
+	writeMetricSample(output, "moto_dial_bulkhead_waiting", nil, strconv.Itoa(dialCapacity.Waiting))
+	writeMetricHeader(output, "moto_dial_bulkhead_global_limit", "Maximum concurrent foreground network dials for this Moto server.", "gauge")
+	writeMetricSample(output, "moto_dial_bulkhead_global_limit", nil, strconv.Itoa(dialCapacity.GlobalLimit))
+	writeMetricHeader(output, "moto_dial_bulkhead_per_target_limit", "Maximum concurrent foreground network dials to one configured target.", "gauge")
+	writeMetricSample(output, "moto_dial_bulkhead_per_target_limit", nil, strconv.Itoa(dialCapacity.PerTargetLimit))
+	writeMetricHeader(output, "moto_dial_bulkhead_target_in_flight", "Foreground network dials currently holding capacity by configured target.", "gauge")
+	for _, target := range sortedStringKeys(dialCapacity.ActiveByTarget) {
+		writeMetricSample(output, "moto_dial_bulkhead_target_in_flight", []prometheusLabel{{"target", target}}, strconv.Itoa(dialCapacity.ActiveByTarget[target]))
 	}
 }
 

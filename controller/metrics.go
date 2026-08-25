@@ -17,6 +17,13 @@ import (
 const (
 	prometheusContentType       = "text/plain; version=0.0.4; charset=utf-8"
 	metricsMaxConcurrentScrapes = 4
+	boostHedgeScheduled         = "scheduled"
+	boostHedgeLaunched          = "launched"
+	boostHedgeWon               = "won"
+	boostHedgeAvoided           = "avoided"
+	boostHedgeSkippedCapacity   = "skipped_capacity"
+	boostHedgeSkippedDeadline   = "skipped_deadline"
+	boostHedgeNoCandidate       = "no_candidate"
 )
 
 type connectionMetricKey struct {
@@ -40,6 +47,11 @@ type dialMetricKey struct {
 	target string
 }
 
+type boostHedgeMetricKey struct {
+	rule    string
+	outcome string
+}
+
 // metricRegistry is the process-wide in-memory metrics registry. Recording is
 // deliberately cheap and dependency-free; rendering takes a snapshot so a
 // slow scrape never holds the write lock used by traffic paths.
@@ -49,61 +61,85 @@ type metricRegistry struct {
 	connectionRefs map[connectionMetricKey]int
 	dialRefs       map[dialMetricKey]int
 
-	connectionsAccepted map[connectionMetricKey]uint64
-	connectionsRejected map[rejectionMetricKey]uint64
-	connectionsActive   map[connectionMetricKey]int64
-	relayBytes          map[relayMetricKey]uint64
-	relayErrors         map[relayMetricKey]uint64
-	relayDurationNanos  map[string]uint64
-	relayDurationCount  map[string]uint64
-	dialAttempts        map[dialMetricKey]uint64
-	dialSuccess         map[dialMetricKey]uint64
-	dialFailures        map[dialMetricKey]uint64
-	dialCanceled        map[dialMetricKey]uint64
-	dialLatencyNanos    map[dialMetricKey]uint64
-	dialLatencyCount    map[dialMetricKey]uint64
-	boostCacheHits      map[string]uint64
-	boostCacheMisses    map[string]uint64
+	connectionsAccepted   map[connectionMetricKey]uint64
+	connectionsRejected   map[rejectionMetricKey]uint64
+	connectionsActive     map[connectionMetricKey]int64
+	relayBytes            map[relayMetricKey]uint64
+	relayErrors           map[relayMetricKey]uint64
+	relayDurationNanos    map[string]uint64
+	relayDurationCount    map[string]uint64
+	dialAttempts          map[dialMetricKey]uint64
+	dialSuccess           map[dialMetricKey]uint64
+	dialFailures          map[dialMetricKey]uint64
+	dialCanceled          map[dialMetricKey]uint64
+	dialLatencyNanos      map[dialMetricKey]uint64
+	dialLatencyCount      map[dialMetricKey]uint64
+	dialBulkheadWaitNanos map[dialMetricKey]uint64
+	dialBulkheadWaitCount map[dialMetricKey]uint64
+	dialBulkheadRejected  map[dialMetricKey]uint64
+	boostCacheHits        map[string]uint64
+	boostCacheMisses      map[string]uint64
+	boostHedgeEvents      map[boostHedgeMetricKey]uint64
+	boostHedgeDelayNanos  map[string]uint64
+	boostHedgeDelayCount  map[string]uint64
+	boostDecisionNanos    map[string]uint64
+	boostDecisionCount    map[string]uint64
 }
 
 type metricSnapshot struct {
-	connectionsAccepted map[connectionMetricKey]uint64
-	connectionsRejected map[rejectionMetricKey]uint64
-	connectionsActive   map[connectionMetricKey]int64
-	relayBytes          map[relayMetricKey]uint64
-	relayErrors         map[relayMetricKey]uint64
-	relayDurationNanos  map[string]uint64
-	relayDurationCount  map[string]uint64
-	dialAttempts        map[dialMetricKey]uint64
-	dialSuccess         map[dialMetricKey]uint64
-	dialFailures        map[dialMetricKey]uint64
-	dialCanceled        map[dialMetricKey]uint64
-	dialLatencyNanos    map[dialMetricKey]uint64
-	dialLatencyCount    map[dialMetricKey]uint64
-	boostCacheHits      map[string]uint64
-	boostCacheMisses    map[string]uint64
+	connectionsAccepted   map[connectionMetricKey]uint64
+	connectionsRejected   map[rejectionMetricKey]uint64
+	connectionsActive     map[connectionMetricKey]int64
+	relayBytes            map[relayMetricKey]uint64
+	relayErrors           map[relayMetricKey]uint64
+	relayDurationNanos    map[string]uint64
+	relayDurationCount    map[string]uint64
+	dialAttempts          map[dialMetricKey]uint64
+	dialSuccess           map[dialMetricKey]uint64
+	dialFailures          map[dialMetricKey]uint64
+	dialCanceled          map[dialMetricKey]uint64
+	dialLatencyNanos      map[dialMetricKey]uint64
+	dialLatencyCount      map[dialMetricKey]uint64
+	dialBulkheadWaitNanos map[dialMetricKey]uint64
+	dialBulkheadWaitCount map[dialMetricKey]uint64
+	dialBulkheadRejected  map[dialMetricKey]uint64
+	boostCacheHits        map[string]uint64
+	boostCacheMisses      map[string]uint64
+	boostHedgeEvents      map[boostHedgeMetricKey]uint64
+	boostHedgeDelayNanos  map[string]uint64
+	boostHedgeDelayCount  map[string]uint64
+	boostDecisionNanos    map[string]uint64
+	boostDecisionCount    map[string]uint64
 }
 
 func newMetricRegistry() *metricRegistry {
 	return &metricRegistry{
-		ruleRefs:            make(map[string]int),
-		connectionRefs:      make(map[connectionMetricKey]int),
-		dialRefs:            make(map[dialMetricKey]int),
-		connectionsAccepted: make(map[connectionMetricKey]uint64),
-		connectionsRejected: make(map[rejectionMetricKey]uint64),
-		connectionsActive:   make(map[connectionMetricKey]int64),
-		relayBytes:          make(map[relayMetricKey]uint64),
-		relayErrors:         make(map[relayMetricKey]uint64),
-		relayDurationNanos:  make(map[string]uint64),
-		relayDurationCount:  make(map[string]uint64),
-		dialAttempts:        make(map[dialMetricKey]uint64),
-		dialSuccess:         make(map[dialMetricKey]uint64),
-		dialFailures:        make(map[dialMetricKey]uint64),
-		dialCanceled:        make(map[dialMetricKey]uint64),
-		dialLatencyNanos:    make(map[dialMetricKey]uint64),
-		dialLatencyCount:    make(map[dialMetricKey]uint64),
-		boostCacheHits:      make(map[string]uint64),
-		boostCacheMisses:    make(map[string]uint64),
+		ruleRefs:              make(map[string]int),
+		connectionRefs:        make(map[connectionMetricKey]int),
+		dialRefs:              make(map[dialMetricKey]int),
+		connectionsAccepted:   make(map[connectionMetricKey]uint64),
+		connectionsRejected:   make(map[rejectionMetricKey]uint64),
+		connectionsActive:     make(map[connectionMetricKey]int64),
+		relayBytes:            make(map[relayMetricKey]uint64),
+		relayErrors:           make(map[relayMetricKey]uint64),
+		relayDurationNanos:    make(map[string]uint64),
+		relayDurationCount:    make(map[string]uint64),
+		dialAttempts:          make(map[dialMetricKey]uint64),
+		dialSuccess:           make(map[dialMetricKey]uint64),
+		dialFailures:          make(map[dialMetricKey]uint64),
+		dialCanceled:          make(map[dialMetricKey]uint64),
+		dialLatencyNanos:      make(map[dialMetricKey]uint64),
+		dialLatencyCount:      make(map[dialMetricKey]uint64),
+		dialBulkheadWaitNanos: make(map[dialMetricKey]uint64),
+		dialBulkheadWaitCount: make(map[dialMetricKey]uint64),
+		dialBulkheadRejected:  make(map[dialMetricKey]uint64),
+		boostCacheHits:        make(map[string]uint64),
+		boostCacheMisses:      make(map[string]uint64),
+		boostHedgeEvents:      make(map[boostHedgeMetricKey]uint64),
+		boostHedgeDelayNanos:  make(map[string]uint64),
+		boostHedgeDelayCount:  make(map[string]uint64),
+		boostDecisionNanos:    make(map[string]uint64),
+		boostDecisionCount:    make(map[string]uint64),
 	}
 }
 
@@ -141,6 +177,9 @@ func (registry *metricRegistry) unregisterRules(rules []*config.Rule) {
 		delete(registry.dialCanceled, key)
 		delete(registry.dialLatencyNanos, key)
 		delete(registry.dialLatencyCount, key)
+		delete(registry.dialBulkheadWaitNanos, key)
+		delete(registry.dialBulkheadWaitCount, key)
+		delete(registry.dialBulkheadRejected, key)
 	}
 	for key := range connectionKeys {
 		if registry.connectionRefs[key] > 1 {
@@ -166,6 +205,15 @@ func (registry *metricRegistry) unregisterRules(rules []*config.Rule) {
 		delete(registry.relayDurationCount, rule)
 		delete(registry.boostCacheHits, rule)
 		delete(registry.boostCacheMisses, rule)
+		delete(registry.boostHedgeDelayNanos, rule)
+		delete(registry.boostHedgeDelayCount, rule)
+		delete(registry.boostDecisionNanos, rule)
+		delete(registry.boostDecisionCount, rule)
+		for key := range registry.boostHedgeEvents {
+			if key.rule == rule {
+				delete(registry.boostHedgeEvents, key)
+			}
+		}
 		for key := range registry.relayBytes {
 			if key.rule == rule {
 				delete(registry.relayBytes, key)
@@ -281,6 +329,24 @@ func metricDial(rule, target string, latency time.Duration, err error) {
 	processMetrics.mu.Unlock()
 }
 
+// metricDialBulkhead records the local admission delay separately from network
+// dial latency. Only expiry of the small capacity wait budget is a rejection;
+// parent-context cancellation remains observable in the wait summary without
+// being mislabeled as upstream failure or local overload.
+func metricDialBulkhead(rule, target string, waited time.Duration, err error) {
+	if waited < 0 {
+		waited = 0
+	}
+	key := dialMetricKey{rule: rule, target: target}
+	processMetrics.mu.Lock()
+	processMetrics.dialBulkheadWaitNanos[key] += uint64(waited)
+	processMetrics.dialBulkheadWaitCount[key]++
+	if errors.Is(err, errDialBulkheadSaturated) {
+		processMetrics.dialBulkheadRejected[key]++
+	}
+	processMetrics.mu.Unlock()
+}
+
 // metricBoostCache records a winner-cache lookup for a boost rule.
 func metricBoostCache(rule string, hit bool) {
 	processMetrics.mu.Lock()
@@ -289,6 +355,47 @@ func metricBoostCache(rule string, hit bool) {
 	} else {
 		processMetrics.boostCacheMisses[rule]++
 	}
+	processMetrics.mu.Unlock()
+}
+
+// metricBoostHedgeEvent records one bounded scheduler outcome. Rejecting
+// unknown outcomes keeps the Prometheus label cardinality independent of
+// network or configuration input.
+func metricBoostHedgeEvent(rule, outcome string) {
+	switch outcome {
+	case boostHedgeScheduled, boostHedgeLaunched, boostHedgeWon,
+		boostHedgeAvoided, boostHedgeSkippedCapacity, boostHedgeSkippedDeadline,
+		boostHedgeNoCandidate:
+	default:
+		return
+	}
+	key := boostHedgeMetricKey{rule: rule, outcome: outcome}
+	processMetrics.mu.Lock()
+	processMetrics.boostHedgeEvents[key]++
+	processMetrics.mu.Unlock()
+}
+
+// metricBoostHedgeDelay records the adaptive delay chosen when scheduling an
+// optional second dial. It does not include bulkhead admission wait time.
+func metricBoostHedgeDelay(rule string, delay time.Duration) {
+	if delay < 0 {
+		delay = 0
+	}
+	processMetrics.mu.Lock()
+	processMetrics.boostHedgeDelayNanos[rule] += uint64(delay)
+	processMetrics.boostHedgeDelayCount[rule]++
+	processMetrics.mu.Unlock()
+}
+
+// metricBoostDecisionDuration measures the complete route decision, including
+// cache lookup, local admission, network dial, and optional hedge scheduling.
+func metricBoostDecisionDuration(rule string, duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	processMetrics.mu.Lock()
+	processMetrics.boostDecisionNanos[rule] += uint64(duration)
+	processMetrics.boostDecisionCount[rule]++
 	processMetrics.mu.Unlock()
 }
 
@@ -311,21 +418,29 @@ func (registry *metricRegistry) snapshot() metricSnapshot {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	return metricSnapshot{
-		connectionsAccepted: cloneMetricMap(registry.connectionsAccepted),
-		connectionsRejected: cloneMetricMap(registry.connectionsRejected),
-		connectionsActive:   cloneMetricMap(registry.connectionsActive),
-		relayBytes:          cloneMetricMap(registry.relayBytes),
-		relayErrors:         cloneMetricMap(registry.relayErrors),
-		relayDurationNanos:  cloneMetricMap(registry.relayDurationNanos),
-		relayDurationCount:  cloneMetricMap(registry.relayDurationCount),
-		dialAttempts:        cloneMetricMap(registry.dialAttempts),
-		dialSuccess:         cloneMetricMap(registry.dialSuccess),
-		dialFailures:        cloneMetricMap(registry.dialFailures),
-		dialCanceled:        cloneMetricMap(registry.dialCanceled),
-		dialLatencyNanos:    cloneMetricMap(registry.dialLatencyNanos),
-		dialLatencyCount:    cloneMetricMap(registry.dialLatencyCount),
-		boostCacheHits:      cloneMetricMap(registry.boostCacheHits),
-		boostCacheMisses:    cloneMetricMap(registry.boostCacheMisses),
+		connectionsAccepted:   cloneMetricMap(registry.connectionsAccepted),
+		connectionsRejected:   cloneMetricMap(registry.connectionsRejected),
+		connectionsActive:     cloneMetricMap(registry.connectionsActive),
+		relayBytes:            cloneMetricMap(registry.relayBytes),
+		relayErrors:           cloneMetricMap(registry.relayErrors),
+		relayDurationNanos:    cloneMetricMap(registry.relayDurationNanos),
+		relayDurationCount:    cloneMetricMap(registry.relayDurationCount),
+		dialAttempts:          cloneMetricMap(registry.dialAttempts),
+		dialSuccess:           cloneMetricMap(registry.dialSuccess),
+		dialFailures:          cloneMetricMap(registry.dialFailures),
+		dialCanceled:          cloneMetricMap(registry.dialCanceled),
+		dialLatencyNanos:      cloneMetricMap(registry.dialLatencyNanos),
+		dialLatencyCount:      cloneMetricMap(registry.dialLatencyCount),
+		dialBulkheadWaitNanos: cloneMetricMap(registry.dialBulkheadWaitNanos),
+		dialBulkheadWaitCount: cloneMetricMap(registry.dialBulkheadWaitCount),
+		dialBulkheadRejected:  cloneMetricMap(registry.dialBulkheadRejected),
+		boostCacheHits:        cloneMetricMap(registry.boostCacheHits),
+		boostCacheMisses:      cloneMetricMap(registry.boostCacheMisses),
+		boostHedgeEvents:      cloneMetricMap(registry.boostHedgeEvents),
+		boostHedgeDelayNanos:  cloneMetricMap(registry.boostHedgeDelayNanos),
+		boostHedgeDelayCount:  cloneMetricMap(registry.boostHedgeDelayCount),
+		boostDecisionNanos:    cloneMetricMap(registry.boostDecisionNanos),
+		boostDecisionCount:    cloneMetricMap(registry.boostDecisionCount),
 	}
 }
 
@@ -486,11 +601,43 @@ func renderPrometheusMetrics(renderGauges ...func(*strings.Builder)) string {
 		writeMetricSample(&output, "moto_dial_latency_seconds_count", labels, strconv.FormatUint(snapshot.dialLatencyCount[key], 10))
 	}
 
+	writeMetricHeader(&output, "moto_dial_bulkhead_wait_seconds", "Local foreground dial admission wait in seconds by rule and target.", "summary")
+	for _, key := range sortedDialKeys(snapshot.dialBulkheadWaitCount) {
+		labels := []prometheusLabel{{"rule", key.rule}, {"target", key.target}}
+		seconds := float64(snapshot.dialBulkheadWaitNanos[key]) / float64(time.Second)
+		writeMetricSample(&output, "moto_dial_bulkhead_wait_seconds_sum", labels, strconv.FormatFloat(seconds, 'g', -1, 64))
+		writeMetricSample(&output, "moto_dial_bulkhead_wait_seconds_count", labels, strconv.FormatUint(snapshot.dialBulkheadWaitCount[key], 10))
+	}
+
+	writeMetricHeader(&output, "moto_dial_bulkhead_rejected_total", "Foreground dials rejected after the bounded local capacity wait expired.", "counter")
+	writeDialCounterSamples(&output, "moto_dial_bulkhead_rejected_total", snapshot.dialBulkheadRejected)
+
 	writeMetricHeader(&output, "moto_boost_cache_hits_total", "Boost winner-cache hits by rule.", "counter")
 	writeRuleCounterSamples(&output, "moto_boost_cache_hits_total", snapshot.boostCacheHits)
 
 	writeMetricHeader(&output, "moto_boost_cache_misses_total", "Boost winner-cache misses by rule.", "counter")
 	writeRuleCounterSamples(&output, "moto_boost_cache_misses_total", snapshot.boostCacheMisses)
+
+	writeMetricHeader(&output, "moto_boost_hedge_events_total", "Adaptive Boost hedge scheduler events by rule and bounded outcome.", "counter")
+	for _, key := range sortedBoostHedgeKeys(snapshot.boostHedgeEvents) {
+		writeMetricSample(&output, "moto_boost_hedge_events_total", []prometheusLabel{{"rule", key.rule}, {"outcome", key.outcome}}, strconv.FormatUint(snapshot.boostHedgeEvents[key], 10))
+	}
+
+	writeMetricHeader(&output, "moto_boost_hedge_delay_seconds", "Adaptive delay selected before an optional Boost fallback dial.", "summary")
+	for _, rule := range sortedStringKeys(snapshot.boostHedgeDelayCount) {
+		labels := []prometheusLabel{{"rule", rule}}
+		seconds := float64(snapshot.boostHedgeDelayNanos[rule]) / float64(time.Second)
+		writeMetricSample(&output, "moto_boost_hedge_delay_seconds_sum", labels, strconv.FormatFloat(seconds, 'g', -1, 64))
+		writeMetricSample(&output, "moto_boost_hedge_delay_seconds_count", labels, strconv.FormatUint(snapshot.boostHedgeDelayCount[rule], 10))
+	}
+
+	writeMetricHeader(&output, "moto_boost_decision_duration_seconds", "Complete Boost route-decision duration in seconds by rule.", "summary")
+	for _, rule := range sortedStringKeys(snapshot.boostDecisionCount) {
+		labels := []prometheusLabel{{"rule", rule}}
+		seconds := float64(snapshot.boostDecisionNanos[rule]) / float64(time.Second)
+		writeMetricSample(&output, "moto_boost_decision_duration_seconds_sum", labels, strconv.FormatFloat(seconds, 'g', -1, 64))
+		writeMetricSample(&output, "moto_boost_decision_duration_seconds_count", labels, strconv.FormatUint(snapshot.boostDecisionCount[rule], 10))
+	}
 
 	var render func(*strings.Builder)
 	if len(renderGauges) > 0 {
@@ -612,6 +759,20 @@ func sortedDialKeys[V any](values map[dialMetricKey]V) []dialMetricKey {
 			return keys[left].rule < keys[right].rule
 		}
 		return keys[left].target < keys[right].target
+	})
+	return keys
+}
+
+func sortedBoostHedgeKeys[V any](values map[boostHedgeMetricKey]V) []boostHedgeMetricKey {
+	keys := make([]boostHedgeMetricKey, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(left, right int) bool {
+		if keys[left].rule != keys[right].rule {
+			return keys[left].rule < keys[right].rule
+		}
+		return keys[left].outcome < keys[right].outcome
 	})
 	return keys
 }

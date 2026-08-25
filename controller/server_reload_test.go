@@ -98,6 +98,95 @@ func reloadRule(name, listen, target string) *config.Rule {
 	}
 }
 
+func findGenerationRule(t *testing.T, generation *routingGeneration, name string) *config.Rule {
+	t.Helper()
+	for _, rule := range generation.rules {
+		if rule.Name == name {
+			return rule
+		}
+	}
+	t.Fatalf("generation %d has no rule %q", generation.id, name)
+	return nil
+}
+
+func TestReloadPreservesStateForExactlyUnchangedRules(t *testing.T) {
+	keptListen := unusedReloadAddress(t)
+	changedListen := unusedReloadAddress(t)
+	keptTarget := "kept.example:443"
+	health := &config.HealthCheckConfig{
+		Type:             config.HealthCheckTCP,
+		Interval:         10_000,
+		Timeout:          2_000,
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+	}
+	kept := reloadRule("kept", keptListen, keptTarget)
+	kept.Mode = config.ModeBoost
+	kept.HealthCheck = health
+	kept.Targets = append(kept.Targets, &config.Target{Address: "kept-backup.example:443"})
+	changed := reloadRule("changed", changedListen, "old.example:443")
+
+	server, err := NewServer([]*config.Rule{kept, changed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	oldGeneration := server.current.Load()
+	oldKept := findGenerationRule(t, oldGeneration, "kept")
+	oldChanged := findGenerationRule(t, oldGeneration, "changed")
+	now := time.Now()
+	for range routeFailureThreshold {
+		attempt, beginErr := oldGeneration.runtime.routes.begin(oldKept, keptTarget, now)
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		routeObserve(attempt, time.Millisecond, errors.New("kept route failed"), now)
+	}
+	oldGeneration.runtime.health.observe(
+		activeHealthKey{rule: oldKept, address: keptTarget},
+		*oldKept.HealthCheck,
+		false,
+	)
+	winner := oldGeneration.runtime.storeBoostWinner(boostRuleKey(oldKept), keptTarget)
+	changedAttempt, err := oldGeneration.runtime.routes.begin(oldChanged, oldChanged.Targets[0].Address, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(changedAttempt, time.Millisecond, errors.New("changed route failed"), now)
+
+	keptReload := reloadRule("kept", keptListen, keptTarget)
+	keptReload.Mode = config.ModeBoost
+	keptReload.HealthCheck = &config.HealthCheckConfig{
+		Type:             config.HealthCheckTCP,
+		Interval:         10_000,
+		Timeout:          2_000,
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+	}
+	keptReload.Targets = append(keptReload.Targets, &config.Target{Address: "kept-backup.example:443"})
+	changedReload := reloadRule("changed", changedListen, "new.example:443")
+	if _, err := server.ReloadRules(context.Background(), []*config.Rule{keptReload, changedReload}); err != nil {
+		t.Fatal(err)
+	}
+
+	newGeneration := server.current.Load()
+	newKept := findGenerationRule(t, newGeneration, "kept")
+	if snapshot := newGeneration.runtime.routes.snapshot(newKept, keptTarget, now); !snapshot.CircuitOpen || snapshot.ConsecutiveFailures < routeFailureThreshold {
+		t.Fatalf("unchanged route lost circuit state: %+v", snapshot)
+	}
+	if !newGeneration.runtime.health.unhealthy(newKept, keptTarget) {
+		t.Fatal("unchanged rule lost active-health state")
+	}
+	entry, ok := newGeneration.runtime.loadBoostWinnerToken(boostRuleKey(newKept))
+	if !ok || entry.addr != winner.addr || entry.generation != winner.generation {
+		t.Fatalf("unchanged rule lost Boost winner: entry=%+v ok=%v", entry, ok)
+	}
+	newChanged := findGenerationRule(t, newGeneration, "changed")
+	if snapshot := newGeneration.runtime.routes.snapshot(newChanged, newChanged.Targets[0].Address, now); snapshot.Observed || snapshot.CircuitOpen {
+		t.Fatalf("changed rule inherited stale route state: %+v", snapshot)
+	}
+}
+
 func waitReloadServerReady(t *testing.T, server *Server) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

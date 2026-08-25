@@ -273,7 +273,10 @@ def phase_summary(results: Sequence[Result], elapsed: float) -> Dict[str, object
         "failed": len(results) - len(successes),
         "success_rate": (100.0 * len(successes) / len(results)) if results else 0.0,
         "elapsed_seconds": elapsed,
-        "throughput_rps": len(results) / elapsed,
+        # Successful throughput must not be inflated by requests that fail
+        # immediately. Keep attempted rate separately for overload diagnosis.
+        "throughput_rps": len(successes) / elapsed,
+        "attempted_rps": len(results) / elapsed,
         "latency_ms": {f"p{p}": latency[p] for p in (50, 90, 95, 99)},
         "first_byte_ms": {f"p{p}": first_byte[p] for p in (50, 90, 95, 99)},
         "connect_ms": {f"p{p}": connect[p] for p in (50, 90, 95, 99)},
@@ -642,7 +645,7 @@ def make_local_config(
         target_entries.append(entry)
     limit = max(128, concurrency * 4)
     return {
-        "log": {"level": "error", "path": "", "version": "benchmark", "date": ""},
+        "log": {"level": "error", "path": ""},
         "metrics": {"enabled": True, "listen": f"127.0.0.1:{metrics_port}"},
         "rules": [
             {

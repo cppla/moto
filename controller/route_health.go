@@ -134,7 +134,7 @@ func routeObserve(attempt routeAttempt, latency time.Duration, err error, now ti
 		return
 	}
 
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) || isDialBulkheadError(err) {
 		registry.Lock()
 		if state := registry.states[attempt.key]; state != nil && state.circuitOpen &&
 			state.halfOpen && state.halfOpenAttempt == attempt.id {

@@ -34,8 +34,16 @@ func resetProcessMetricsForTest() {
 	processMetrics.dialCanceled = make(map[dialMetricKey]uint64)
 	processMetrics.dialLatencyNanos = make(map[dialMetricKey]uint64)
 	processMetrics.dialLatencyCount = make(map[dialMetricKey]uint64)
+	processMetrics.dialBulkheadWaitNanos = make(map[dialMetricKey]uint64)
+	processMetrics.dialBulkheadWaitCount = make(map[dialMetricKey]uint64)
+	processMetrics.dialBulkheadRejected = make(map[dialMetricKey]uint64)
 	processMetrics.boostCacheHits = make(map[string]uint64)
 	processMetrics.boostCacheMisses = make(map[string]uint64)
+	processMetrics.boostHedgeEvents = make(map[boostHedgeMetricKey]uint64)
+	processMetrics.boostHedgeDelayNanos = make(map[string]uint64)
+	processMetrics.boostHedgeDelayCount = make(map[string]uint64)
+	processMetrics.boostDecisionNanos = make(map[string]uint64)
+	processMetrics.boostDecisionCount = make(map[string]uint64)
 	processMetrics.mu.Unlock()
 	setMetricsGaugeRenderer(nil)
 }
@@ -120,8 +128,14 @@ func TestMetricsConcurrentRecordingAndLabelEscaping(t *testing.T) {
 				metricDial(rule, target, 100*time.Millisecond, nil)
 				metricDial(rule, target, 200*time.Millisecond, errors.New("dial failed"))
 				metricDial(rule, target, 0, context.Canceled)
+				metricDialBulkhead(rule, target, 50*time.Millisecond, nil)
+				metricDialBulkhead(rule, target, 100*time.Millisecond, &dialBulkheadError{target: target, saturated: true})
 				metricBoostCache(rule, true)
 				metricBoostCache(rule, false)
+				metricBoostHedgeEvent(rule, boostHedgeScheduled)
+				metricBoostHedgeEvent(rule, boostHedgeLaunched)
+				metricBoostHedgeDelay(rule, 125*time.Millisecond)
+				metricBoostDecisionDuration(rule, 175*time.Millisecond)
 			}
 		}()
 	}
@@ -146,12 +160,14 @@ func TestMetricsConcurrentRecordingAndLabelEscaping(t *testing.T) {
 	total := uint64(workers * iterations)
 	dialTotal := total * 3
 	dialLatencyTotal := total * 2
+	bulkheadWaitTotal := total * 2
 
 	labels := `{rule="` + escapePrometheusLabel(rule) + `",mode="` + escapePrometheusLabel(mode) + `"}`
 	rejectionLabels := `{rule="` + escapePrometheusLabel(rule) + `",mode="` + escapePrometheusLabel(mode) + `",reason="` + escapePrometheusLabel(reason) + `"}`
 	relayLabels := `{rule="` + escapePrometheusLabel(rule) + `",direction="` + escapePrometheusLabel(direction) + `"}`
 	dialLabels := `{rule="` + escapePrometheusLabel(rule) + `",target="` + escapePrometheusLabel(target) + `"}`
 	ruleLabel := `{rule="` + escapePrometheusLabel(rule) + `"}`
+	hedgeLabel := `{rule="` + escapePrometheusLabel(rule) + `",outcome="` + boostHedgeLaunched + `"}`
 
 	wants := []string{
 		"moto_connections_accepted_total" + labels + " " + strconv.FormatUint(total, 10) + "\n",
@@ -167,8 +183,16 @@ func TestMetricsConcurrentRecordingAndLabelEscaping(t *testing.T) {
 		"moto_dial_canceled_total" + dialLabels + " " + strconv.FormatUint(total, 10) + "\n",
 		"moto_dial_latency_seconds_sum" + dialLabels + " 480\n",
 		"moto_dial_latency_seconds_count" + dialLabels + " " + strconv.FormatUint(dialLatencyTotal, 10) + "\n",
+		"moto_dial_bulkhead_wait_seconds_sum" + dialLabels + " 240\n",
+		"moto_dial_bulkhead_wait_seconds_count" + dialLabels + " " + strconv.FormatUint(bulkheadWaitTotal, 10) + "\n",
+		"moto_dial_bulkhead_rejected_total" + dialLabels + " " + strconv.FormatUint(total, 10) + "\n",
 		"moto_boost_cache_hits_total" + ruleLabel + " " + strconv.FormatUint(total, 10) + "\n",
 		"moto_boost_cache_misses_total" + ruleLabel + " " + strconv.FormatUint(total, 10) + "\n",
+		"moto_boost_hedge_events_total" + hedgeLabel + " " + strconv.FormatUint(total, 10) + "\n",
+		"moto_boost_hedge_delay_seconds_sum" + ruleLabel + " 200\n",
+		"moto_boost_hedge_delay_seconds_count" + ruleLabel + " " + strconv.FormatUint(total, 10) + "\n",
+		"moto_boost_decision_duration_seconds_sum" + ruleLabel + " 280\n",
+		"moto_boost_decision_duration_seconds_count" + ruleLabel + " " + strconv.FormatUint(total, 10) + "\n",
 	}
 	for _, want := range wants {
 		if !strings.Contains(body, want) {
@@ -225,7 +249,12 @@ func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
 	metricConnectionAccepted("reload-rule", config.ModeBoost)
 	metricDial("reload-rule", "old.example:443", time.Millisecond, nil)
 	metricDial("reload-rule", "new.example:443", time.Millisecond, nil)
+	metricDialBulkhead("reload-rule", "old.example:443", time.Millisecond, &dialBulkheadError{target: "old.example:443", saturated: true})
+	metricDialBulkhead("reload-rule", "new.example:443", time.Millisecond, nil)
 	metricRelay("reload-rule", "client_to_target", 1, nil)
+	metricBoostHedgeEvent("reload-rule", boostHedgeWon)
+	metricBoostHedgeDelay("reload-rule", time.Millisecond)
+	metricBoostDecisionDuration("reload-rule", 2*time.Millisecond)
 
 	processMetrics.unregisterRules(oldRules)
 	snapshot := processMetrics.snapshot()
@@ -235,19 +264,39 @@ func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
 	if _, exists := snapshot.dialAttempts[dialMetricKey{rule: "reload-rule", target: "old.example:443"}]; exists {
 		t.Fatal("retired target label was retained")
 	}
+	if _, exists := snapshot.dialBulkheadWaitCount[dialMetricKey{rule: "reload-rule", target: "old.example:443"}]; exists {
+		t.Fatal("retired bulkhead target label was retained")
+	}
 	if snapshot.connectionsAccepted[connectionMetricKey{rule: "reload-rule", mode: config.ModeBoost}] != 1 ||
-		snapshot.dialAttempts[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 {
+		snapshot.dialAttempts[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 ||
+		snapshot.dialBulkheadWaitCount[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 {
 		t.Fatal("current generation metrics were removed")
 	}
 	if snapshot.relayBytes[relayMetricKey{rule: "reload-rule", direction: "client_to_target"}] != 1 {
 		t.Fatal("shared rule metric was removed while still referenced")
 	}
+	if snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: "reload-rule", outcome: boostHedgeWon}] != 1 ||
+		snapshot.boostHedgeDelayCount["reload-rule"] != 1 || snapshot.boostDecisionCount["reload-rule"] != 1 {
+		t.Fatal("shared Boost hedge metrics were removed while still referenced")
+	}
 
 	processMetrics.unregisterRules(newRules)
 	snapshot = processMetrics.snapshot()
-	if len(snapshot.connectionsAccepted) != 0 || len(snapshot.dialAttempts) != 0 || len(snapshot.relayBytes) != 0 {
-		t.Fatalf("retired labels remain: connections=%d dials=%d relay=%d",
-			len(snapshot.connectionsAccepted), len(snapshot.dialAttempts), len(snapshot.relayBytes))
+	if len(snapshot.connectionsAccepted) != 0 || len(snapshot.dialAttempts) != 0 ||
+		len(snapshot.dialBulkheadWaitCount) != 0 || len(snapshot.relayBytes) != 0 ||
+		len(snapshot.boostHedgeEvents) != 0 || len(snapshot.boostHedgeDelayCount) != 0 ||
+		len(snapshot.boostDecisionCount) != 0 {
+		t.Fatalf("retired labels remain: connections=%d dials=%d bulkhead=%d relay=%d hedge=%d",
+			len(snapshot.connectionsAccepted), len(snapshot.dialAttempts),
+			len(snapshot.dialBulkheadWaitCount), len(snapshot.relayBytes), len(snapshot.boostHedgeEvents))
+	}
+}
+
+func TestMetricBoostHedgeRejectsUnboundedOutcome(t *testing.T) {
+	resetProcessMetricsForTest()
+	metricBoostHedgeEvent("boost-rule", "target-controlled-value")
+	if got := len(processMetrics.snapshot().boostHedgeEvents); got != 0 {
+		t.Fatalf("unknown hedge outcome created %d metric series", got)
 	}
 }
 

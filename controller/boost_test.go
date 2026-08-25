@@ -37,6 +37,15 @@ func boostTestRule(name, listen string, addresses ...string) *config.Rule {
 	}
 }
 
+func hedgedBoostTestRule(name, listen string, addresses ...string) *config.Rule {
+	rule := boostTestRule(name, listen, addresses...)
+	rule.Hedge = &config.HedgeConfig{
+		MinDelay: config.DefaultHedgeMinDelay,
+		MaxDelay: config.DefaultHedgeMaxDelay,
+	}
+	return rule
+}
+
 func TestBoostRuleKeyIncludesRouteIdentity(t *testing.T) {
 	base := boostTestRule("duplicate", "127.0.0.1:1001", "one:1", "two:2")
 	differentListener := boostTestRule("duplicate", "127.0.0.1:1002", "one:1", "two:2")
@@ -50,12 +59,735 @@ func TestBoostRuleKeyIncludesRouteIdentity(t *testing.T) {
 	}
 }
 
+func TestCachedBoostHedgeDelayClampsTwiceEWMA(t *testing.T) {
+	tests := []struct {
+		name string
+		ewma time.Duration
+		want time.Duration
+	}{
+		{name: "no sample uses minimum", want: 25 * time.Millisecond},
+		{name: "below minimum", ewma: 5 * time.Millisecond, want: 25 * time.Millisecond},
+		{name: "inside range", ewma: 40 * time.Millisecond, want: 80 * time.Millisecond},
+		{name: "above maximum", ewma: 200 * time.Millisecond, want: 250 * time.Millisecond},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := newRoutingRuntime()
+			defer runtime.stopBackground()
+			rule := hedgedBoostTestRule(
+				fmt.Sprintf("hedge-delay-%d", index),
+				fmt.Sprintf("127.0.0.1:%d", 18000+index),
+				"cached:443",
+				"fallback:443",
+			)
+			if test.ewma > 0 {
+				attempt, err := runtime.routes.begin(rule, "cached:443", time.Now())
+				if err != nil {
+					t.Fatal(err)
+				}
+				routeObserve(attempt, test.ewma, nil, time.Now())
+			}
+			if got := runtime.cachedBoostHedgeDelay(rule, "cached:443"); got != test.want {
+				t.Fatalf("cachedBoostHedgeDelay() = %s, want %s", got, test.want)
+			}
+		})
+	}
+
+	legacy := boostTestRule("legacy-delay", "127.0.0.1:18004", "cached:443", "fallback:443")
+	legacyRuntime := newRoutingRuntime()
+	defer legacyRuntime.stopBackground()
+	if got := legacyRuntime.cachedBoostHedgeDelay(legacy, "cached:443"); got != 0 {
+		t.Fatalf("omitted hedge delay = %s, want disabled", got)
+	}
+}
+
+func TestCachedBoostHardFailureStartsFallbackWithoutHedgeDelay(t *testing.T) {
+	resetProcessMetricsForTest()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule("hard-fallback", "127.0.0.1:18100", "cached:443", "fallback:443", "standby:443")
+	heartbeat := make(chan time.Time)
+	winnerConn, winnerPeer := net.Pipe()
+	defer winnerPeer.Close()
+	standbyCanceled := make(chan struct{})
+
+	outcome, err := runtime.raceCachedBoostTargetWithDial(
+		context.Background(),
+		rule,
+		"cached:443",
+		func(ctx context.Context, _ *config.Rule, addr string, _ boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+			switch addr {
+			case "cached:443":
+				return nil, routeAttempt{}, errors.New("cached route failed")
+			case "fallback:443":
+				return winnerConn, routeAttempt{}, nil
+			case "standby:443":
+				<-ctx.Done()
+				close(standbyCanceled)
+				return nil, routeAttempt{}, ctx.Err()
+			default:
+				return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", addr)
+			}
+		},
+		nil,
+		75*time.Millisecond,
+		heartbeat,
+	)
+	if err != nil {
+		t.Fatalf("raceCachedBoostTargetWithDial() error = %v", err)
+	}
+	defer outcome.winner.conn.Close()
+	if outcome.winner.addr != "fallback:443" || !outcome.cachedFailed ||
+		!outcome.fallbackStarted || outcome.hedged {
+		t.Fatalf("outcome = %+v, want immediate fallback winner after cached failure", outcome)
+	}
+	select {
+	case <-standbyCanceled:
+	default:
+		t.Fatal("first fallback winner did not cancel the other immediate fallback")
+	}
+	snapshot := processMetrics.snapshot()
+	if snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeLaunched}] != 0 ||
+		snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeWon}] != 0 {
+		t.Fatal("hard-failure fallback was counted as a delayed hedge")
+	}
+}
+
+func TestCachedBoostSlowPrimaryLaunchesHedgeOnSignalAndCancelsLoser(t *testing.T) {
+	resetProcessMetricsForTest()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule("slow-hedge", "127.0.0.1:18101", "cached:443", "fallback:443")
+	hedgeReady := make(chan time.Time, 1)
+	primaryStarted := make(chan struct{})
+	primaryCanceled := make(chan struct{})
+	fallbackStarted := make(chan struct{})
+	winnerConn, winnerPeer := net.Pipe()
+	defer winnerPeer.Close()
+
+	type result struct {
+		outcome cachedBoostOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := runtime.raceCachedBoostTargetWithDial(
+			context.Background(),
+			rule,
+			"cached:443",
+			func(ctx context.Context, _ *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+				switch addr {
+				case "cached:443":
+					options.onStart()
+					close(primaryStarted)
+					<-ctx.Done()
+					close(primaryCanceled)
+					return nil, routeAttempt{}, ctx.Err()
+				case "fallback:443":
+					options.onStart()
+					close(fallbackStarted)
+					return winnerConn, routeAttempt{}, nil
+				default:
+					return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", addr)
+				}
+			},
+			nil,
+			80*time.Millisecond,
+			hedgeReady,
+		)
+		done <- result{outcome: outcome, err: err}
+	}()
+
+	<-primaryStarted
+	select {
+	case <-fallbackStarted:
+		t.Fatal("fallback started before the hedge signal")
+	default:
+	}
+	hedgeReady <- time.Now()
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("raceCachedBoostTargetWithDial() error = %v", got.err)
+	}
+	defer got.outcome.winner.conn.Close()
+	if got.outcome.winner.addr != "fallback:443" || !got.outcome.hedged || got.outcome.cachedFailed {
+		t.Fatalf("outcome = %+v, want delayed fallback winner and neutral canceled primary", got.outcome)
+	}
+	select {
+	case <-primaryCanceled:
+	default:
+		t.Fatal("hedge winner did not cancel the slow primary")
+	}
+
+	snapshot := processMetrics.snapshot()
+	for _, event := range []string{boostHedgeScheduled, boostHedgeLaunched, boostHedgeWon} {
+		if got := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: event}]; got != 1 {
+			t.Fatalf("hedge event %s = %d, want 1", event, got)
+		}
+	}
+	if got := snapshot.boostHedgeDelayNanos[rule.Name]; got != uint64(80*time.Millisecond) {
+		t.Fatalf("recorded hedge delay = %s, want 80ms", time.Duration(got))
+	}
+}
+
+func TestCachedBoostHedgeCapacitySkipKeepsPrimaryAlive(t *testing.T) {
+	resetProcessMetricsForTest()
+	bulkhead := newDialBulkhead(1, 1, 0)
+	runtime := newRoutingRuntimeWithDialResources(make(chan struct{}, 1), bulkhead)
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule("hedge-capacity", "127.0.0.1:18102", "cached:443", "fallback:443")
+	hedgeReady := make(chan time.Time, 1)
+	primaryStarted := make(chan struct{})
+	releasePrimary := make(chan struct{})
+	fallbackSkipped := make(chan struct{})
+	primaryConn, primaryPeer := net.Pipe()
+	defer primaryPeer.Close()
+
+	type result struct {
+		outcome cachedBoostOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := runtime.raceCachedBoostTargetWithDial(
+			context.Background(),
+			rule,
+			"cached:443",
+			func(ctx context.Context, dialRule *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+				var permit *dialPermit
+				var acquireErr error
+				if options.tryOnly {
+					permit, acquireErr = runtime.tryAcquireTrafficDial(ctx, dialRule, addr)
+				} else {
+					permit, acquireErr = runtime.acquireTrafficDial(ctx, dialRule, addr)
+				}
+				if acquireErr != nil {
+					if addr == "fallback:443" {
+						close(fallbackSkipped)
+					}
+					return nil, routeAttempt{}, acquireErr
+				}
+				defer permit.release()
+				if options.onStart != nil {
+					options.onStart()
+				}
+				if addr != "cached:443" {
+					return nil, routeAttempt{}, fmt.Errorf("unexpected admitted target %s", addr)
+				}
+				close(primaryStarted)
+				<-releasePrimary
+				return primaryConn, routeAttempt{}, nil
+			},
+			nil,
+			50*time.Millisecond,
+			hedgeReady,
+		)
+		done <- result{outcome: outcome, err: err}
+	}()
+
+	<-primaryStarted
+	hedgeReady <- time.Now()
+	<-fallbackSkipped
+	select {
+	case early := <-done:
+		t.Fatalf("capacity-limited optional hedge canceled primary: %+v", early)
+	default:
+	}
+	close(releasePrimary)
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("raceCachedBoostTargetWithDial() error = %v", got.err)
+	}
+	defer got.outcome.winner.conn.Close()
+	if got.outcome.winner.addr != "cached:443" {
+		t.Fatalf("winner = %s, want primary", got.outcome.winner.addr)
+	}
+	if snapshot := bulkhead.snapshot(); snapshot.Active != 0 || snapshot.Waiting != 0 {
+		t.Fatalf("bulkhead leaked after hedge: %+v", snapshot)
+	}
+	metrics := processMetrics.snapshot()
+	if got := metrics.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeSkippedCapacity}]; got != 1 {
+		t.Fatalf("skipped-capacity events = %d, want 1", got)
+	}
+	if got := metrics.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeLaunched}]; got != 0 {
+		t.Fatalf("capacity-skipped hedge launched events = %d, want 0", got)
+	}
+}
+
+func TestCachedBoostRetriesSkippedHedgeAsRequiredFallback(t *testing.T) {
+	resetProcessMetricsForTest()
+	defer resetProcessMetricsForTest()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule("hedge-capacity-retry", "127.0.0.1:18107", "cached:443", "fallback:443")
+	hedgeReady := make(chan time.Time, 1)
+	primaryStarted := make(chan struct{})
+	failPrimary := make(chan struct{})
+	optionalSkipped := make(chan struct{})
+	winnerConn, winnerPeer := net.Pipe()
+	defer winnerPeer.Close()
+	var fallbackCalls atomic.Int32
+
+	type result struct {
+		outcome cachedBoostOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := runtime.raceCachedBoostTargetWithDial(
+			context.Background(),
+			rule,
+			"cached:443",
+			func(ctx context.Context, _ *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+				switch addr {
+				case "cached:443":
+					options.onStart()
+					close(primaryStarted)
+					select {
+					case <-failPrimary:
+						return nil, routeAttempt{}, errors.New("primary failed after skipped hedge")
+					case <-ctx.Done():
+						return nil, routeAttempt{}, ctx.Err()
+					}
+				case "fallback:443":
+					call := fallbackCalls.Add(1)
+					if call == 1 {
+						if !options.tryOnly {
+							return nil, routeAttempt{}, errors.New("optional hedge did not use try-only admission")
+						}
+						close(optionalSkipped)
+						return nil, routeAttempt{}, &dialBulkheadError{target: addr, saturated: true}
+					}
+					if options.tryOnly {
+						return nil, routeAttempt{}, errors.New("required fallback still used try-only admission")
+					}
+					return winnerConn, routeAttempt{}, nil
+				default:
+					return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", addr)
+				}
+			},
+			nil,
+			50*time.Millisecond,
+			hedgeReady,
+		)
+		done <- result{outcome: outcome, err: err}
+	}()
+
+	<-primaryStarted
+	hedgeReady <- time.Now()
+	<-optionalSkipped
+	close(failPrimary)
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("race error = %v", got.err)
+	}
+	defer got.outcome.winner.conn.Close()
+	if got.outcome.winner.addr != "fallback:443" || !got.outcome.cachedFailed ||
+		!got.outcome.fallbackStarted || got.outcome.hedged {
+		t.Fatalf("capacity retry outcome = %+v", got.outcome)
+	}
+	if calls := fallbackCalls.Load(); calls != 2 {
+		t.Fatalf("fallback calls = %d, want optional attempt plus required retry", calls)
+	}
+	snapshot := processMetrics.snapshot()
+	if skipped := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeSkippedCapacity}]; skipped != 1 {
+		t.Fatalf("skipped-capacity events = %d, want 1", skipped)
+	}
+	for _, event := range []string{boostHedgeLaunched, boostHedgeWon} {
+		if got := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: event}]; got != 0 {
+			t.Fatalf("capacity-skipped event %s = %d, want 0", event, got)
+		}
+	}
+}
+
+func TestCachedBoostRetriesLateCapacityResultAfterPrimaryFailure(t *testing.T) {
+	resetProcessMetricsForTest()
+	defer resetProcessMetricsForTest()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule(
+		"hedge-capacity-reverse",
+		"127.0.0.1:18108",
+		"cached:443",
+		"fallback:443",
+		"standby:443",
+	)
+	hedgeReady := make(chan time.Time, 1)
+	primaryStarted := make(chan struct{})
+	failPrimary := make(chan struct{})
+	optionalAttempted := make(chan struct{})
+	releaseOptionalResult := make(chan struct{})
+	requiredStandbyStarted := make(chan struct{})
+	standbyCanceled := make(chan struct{})
+	winnerConn, winnerPeer := net.Pipe()
+	defer winnerPeer.Close()
+	var fallbackCalls atomic.Int32
+
+	type result struct {
+		outcome cachedBoostOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := runtime.raceCachedBoostTargetWithDial(
+			context.Background(),
+			rule,
+			"cached:443",
+			func(ctx context.Context, _ *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+				switch addr {
+				case "cached:443":
+					options.onStart()
+					close(primaryStarted)
+					select {
+					case <-failPrimary:
+						return nil, routeAttempt{}, errors.New("primary failed before optional result")
+					case <-ctx.Done():
+						return nil, routeAttempt{}, ctx.Err()
+					}
+				case "fallback:443":
+					call := fallbackCalls.Add(1)
+					if call == 1 {
+						if !options.tryOnly {
+							return nil, routeAttempt{}, errors.New("first fallback was not optional")
+						}
+						close(optionalAttempted)
+						select {
+						case <-releaseOptionalResult:
+							return nil, routeAttempt{}, &dialBulkheadError{target: addr, saturated: true}
+						case <-ctx.Done():
+							return nil, routeAttempt{}, ctx.Err()
+						}
+					}
+					if options.tryOnly {
+						return nil, routeAttempt{}, errors.New("retried fallback was still optional")
+					}
+					return winnerConn, routeAttempt{}, nil
+				case "standby:443":
+					if options.tryOnly {
+						return nil, routeAttempt{}, errors.New("post-primary standby was still optional")
+					}
+					close(requiredStandbyStarted)
+					<-ctx.Done()
+					close(standbyCanceled)
+					return nil, routeAttempt{}, ctx.Err()
+				default:
+					return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", addr)
+				}
+			},
+			nil,
+			50*time.Millisecond,
+			hedgeReady,
+		)
+		done <- result{outcome: outcome, err: err}
+	}()
+
+	<-primaryStarted
+	hedgeReady <- time.Now()
+	<-optionalAttempted
+	close(failPrimary)
+	select {
+	case <-requiredStandbyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("primary failure did not switch new fallback to required admission")
+	}
+	close(releaseOptionalResult)
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("race error = %v", got.err)
+	}
+	defer got.outcome.winner.conn.Close()
+	if got.outcome.winner.addr != "fallback:443" || !got.outcome.cachedFailed ||
+		!got.outcome.fallbackStarted || got.outcome.hedged {
+		t.Fatalf("reverse capacity retry outcome = %+v", got.outcome)
+	}
+	if calls := fallbackCalls.Load(); calls != 2 {
+		t.Fatalf("fallback calls = %d, want optional attempt plus required retry", calls)
+	}
+	select {
+	case <-standbyCanceled:
+	default:
+		t.Fatal("required retry winner did not cancel the other fallback")
+	}
+	snapshot := processMetrics.snapshot()
+	if skipped := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeSkippedCapacity}]; skipped != 1 {
+		t.Fatalf("skipped-capacity events = %d, want 1", skipped)
+	}
+	for _, event := range []string{boostHedgeLaunched, boostHedgeWon} {
+		if got := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: event}]; got != 0 {
+			t.Fatalf("reverse capacity event %s = %d, want 0", event, got)
+		}
+	}
+}
+
+func TestCachedBoostRejectedBeforeDialDoesNotScheduleHedge(t *testing.T) {
+	resetProcessMetricsForTest()
+	defer resetProcessMetricsForTest()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule("hedge-prestart-reject", "127.0.0.1:18104", "cached:443", "fallback:443")
+
+	outcome, err := runtime.raceCachedBoostTargetWithDial(
+		context.Background(),
+		rule,
+		"cached:443",
+		func(context.Context, *config.Rule, string, boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+			return nil, routeAttempt{}, &dialBulkheadError{target: "cached:443", saturated: true}
+		},
+		nil,
+		50*time.Millisecond,
+		nil,
+	)
+	if !errors.Is(err, errDialBulkheadSaturated) {
+		t.Fatalf("race error = %v, want bulkhead saturation", err)
+	}
+	if outcome.fallbackStarted || outcome.hedged || outcome.cachedFailed {
+		t.Fatalf("pre-dial rejection changed Hedge outcome: %+v", outcome)
+	}
+	snapshot := processMetrics.snapshot()
+	for _, event := range []string{boostHedgeScheduled, boostHedgeLaunched, boostHedgeAvoided} {
+		if got := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: event}]; got != 0 {
+			t.Fatalf("pre-dial rejection event %s = %d, want 0", event, got)
+		}
+	}
+	if got := snapshot.boostHedgeDelayCount[rule.Name]; got != 0 {
+		t.Fatalf("pre-dial rejection recorded %d Hedge delay sample(s)", got)
+	}
+}
+
+func TestCachedBoostAlternativeRejectedBeforeDialIsNotLaunched(t *testing.T) {
+	resetProcessMetricsForTest()
+	defer resetProcessMetricsForTest()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule("hedge-alt-prestart", "127.0.0.1:18105", "cached:443", "fallback:443")
+	hedgeReady := make(chan time.Time, 1)
+	primaryStarted := make(chan struct{})
+	releasePrimary := make(chan struct{})
+	fallbackReturned := make(chan struct{})
+	primaryConn, primaryPeer := net.Pipe()
+	defer primaryPeer.Close()
+
+	type result struct {
+		outcome cachedBoostOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := runtime.raceCachedBoostTargetWithDial(
+			context.Background(),
+			rule,
+			"cached:443",
+			func(ctx context.Context, _ *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+				switch addr {
+				case "cached:443":
+					options.onStart()
+					close(primaryStarted)
+					select {
+					case <-releasePrimary:
+						return primaryConn, routeAttempt{}, nil
+					case <-ctx.Done():
+						return nil, routeAttempt{}, ctx.Err()
+					}
+				case "fallback:443":
+					close(fallbackReturned)
+					return nil, routeAttempt{}, ErrCircuitOpen
+				default:
+					return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", addr)
+				}
+			},
+			nil,
+			50*time.Millisecond,
+			hedgeReady,
+		)
+		done <- result{outcome: outcome, err: err}
+	}()
+
+	<-primaryStarted
+	hedgeReady <- time.Now()
+	<-fallbackReturned
+	close(releasePrimary)
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("race error = %v", got.err)
+	}
+	defer got.outcome.winner.conn.Close()
+	if got.outcome.hedged || !got.outcome.fallbackStarted {
+		t.Fatalf("pre-dial fallback outcome = %+v, want selected but not launched", got.outcome)
+	}
+	snapshot := processMetrics.snapshot()
+	if launched := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeLaunched}]; launched != 0 {
+		t.Fatalf("pre-dial fallback launched events = %d, want 0", launched)
+	}
+}
+
+func TestCachedBoostSkipsHedgeWithoutDeadlineBudget(t *testing.T) {
+	resetProcessMetricsForTest()
+	defer resetProcessMetricsForTest()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule("hedge-deadline", "127.0.0.1:18106", "cached:443", "fallback:443")
+	primaryConn, primaryPeer := net.Pipe()
+	defer primaryPeer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	outcome, err := runtime.raceCachedBoostTargetWithDial(
+		ctx,
+		rule,
+		"cached:443",
+		func(_ context.Context, _ *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+			if addr != "cached:443" {
+				return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", addr)
+			}
+			options.onStart()
+			return primaryConn, routeAttempt{}, nil
+		},
+		nil,
+		50*time.Millisecond,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("race error = %v", err)
+	}
+	defer outcome.winner.conn.Close()
+	snapshot := processMetrics.snapshot()
+	if skipped := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeSkippedDeadline}]; skipped != 1 {
+		t.Fatalf("skipped-deadline events = %d, want 1", skipped)
+	}
+	for _, event := range []string{boostHedgeScheduled, boostHedgeLaunched, boostHedgeAvoided} {
+		if got := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: event}]; got != 0 {
+			t.Fatalf("deadline-skipped event %s = %d, want 0", event, got)
+		}
+	}
+	if got := snapshot.boostHedgeDelayCount[rule.Name]; got != 0 {
+		t.Fatalf("deadline-skipped path recorded %d delay sample(s)", got)
+	}
+}
+
+func TestCachedBoostHedgeDelayStartsAfterPrimaryAdmission(t *testing.T) {
+	resetProcessMetricsForTest()
+	defer resetProcessMetricsForTest()
+
+	primaryListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primaryListener.Close()
+	fallbackListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fallbackListener.Close()
+
+	acceptOne := func(listener net.Listener) <-chan net.Conn {
+		accepted := make(chan net.Conn, 1)
+		go func() {
+			connection, acceptErr := listener.Accept()
+			if acceptErr == nil {
+				accepted <- connection
+			}
+		}()
+		return accepted
+	}
+	primaryAccepted := acceptOne(primaryListener)
+	fallbackAccepted := acceptOne(fallbackListener)
+
+	bulkhead := newDialBulkhead(1, 1, time.Second)
+	runtime := newRoutingRuntimeWithDialResources(make(chan struct{}, 1), bulkhead)
+	defer runtime.stopBackground()
+	rule := hedgedBoostTestRule(
+		"hedge-admission-anchor",
+		"127.0.0.1:18103",
+		primaryListener.Addr().String(),
+		fallbackListener.Addr().String(),
+	)
+	rule.Hedge.MinDelay = 25
+	rule.Hedge.MaxDelay = 25
+
+	holder, _, err := bulkhead.acquire(context.Background(), "capacity-holder:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holderReleased := false
+	defer func() {
+		if !holderReleased {
+			holder.release()
+		}
+	}()
+
+	type cachedResult struct {
+		outcome cachedBoostOutcome
+		err     error
+	}
+	done := make(chan cachedResult, 1)
+	go func() {
+		outcome, raceErr := runtime.raceCachedBoostTarget(context.Background(), rule, primaryListener.Addr().String(), nil)
+		done <- cachedResult{outcome: outcome, err: raceErr}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for bulkhead.snapshot().Waiting != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := bulkhead.snapshot().Waiting; got != 1 {
+		t.Fatalf("primary bulkhead waiters = %d, want 1", got)
+	}
+	time.Sleep(3 * time.Duration(rule.Hedge.MinDelay) * time.Millisecond)
+	select {
+	case connection := <-fallbackAccepted:
+		_ = connection.Close()
+		t.Fatal("fallback dialed while the primary was still waiting for admission")
+	default:
+	}
+
+	holder.release()
+	holderReleased = true
+
+	var result cachedResult
+	select {
+	case result = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cached Boost race did not finish after admission became available")
+	}
+	if result.err != nil {
+		t.Fatalf("raceCachedBoostTarget() error = %v", result.err)
+	}
+	if result.outcome.winner.addr != primaryListener.Addr().String() {
+		t.Fatalf("winner = %q, want admitted primary", result.outcome.winner.addr)
+	}
+	defer result.outcome.winner.conn.Close()
+
+	select {
+	case connection := <-primaryAccepted:
+		defer connection.Close()
+	case <-time.After(time.Second):
+		t.Fatal("primary listener did not accept the admitted dial")
+	}
+	select {
+	case connection := <-fallbackAccepted:
+		_ = connection.Close()
+		t.Fatal("fallback dialed before the admitted primary could win")
+	case <-time.After(3 * time.Duration(rule.Hedge.MinDelay) * time.Millisecond):
+	}
+
+	snapshot := processMetrics.snapshot()
+	if got := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeAvoided}]; got != 1 {
+		t.Fatalf("avoided hedge events = %d, want 1", got)
+	}
+	if got := snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeLaunched}]; got != 0 {
+		t.Fatalf("launched hedge events = %d, want 0", got)
+	}
+}
+
 func TestRaceBoostTargetsClosesEveryLoser(t *testing.T) {
 	resetRouteHealthForTest()
 	rule := boostTestRule("race", "127.0.0.1:1001", "one:1", "two:2", "three:3")
 	connections := make(map[string]*boostTrackingConn, len(rule.Targets))
 	dialed := make(map[string]bool, 2)
 	var dialedMu sync.Mutex
+	initialPairStarted := make(chan struct{})
+	var initialPairOnce sync.Once
 	peers := make([]net.Conn, 0, len(rule.Targets))
 	for _, target := range rule.Targets {
 		conn, peer := net.Pipe()
@@ -68,10 +800,25 @@ func TestRaceBoostTargetsClosesEveryLoser(t *testing.T) {
 		}
 	}()
 
-	winner, err := raceBoostTargets(context.Background(), rule, func(_ context.Context, addr string) (net.Conn, error) {
+	winner, err := raceBoostTargets(context.Background(), rule, func(ctx context.Context, addr string) (net.Conn, error) {
 		dialedMu.Lock()
 		dialed[addr] = true
+		if len(dialed) == 2 {
+			initialPairOnce.Do(func() { close(initialPairStarted) })
+		}
 		dialedMu.Unlock()
+		select {
+		case <-initialPairStarted:
+		case <-ctx.Done():
+			// The pair barrier and cancellation can become ready together after
+			// the first success wins. Once both test dials have started, prefer
+			// returning their connections so the race owns and closes its loser.
+			select {
+			case <-initialPairStarted:
+			default:
+				return nil, ctx.Err()
+			}
+		}
 		return connections[addr], nil
 	})
 	if err != nil {
@@ -329,22 +1076,28 @@ func TestBoostCacheHitDoesNotExtendRevalidationDeadline(t *testing.T) {
 	}
 }
 
-func TestBoostWinnerEvictionOnlyUsesAttributedUpstreamFailures(t *testing.T) {
-	clientReset := relayResult{
-		ClientToTarget: relayDirectionResult{Err: errors.New("client reset")},
-	}
-	if upstreamRelayError(clientReset) != nil {
-		t.Fatal("client failure would evict boost winner")
+func TestFinishBoostRelayDropsOnlyErroredCurrentWinner(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule("relay-cache", "127.0.0.1:18200", "one:1", "two:2")
+	key := boostRuleKey(rule)
+	token := runtime.storeBoostWinner(key, "one:1")
+
+	runtime.finishBoostRelay(token, routeAttempt{}, relayResult{
+		TargetToClient: relayDirectionResult{Err: errors.New("ambiguous relay error")},
+	})
+	if _, ok := runtime.loadBoostWinnerToken(key); ok {
+		t.Fatal("errored relay retained its cached winner")
 	}
 
-	upstreamReset := relayResult{
-		TargetToClient: relayDirectionResult{
-			Err:             errors.New("upstream reset"),
-			upstreamFailure: true,
-		},
-	}
-	if upstreamRelayError(upstreamReset) == nil {
-		t.Fatal("attributed upstream failure would retain boost winner")
+	stale := runtime.storeBoostWinner(key, "one:1")
+	current := runtime.storeBoostWinner(key, "two:2")
+	runtime.finishBoostRelay(stale, routeAttempt{}, relayResult{
+		ClientToTarget: relayDirectionResult{Err: errors.New("old stream failed")},
+	})
+	entry, ok := runtime.loadBoostWinnerToken(key)
+	if !ok || entry.addr != current.addr || entry.generation != current.generation {
+		t.Fatalf("old stream deleted newer winner: entry=%+v ok=%v", entry, ok)
 	}
 }
 

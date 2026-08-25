@@ -109,6 +109,45 @@ func TestLoadHealthCheckDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadHedgeDefaultsAndExplicitOptIn(t *testing.T) {
+	path := writeConfig(t, `{
+		"log": {"level": "info", "path": ""},
+		"rules": [{
+			"name": "hedged",
+			"listen": "127.0.0.1:8080",
+			"mode": "boost",
+			"hedge": {},
+			"targets": [
+				{"address": "one.example:443"},
+				{"address": "two.example:443"}
+			]
+		}, {
+			"name": "legacy",
+			"listen": "127.0.0.1:8081",
+			"mode": "boost",
+			"targets": [
+				{"address": "one.example:443"},
+				{"address": "two.example:443"}
+			]
+		}]
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	hedge := cfg.Rules[0].Hedge
+	if hedge == nil {
+		t.Fatal("Hedge = nil, want enabled configuration")
+	}
+	if hedge.MinDelay != DefaultHedgeMinDelay || hedge.MaxDelay != DefaultHedgeMaxDelay {
+		t.Fatalf("Hedge delays = %d/%d, want %d/%d", hedge.MinDelay, hedge.MaxDelay, DefaultHedgeMinDelay, DefaultHedgeMaxDelay)
+	}
+	if cfg.Rules[1].Hedge != nil {
+		t.Fatal("omitted hedge object enabled scheduling")
+	}
+}
+
 func TestMetricsConfigRejectsPublicAndConflictingListeners(t *testing.T) {
 	tests := map[string]struct {
 		metrics MetricsConfig
@@ -188,8 +227,12 @@ func TestLoadRejectsNonStrictJSON(t *testing.T) {
 	tests := map[string]string{
 		"unknown top-level field": `{` + validRule + `,"unknown":true}`,
 		"unknown nested field":    `{"log":{"level":"info","path":"","unknown":true},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
+		"removed log version":     `{"log":{"level":"info","path":"","version":"1.0.1"},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
+		"removed log date":        `{"log":{"level":"info","path":"","date":"2024-07-23"},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
 		"unknown metrics field":   `{"log":{"level":"info","path":""},"metrics":{"enabled":true,"unknown":true},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
 		"unknown health field":    `{"log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","healthCheck":{"type":"tcp","unknown":true},"targets":[{"address":"example.com:80"}]}]}`,
+		"unknown hedge field":     `{"log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"boost","hedge":{"unknown":true},"targets":[{"address":"one.example:80"},{"address":"two.example:80"}]}]}`,
+		"removed tcp field":       `{"log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","tcp":{},"targets":[{"address":"example.com:80"}]}]}`,
 		"legacy snake-case limit": `{"log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","max_connections":100,"targets":[{"address":"example.com:80"}]}]}`,
 		"case-folded top-level":   `{"Log":{"level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
 		"case-folded nested":      `{"log":{"Level":"info","path":""},"rules":[{"name":"one","listen":":8000","mode":"normal","targets":[{"address":"example.com:80"}]}]}`,
@@ -261,6 +304,53 @@ func TestValidateRejectsInvalidConfiguration(t *testing.T) {
 		"timeout too large": {
 			mutate: func(c *Config) { c.Rules[0].Timeout = uint64(maxRuleTimeout/time.Millisecond) + 1 },
 			want:   "timeout must not exceed",
+		},
+		"hedge outside boost mode": {
+			mutate: func(c *Config) {
+				c.Rules[0].Hedge = &HedgeConfig{}
+			},
+			want: "only valid in boost mode",
+		},
+		"hedge needs unique targets": {
+			mutate: func(c *Config) {
+				c.Rules[0].Mode = ModeBoost
+				c.Rules[0].Hedge = &HedgeConfig{}
+				c.Rules[0].Targets = append(c.Rules[0].Targets, &Target{Address: c.Rules[0].Targets[0].Address})
+			},
+			want: "at least two unique",
+		},
+		"hedge minimum below floor": {
+			mutate: func(c *Config) {
+				c.Rules[0].Mode = ModeBoost
+				c.Rules[0].Hedge = &HedgeConfig{MinDelay: minHedgeDelay - 1, MaxDelay: DefaultHedgeMaxDelay}
+				c.Rules[0].Targets = append(c.Rules[0].Targets, &Target{Address: "two.example:80"})
+			},
+			want: "minDelay must be between",
+		},
+		"hedge minimum exceeds maximum": {
+			mutate: func(c *Config) {
+				c.Rules[0].Mode = ModeBoost
+				c.Rules[0].Hedge = &HedgeConfig{MinDelay: 251, MaxDelay: 250}
+				c.Rules[0].Targets = append(c.Rules[0].Targets, &Target{Address: "two.example:80"})
+			},
+			want: "minDelay must not exceed",
+		},
+		"hedge maximum above ceiling": {
+			mutate: func(c *Config) {
+				c.Rules[0].Mode = ModeBoost
+				c.Rules[0].Hedge = &HedgeConfig{MinDelay: DefaultHedgeMinDelay, MaxDelay: maxHedgeDelay + 1}
+				c.Rules[0].Targets = append(c.Rules[0].Targets, &Target{Address: "two.example:80"})
+			},
+			want: "maxDelay must be between",
+		},
+		"hedge consumes whole decision timeout": {
+			mutate: func(c *Config) {
+				c.Rules[0].Mode = ModeBoost
+				c.Rules[0].Timeout = 250
+				c.Rules[0].Hedge = &HedgeConfig{MinDelay: DefaultHedgeMinDelay, MaxDelay: 250}
+				c.Rules[0].Targets = append(c.Rules[0].Targets, &Target{Address: "two.example:80"})
+			},
+			want: "maxDelay must be less than rule timeout",
 		},
 		"too many targets": {
 			mutate: func(c *Config) {

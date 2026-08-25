@@ -32,7 +32,7 @@ race:
 	$(GO) test -race ./...
 
 fault-test:
-	$(GO) test -race ./controller -shuffle=on -count=10 -run 'Test(ConcurrentReload|ReloadRules|RouteHealth|RaceBoostTargets|Prewarm|ActiveHealth|.*TLS|.*ProxyProtocol|ServerClose)'
+	$(GO) test -race ./controller -shuffle=on -count=10 -run 'Test(ConcurrentReload|ReloadRules|RouteHealth|RaceBoostTargets|CachedBoost|DialBulkhead|Prewarm|ActiveHealth|.*TLS|.*ProxyProtocol|ServerClose)'
 
 vet:
 	$(GO) vet ./...
@@ -47,13 +47,14 @@ config-check:
 	$(GO) run . --config config/setting.json --check-config
 
 bench-check:
-	$(PYTHON) -c 'import py_compile, tempfile; cache = tempfile.TemporaryDirectory(); py_compile.compile("test/bench.py", cfile=cache.name + "/bench.pyc", doraise=True)'
+	$(PYTHON) -c 'import py_compile, tempfile; cache = tempfile.TemporaryDirectory(); py_compile.compile("test/bench.py", cfile=cache.name + "/bench.pyc", doraise=True); py_compile.compile("test/bulk_relay_bench.py", cfile=cache.name + "/bulk_relay_bench.pyc", doraise=True)'
 
 bench-smoke:
 	$(PYTHON) test/bench.py --self-contained --mode normal -c 4 -t 12 --warmup 4 --timeout 2 --min-success-rate 100 --min-warm-throughput-ratio 0.02 --max-warm-p95-ms 500
 	$(PYTHON) test/bench.py --self-contained --mode regex -c 4 -t 12 --warmup 4 --timeout 2 --min-success-rate 100 --min-warm-throughput-ratio 0.02 --max-warm-p95-ms 500
 	$(PYTHON) test/bench.py --self-contained --mode boost -c 4 -t 12 --warmup 4 --timeout 2 --min-success-rate 100 --min-warm-throughput-ratio 0.02 --max-warm-p95-ms 500
 	$(PYTHON) test/bench.py --self-contained --mode roundrobin -c 4 -t 12 --warmup 4 --timeout 2 --min-success-rate 100 --min-warm-throughput-ratio 0.02 --max-warm-p95-ms 500
+	$(PYTHON) test/bulk_relay_bench.py --direction both --concurrency 1 --connections 1 --bytes-per-direction 1MiB --warmup-bytes 64KiB --timeout 30 --min-success-rate 100
 
 cross-build:
 	mkdir -p $(CROSS_BUILD_DIR)

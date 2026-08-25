@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,6 +24,8 @@ const (
 	metricsHandlerDrainTimeout  = 5 * time.Second
 	serverGlobalConnectionLimit = 4_096
 	serverErrorBufferSize       = 257
+	acceptRetryInitialDelay     = 5 * time.Millisecond
+	acceptRetryMaximumDelay     = time.Second
 )
 
 type listenerState struct {
@@ -56,6 +59,7 @@ type Server struct {
 	forceCtx        context.Context
 	forceCancel     context.CancelFunc
 	prewarmDialSem  chan struct{}
+	trafficDials    *dialBulkhead
 	serveCtx        context.Context
 	errCh           chan error
 
@@ -98,6 +102,7 @@ func NewServerWithMetrics(rules []*config.Rule, metricsListen string) (*Server, 
 		forceCtx:        forceCtx,
 		forceCancel:     forceCancel,
 		prewarmDialSem:  make(chan struct{}, prewarmGlobalDialLimit),
+		trafficDials:    newTrafficDialBulkhead(),
 		listenersByKey:  make(map[string]*listenerState, len(rules)),
 		admissionsByKey: make(map[string]*listenerAdmission, len(rules)),
 		retired:         make(map[uint64]*routingGeneration),
@@ -126,7 +131,7 @@ func NewServerWithMetrics(rules []*config.Rule, metricsListen string) (*Server, 
 		s.admissionsByKey[state.key] = admission
 		listenerKeys = append(listenerKeys, state.key)
 	}
-	generation, err := newRoutingGeneration(1, rules, listenerKeys, s.prewarmDialSem)
+	generation, err := newRoutingGeneration(1, rules, listenerKeys, s.prewarmDialSem, s.trafficDials)
 	if err != nil {
 		s.Close()
 		return nil, fmt.Errorf("prepare routing generation: %w", err)
@@ -272,14 +277,43 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) acceptLoop(ctx context.Context, state *listenerState) error {
+	var retryDelay time.Duration
 	for {
 		conn, err := state.listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			if isRetryableAcceptError(err) {
+				if retryDelay == 0 {
+					retryDelay = acceptRetryInitialDelay
+				} else {
+					retryDelay *= 2
+					if retryDelay > acceptRetryMaximumDelay {
+						retryDelay = acceptRetryMaximumDelay
+					}
+				}
+				utils.Logger.Warn("接收连接暂时失败，稍后重试",
+					zap.String("listen", state.key),
+					zap.Duration("retryAfter", retryDelay),
+					zap.Error(err))
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return nil
+				case <-timer.C:
+				}
+				continue
+			}
 			return fmt.Errorf("accept listener %q: %w", state.key, err)
 		}
+		retryDelay = 0
 		generation, binding := s.acquireBinding(state.key)
 		if generation == nil || binding == nil {
 			_ = conn.Close()
@@ -385,6 +419,14 @@ func (s *Server) acceptLoop(ctx context.Context, state *listenerState) error {
 			generation.runtime.dispatch(connectionCtx, preparedConn, rule)
 		}(clientIP)
 	}
+}
+
+func isRetryableAcceptError(err error) bool {
+	if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 func (s *Server) startListenerLocked(state *listenerState) {

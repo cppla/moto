@@ -1,9 +1,7 @@
 {
   "log": {
-    "level": "debug",
-    "path": "./moto.log",
-    "version": "1.0.1",
-    "date": "2024-07-23"
+    "level": "info",
+    "path": "./moto.log"
   },
   "metrics": {
     "enabled": true,
@@ -16,16 +14,23 @@
       "mode": "normal",
       "prewarm": false,
       "timeout": 3000,
+      "healthCheck": {
+        "type": "tcp",
+        "interval": 10000,
+        "timeout": 2000,
+        "failureThreshold": 3,
+        "successThreshold": 2
+      },
       "allowlist": ["127.0.0.0/8", "::1/128"],
       "maxConnections": 4096,
       "maxConnectionsPerIP": 1024,
       "blacklist": null,
       "targets": [
         {
-          "address": "www.baidu.com:80"
+          "address": "183.2.172.177:80"
         },
         {
-          "address": "www.baidu.com:80"
+          "address": "180.101.51.73:80"
         }
       ]
     },
@@ -35,18 +40,25 @@
       "mode": "regex",
       "prewarm": false,
       "timeout": 1000,
+      "healthCheck": {
+        "type": "tcp",
+        "interval": 10000,
+        "timeout": 2000,
+        "failureThreshold": 3,
+        "successThreshold": 2
+      },
       "allowlist": ["127.0.0.0/8", "::1/128"],
       "maxConnections": 4096,
       "maxConnectionsPerIP": 1024,
       "blacklist": null,
       "targets": [
         {
-          "regexp": "^(GET|POST|HEAD|DELETE|PUT|CONNECT|OPTIONS|TRACE)",
-          "address": "www.baidu.com:80"
+          "regexp": "^(GET|POST|HEAD|DELETE|PUT|PATCH|CONNECT|OPTIONS|TRACE) ",
+          "address": "183.2.172.177:80"
         },
         {
-          "regexp": "^SSH",
-          "address": "www.baidu.com:22"
+          "regexp": "^(GET|POST|HEAD|DELETE|PUT|PATCH|CONNECT|OPTIONS|TRACE) ",
+          "address": "180.101.51.73:80"
         }
       ]
     },
@@ -56,22 +68,30 @@
       "mode": "boost",
       "prewarm": false,
       "timeout": 3000,
+      "hedge": {
+        "minDelay": 25,
+        "maxDelay": 250
+      },
+      "healthCheck": {
+        "type": "tcp",
+        "interval": 10000,
+        "timeout": 2000,
+        "failureThreshold": 3,
+        "successThreshold": 2
+      },
       "allowlist": ["127.0.0.0/8", "::1/128"],
       "maxConnections": 4096,
       "maxConnectionsPerIP": 1024,
       "blacklist": null,
       "targets": [
         {
-          "address": "8.130.11.142:85"
+          "address": "84.17.57.26:80"
         },
         {
-          "address": "8.130.55.77:85"
+          "address": "156.146.44.90:80"
         },
         {
-          "address": "8.130.65.34:85"
-        },
-        {
-          "address": "39.104.207.33:85"
+          "address": "84.17.57.27:80"
         }
       ]
     },
@@ -81,22 +101,26 @@
       "mode": "roundrobin",
       "prewarm": false,
       "timeout": 3000,
+      "healthCheck": {
+        "type": "tcp",
+        "interval": 10000,
+        "timeout": 2000,
+        "failureThreshold": 3,
+        "successThreshold": 2
+      },
       "allowlist": ["127.0.0.0/8", "::1/128"],
       "maxConnections": 4096,
       "maxConnectionsPerIP": 1024,
       "blacklist": null,
       "targets": [
         {
-          "address": "8.130.11.142:85"
+          "address": "84.17.57.26:80"
         },
         {
-          "address": "8.130.55.77:85"
+          "address": "156.146.44.90:80"
         },
         {
-          "address": "8.130.65.34:85"
-        },
-        {
-          "address": "39.104.207.33:85"
+          "address": "84.17.57.27:80"
         }
       ]
     }

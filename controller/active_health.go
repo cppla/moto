@@ -124,7 +124,9 @@ func (manager *activeHealthManager) start(parent context.Context, rules []*confi
 	}
 	manager.mu.Lock()
 	for _, job := range jobs {
-		manager.states[job.key] = &activeHealthState{}
+		if manager.states[job.key] == nil {
+			manager.states[job.key] = &activeHealthState{}
+		}
 	}
 	manager.mu.Unlock()
 	manager.wg.Add(len(jobs))
@@ -286,24 +288,21 @@ func dialActiveHealthTarget(ctx context.Context, network, address, proxyProtocol
 	if err != nil {
 		return nil, err
 	}
+	configureTCP(connection)
 	if proxyProtocol == "" {
 		return connection, nil
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := connection.SetWriteDeadline(deadline); err != nil {
-			_ = connection.Close()
-			return nil, fmt.Errorf("set active health PROXY protocol write deadline: %w", err)
-		}
-	}
-	if err := writeActiveHealthProxyProtocol(connection, proxyProtocol); err != nil {
+	if err := writeActiveHealthProxyProtocolContext(ctx, connection, proxyProtocol); err != nil {
 		_ = connection.Close()
 		return nil, err
 	}
-	if err := connection.SetWriteDeadline(time.Time{}); err != nil {
-		_ = connection.Close()
-		return nil, fmt.Errorf("clear active health PROXY protocol write deadline: %w", err)
-	}
 	return connection, nil
+}
+
+func writeActiveHealthProxyProtocolContext(ctx context.Context, connection net.Conn, version string) error {
+	return writeProxyProtocolWithContext(ctx, connection, "active health", func() error {
+		return writeActiveHealthProxyProtocol(connection, version)
+	})
 }
 
 func writeActiveHealthProxyProtocol(connection net.Conn, version string) error {

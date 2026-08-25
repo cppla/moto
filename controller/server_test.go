@@ -10,9 +10,39 @@ import (
 	"net/netip"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+type retryOnceTestListener struct {
+	calls int
+}
+
+func (listener *retryOnceTestListener) Accept() (net.Conn, error) {
+	listener.calls++
+	if listener.calls == 1 {
+		return nil, syscall.EMFILE
+	}
+	return nil, net.ErrClosed
+}
+
+func (*retryOnceTestListener) Close() error   { return nil }
+func (*retryOnceTestListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func TestAcceptLoopRetriesTemporaryFailure(t *testing.T) {
+	listener := &retryOnceTestListener{}
+	server := &Server{}
+	if err := server.acceptLoop(context.Background(), &listenerState{
+		key:      "temporary-listener",
+		listener: listener,
+	}); err != nil {
+		t.Fatalf("acceptLoop() error = %v", err)
+	}
+	if listener.calls != 2 {
+		t.Fatalf("Accept calls = %d, want retry after temporary failure", listener.calls)
+	}
+}
 
 func TestRemoteIPNormalizesIPv4AndIPv6(t *testing.T) {
 	tests := []struct {

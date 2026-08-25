@@ -9,18 +9,19 @@ import (
 
 var (
 	configTopLevelFields = stringSet("log", "metrics", "rules")
-	configLogFields      = stringSet("level", "path", "version", "date")
+	configLogFields      = stringSet("level", "path")
 	configMetricsFields  = stringSet("enabled", "listen")
 	configRuleFields     = stringSet(
 		"name", "listen", "mode", "prewarm", "targets", "timeout",
 		"blacklist", "allowlist", "maxConnections", "maxConnectionsPerIP",
-		"healthCheck", "proxyProtocol",
+		"healthCheck", "hedge", "proxyProtocol",
 	)
 	configTargetFields = stringSet("regexp", "address", "serverNames", "alpn")
 	configHealthFields = stringSet(
 		"type", "interval", "timeout", "failureThreshold", "successThreshold",
 		"path", "statusMin", "statusMax",
 	)
+	configHedgeFields = stringSet("minDelay", "maxDelay")
 	configProxyFields = stringSet("accept", "trustedCIDRs", "send")
 )
 
@@ -96,6 +97,15 @@ func validateStrictConfigJSON(data []byte) error {
 				return objectErr
 			}
 			if err := validateObjectFields(rulePath+".healthCheck", object, configHealthFields); err != nil {
+				return err
+			}
+		}
+		if raw, exists := rule["hedge"]; exists && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			object, objectErr := decodeJSONObject(raw, rulePath+".hedge")
+			if objectErr != nil {
+				return objectErr
+			}
+			if err := validateObjectFields(rulePath+".hedge", object, configHedgeFields); err != nil {
 				return err
 			}
 		}
