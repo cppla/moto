@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"moto/config"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -21,6 +22,7 @@ func resetProcessMetricsForTest() {
 	processMetrics.ruleRefs = make(map[string]int)
 	processMetrics.connectionRefs = make(map[connectionMetricKey]int)
 	processMetrics.dialRefs = make(map[dialMetricKey]int)
+	processMetrics.connectProxyRefs = make(map[connectProxyMetricKey]int)
 	processMetrics.connectionsAccepted = make(map[connectionMetricKey]uint64)
 	processMetrics.connectionsRejected = make(map[rejectionMetricKey]uint64)
 	processMetrics.connectionsActive = make(map[connectionMetricKey]int64)
@@ -44,6 +46,11 @@ func resetProcessMetricsForTest() {
 	processMetrics.boostHedgeDelayCount = make(map[string]uint64)
 	processMetrics.boostDecisionNanos = make(map[string]uint64)
 	processMetrics.boostDecisionCount = make(map[string]uint64)
+	processMetrics.connectProxyAttempts = make(map[connectProxyAttemptMetricKey]uint64)
+	processMetrics.connectProxyHandshakes = make(map[connectProxyAttemptMetricKey]uint64)
+	processMetrics.connectProxySetupNanos = make(map[connectProxyMetricKey]uint64)
+	processMetrics.connectProxySetupCount = make(map[connectProxyMetricKey]uint64)
+	processMetrics.connectProxyFallbacks = make(map[connectProxyFallbackMetricKey]uint64)
 	processMetrics.mu.Unlock()
 	setMetricsGaugeRenderer(nil)
 }
@@ -233,15 +240,115 @@ func TestMetricsOutputIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestConnectProxyMetricsCaptureSetupOutcomeAndFallback(t *testing.T) {
+	resetProcessMetricsForTest()
+	const (
+		ruleName      = "native-connect"
+		targetAddress = "proxy.example:443"
+	)
+	target := &config.Target{
+		Address: targetAddress,
+		ConnectProxy: &config.ConnectProxyConfig{Protocols: []string{
+			config.ConnectProxyH3,
+			config.ConnectProxyH2,
+		}},
+	}
+	rules := []*config.Rule{{Name: ruleName, Targets: []*config.Target{target}}}
+	processMetrics.registerRules(rules)
+	defer processMetrics.unregisterRules(rules)
+
+	manager := newConnectProxyManager()
+	defer manager.close()
+	var peer net.Conn
+	manager.dialers = map[string]connectProxyDialFunc{
+		config.ConnectProxyH3: func(context.Context, *config.Target, string) (net.Conn, error) {
+			return nil, &connectProxyStatusError{protocol: config.ConnectProxyH3, statusCode: http.StatusNotImplemented}
+		},
+		config.ConnectProxyH2: func(context.Context, *config.Target, string) (net.Conn, error) {
+			connection, other := net.Pipe()
+			peer = other
+			return connection, nil
+		},
+	}
+	connection, err := manager.dialForRule(context.Background(), ruleName, target, "destination.example:443")
+	if err != nil {
+		t.Fatalf("dialForRule() error = %v", err)
+	}
+	_ = connection.Close()
+	if peer != nil {
+		_ = peer.Close()
+	}
+	metricConnectProxyHandshake(ruleName, targetAddress, connectProxyAttemptTimeout)
+
+	snapshot := processMetrics.snapshot()
+	h3Attempt := connectProxyAttemptMetricKey{rule: ruleName, target: targetAddress, protocol: config.ConnectProxyH3, outcome: string(connectProxyFailureProtocolUnsupported)}
+	h2Attempt := connectProxyAttemptMetricKey{rule: ruleName, target: targetAddress, protocol: config.ConnectProxyH2, outcome: connectProxyAttemptSuccess}
+	h3Handshake := connectProxyAttemptMetricKey{rule: ruleName, target: targetAddress, protocol: config.ConnectProxyH3, outcome: connectProxyAttemptTimeout}
+	h3Setup := connectProxyMetricKey{rule: ruleName, target: targetAddress, protocol: config.ConnectProxyH3}
+	h2Setup := connectProxyMetricKey{rule: ruleName, target: targetAddress, protocol: config.ConnectProxyH2}
+	fallback := connectProxyFallbackMetricKey{
+		rule: ruleName, target: targetAddress,
+		from: config.ConnectProxyH3, to: config.ConnectProxyH2,
+		reason: connectProxyFallbackStatus501,
+	}
+	if snapshot.connectProxyAttempts[h3Attempt] != 1 || snapshot.connectProxyAttempts[h2Attempt] != 1 {
+		t.Fatalf("CONNECT attempts = %#v, want one H3 status error and one H2 success", snapshot.connectProxyAttempts)
+	}
+	if snapshot.connectProxyHandshakes[h3Handshake] != 1 {
+		t.Fatalf("CONNECT handshakes = %#v, want one physical H3 timeout", snapshot.connectProxyHandshakes)
+	}
+	if snapshot.connectProxySetupCount[h3Setup] != 1 || snapshot.connectProxySetupCount[h2Setup] != 1 {
+		t.Fatalf("CONNECT setup counts = %#v, want one per protocol", snapshot.connectProxySetupCount)
+	}
+	if snapshot.connectProxyFallbacks[fallback] != 1 {
+		t.Fatalf("CONNECT fallbacks = %#v, want one H3-to-H2 status_501 fallback", snapshot.connectProxyFallbacks)
+	}
+
+	beforeAttempts := len(snapshot.connectProxyAttempts)
+	beforeHandshakes := len(snapshot.connectProxyHandshakes)
+	beforeFallbacks := len(snapshot.connectProxyFallbacks)
+	metricConnectProxyAttempt(ruleName, targetAddress, "h4", connectProxyAttemptSuccess, time.Second, true)
+	metricConnectProxyAttempt(ruleName, targetAddress, config.ConnectProxyH2, "destination-controlled", time.Second, true)
+	metricConnectProxyFallback(ruleName, targetAddress, "status_418")
+	metricConnectProxyHandshake(ruleName, targetAddress, "destination-controlled")
+	snapshot = processMetrics.snapshot()
+	if len(snapshot.connectProxyAttempts) != beforeAttempts || len(snapshot.connectProxyHandshakes) != beforeHandshakes ||
+		len(snapshot.connectProxyFallbacks) != beforeFallbacks {
+		t.Fatal("unbounded CONNECT protocol, outcome, or fallback reason created a metric series")
+	}
+
+	body := renderPrometheusMetrics()
+	wants := []string{
+		`moto_connect_proxy_attempts_total{rule="native-connect",target="proxy.example:443",protocol="h3",outcome="protocol_unsupported"} 1` + "\n",
+		`moto_connect_proxy_handshakes_total{rule="native-connect",target="proxy.example:443",protocol="h3",outcome="timeout"} 1` + "\n",
+		`moto_connect_proxy_setup_duration_seconds_count{rule="native-connect",target="proxy.example:443",protocol="h2"} 1` + "\n",
+		`moto_connect_proxy_fallbacks_total{rule="native-connect",target="proxy.example:443",from="h3",to="h2",reason="status_501"} 1` + "\n",
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q\noutput:\n%s", want, body)
+		}
+	}
+}
+
 func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
 	resetProcessMetricsForTest()
 	oldRules := []*config.Rule{{
 		Name: "reload-rule", Mode: config.ModeNormal,
-		Targets: []*config.Target{{Address: "old.example:443"}},
+		Targets: []*config.Target{{
+			Address: "old.example:443",
+			ConnectProxy: &config.ConnectProxyConfig{Protocols: []string{
+				config.ConnectProxyH3,
+				config.ConnectProxyH2,
+			}},
+		}},
 	}}
 	newRules := []*config.Rule{{
 		Name: "reload-rule", Mode: config.ModeBoost,
-		Targets: []*config.Target{{Address: "new.example:443"}},
+		Targets: []*config.Target{{
+			Address:      "new.example:443",
+			ConnectProxy: &config.ConnectProxyConfig{Protocols: []string{config.ConnectProxyH2}},
+		}},
 	}}
 	processMetrics.registerRules(oldRules)
 	processMetrics.registerRules(newRules)
@@ -255,6 +362,11 @@ func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
 	metricBoostHedgeEvent("reload-rule", boostHedgeWon)
 	metricBoostHedgeDelay("reload-rule", time.Millisecond)
 	metricBoostDecisionDuration("reload-rule", 2*time.Millisecond)
+	metricConnectProxyAttempt("reload-rule", "old.example:443", config.ConnectProxyH3, connectProxyAttemptTimeout, 3*time.Millisecond, true)
+	metricConnectProxyHandshake("reload-rule", "old.example:443", connectProxyAttemptTimeout)
+	metricConnectProxyAttempt("reload-rule", "old.example:443", config.ConnectProxyH2, connectProxyAttemptSuccess, 2*time.Millisecond, true)
+	metricConnectProxyFallback("reload-rule", "old.example:443", connectProxyFallbackTimeout)
+	metricConnectProxyAttempt("reload-rule", "new.example:443", config.ConnectProxyH2, connectProxyAttemptSuccess, time.Millisecond, true)
 
 	processMetrics.unregisterRules(oldRules)
 	snapshot := processMetrics.snapshot()
@@ -267,9 +379,29 @@ func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
 	if _, exists := snapshot.dialBulkheadWaitCount[dialMetricKey{rule: "reload-rule", target: "old.example:443"}]; exists {
 		t.Fatal("retired bulkhead target label was retained")
 	}
+	for key := range snapshot.connectProxyAttempts {
+		if key.rule == "reload-rule" && key.target == "old.example:443" {
+			t.Fatal("retired CONNECT attempt labels were retained")
+		}
+	}
+	for key := range snapshot.connectProxyHandshakes {
+		if key.rule == "reload-rule" && key.target == "old.example:443" {
+			t.Fatal("retired CONNECT handshake labels were retained")
+		}
+	}
+	for key := range snapshot.connectProxyFallbacks {
+		if key.rule == "reload-rule" && key.target == "old.example:443" {
+			t.Fatal("retired CONNECT fallback labels were retained")
+		}
+	}
+	if _, exists := snapshot.connectProxySetupCount[connectProxyMetricKey{rule: "reload-rule", target: "old.example:443", protocol: config.ConnectProxyH3}]; exists {
+		t.Fatal("retired CONNECT setup labels were retained")
+	}
 	if snapshot.connectionsAccepted[connectionMetricKey{rule: "reload-rule", mode: config.ModeBoost}] != 1 ||
 		snapshot.dialAttempts[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 ||
-		snapshot.dialBulkheadWaitCount[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 {
+		snapshot.dialBulkheadWaitCount[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 ||
+		snapshot.connectProxyAttempts[connectProxyAttemptMetricKey{rule: "reload-rule", target: "new.example:443", protocol: config.ConnectProxyH2, outcome: connectProxyAttemptSuccess}] != 1 ||
+		snapshot.connectProxySetupCount[connectProxyMetricKey{rule: "reload-rule", target: "new.example:443", protocol: config.ConnectProxyH2}] != 1 {
 		t.Fatal("current generation metrics were removed")
 	}
 	if snapshot.relayBytes[relayMetricKey{rule: "reload-rule", direction: "client_to_target"}] != 1 {
@@ -285,10 +417,128 @@ func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
 	if len(snapshot.connectionsAccepted) != 0 || len(snapshot.dialAttempts) != 0 ||
 		len(snapshot.dialBulkheadWaitCount) != 0 || len(snapshot.relayBytes) != 0 ||
 		len(snapshot.boostHedgeEvents) != 0 || len(snapshot.boostHedgeDelayCount) != 0 ||
-		len(snapshot.boostDecisionCount) != 0 {
+		len(snapshot.boostDecisionCount) != 0 || len(snapshot.connectProxyAttempts) != 0 ||
+		len(snapshot.connectProxyHandshakes) != 0 || len(snapshot.connectProxySetupCount) != 0 ||
+		len(snapshot.connectProxyFallbacks) != 0 {
 		t.Fatalf("retired labels remain: connections=%d dials=%d bulkhead=%d relay=%d hedge=%d",
 			len(snapshot.connectionsAccepted), len(snapshot.dialAttempts),
 			len(snapshot.dialBulkheadWaitCount), len(snapshot.relayBytes), len(snapshot.boostHedgeEvents))
+	}
+}
+
+func TestMetricRegistryBulkConnectProxyLabelReclamation(t *testing.T) {
+	resetProcessMetricsForTest()
+	const (
+		ruleName    = "bulk-connect-reload"
+		targetCount = 512
+	)
+	outcomes := []string{
+		connectProxyAttemptSuccess,
+		connectProxyAttemptStatusError,
+		connectProxyAttemptTransportError,
+		connectProxyAttemptCanceled,
+		connectProxyAttemptTimeout,
+		connectProxyAttemptUnavailable,
+		connectProxyAttemptCooldown,
+		connectProxyAttemptCapacity,
+		string(connectProxyFailurePolicyDenied),
+		string(connectProxyFailureProxyAuth),
+		string(connectProxyFailureRateLimited),
+		string(connectProxyFailureDestinationConnect),
+		string(connectProxyFailureServiceUnavailable),
+		string(connectProxyFailureProtocolUnsupported),
+	}
+	reasons := []string{
+		connectProxyFallbackUnavailable,
+		connectProxyFallbackCooldown,
+		connectProxyFallbackStatus405,
+		connectProxyFallbackStatus501,
+		connectProxyFallbackStatus505,
+		connectProxyFallbackCanceled,
+		connectProxyFallbackTimeout,
+		connectProxyFallbackTransportError,
+	}
+	protocols := []string{config.ConnectProxyH3, config.ConnectProxyH2}
+	oldTargets := make([]*config.Target, 0, targetCount)
+	retainedTargets := make([]*config.Target, 0, targetCount/2)
+	addresses := make([]string, 0, targetCount)
+	for index := 0; index < targetCount; index++ {
+		address := "proxy-" + strconv.Itoa(index) + ".example:443"
+		addresses = append(addresses, address)
+		oldTargets = append(oldTargets, &config.Target{
+			Address:      address,
+			ConnectProxy: &config.ConnectProxyConfig{Protocols: protocols},
+		})
+		if index%2 == 0 {
+			retainedTargets = append(retainedTargets, &config.Target{
+				Address:      address,
+				ConnectProxy: &config.ConnectProxyConfig{Protocols: protocols},
+			})
+		}
+	}
+	oldRules := []*config.Rule{{Name: ruleName, Targets: oldTargets}}
+	retainedRules := []*config.Rule{{Name: ruleName, Targets: retainedTargets}}
+	processMetrics.registerRules(oldRules)
+	processMetrics.registerRules(retainedRules)
+
+	// Populate every bounded outcome and reason so cleanup exercises thousands
+	// of series. Correctness is asserted by set membership, not wall-clock time.
+	for _, address := range addresses {
+		for _, protocol := range protocols {
+			for _, outcome := range outcomes {
+				metricConnectProxyAttempt(ruleName, address, protocol, outcome, time.Millisecond, outcome == connectProxyAttemptSuccess)
+			}
+		}
+		for _, reason := range reasons {
+			metricConnectProxyFallback(ruleName, address, reason)
+		}
+	}
+
+	processMetrics.unregisterRules(oldRules)
+	snapshot := processMetrics.snapshot()
+	retainedCount := targetCount / 2
+	if got, want := len(snapshot.connectProxyAttempts), retainedCount*len(protocols)*len(outcomes); got != want {
+		t.Fatalf("CONNECT attempt series after bulk reload = %d, want %d", got, want)
+	}
+	if got, want := len(snapshot.connectProxySetupCount), retainedCount*len(protocols); got != want {
+		t.Fatalf("CONNECT setup series after bulk reload = %d, want %d", got, want)
+	}
+	if got, want := len(snapshot.connectProxyFallbacks), retainedCount*len(reasons); got != want {
+		t.Fatalf("CONNECT fallback series after bulk reload = %d, want %d", got, want)
+	}
+	for index, address := range addresses {
+		attempt := connectProxyAttemptMetricKey{
+			rule: ruleName, target: address,
+			protocol: config.ConnectProxyH3, outcome: connectProxyAttemptTransportError,
+		}
+		fallback := connectProxyFallbackMetricKey{
+			rule: ruleName, target: address,
+			from: config.ConnectProxyH3, to: config.ConnectProxyH2,
+			reason: connectProxyFallbackTimeout,
+		}
+		_, attemptExists := snapshot.connectProxyAttempts[attempt]
+		_, fallbackExists := snapshot.connectProxyFallbacks[fallback]
+		wantRetained := index%2 == 0
+		if attemptExists != wantRetained || fallbackExists != wantRetained {
+			t.Fatalf("target %q retained attempt=%t fallback=%t, want both %t", address, attemptExists, fallbackExists, wantRetained)
+		}
+	}
+	processMetrics.mu.RLock()
+	refCount := len(processMetrics.connectProxyRefs)
+	processMetrics.mu.RUnlock()
+	if want := retainedCount * len(protocols); refCount != want {
+		t.Fatalf("CONNECT refs after bulk reload = %d, want %d", refCount, want)
+	}
+
+	processMetrics.unregisterRules(retainedRules)
+	snapshot = processMetrics.snapshot()
+	processMetrics.mu.RLock()
+	refCount = len(processMetrics.connectProxyRefs)
+	processMetrics.mu.RUnlock()
+	if refCount != 0 || len(snapshot.connectProxyAttempts) != 0 ||
+		len(snapshot.connectProxySetupCount) != 0 || len(snapshot.connectProxyFallbacks) != 0 {
+		t.Fatalf("CONNECT labels remain after bulk retirement: refs=%d attempts=%d setup=%d fallbacks=%d",
+			refCount, len(snapshot.connectProxyAttempts), len(snapshot.connectProxySetupCount), len(snapshot.connectProxyFallbacks))
 	}
 }
 

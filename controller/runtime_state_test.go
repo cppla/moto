@@ -78,3 +78,11 @@ func TestBoostWinnerGenerationPreventsStaleEviction(t *testing.T) {
 		t.Fatal("winner remained after current-token eviction")
 	}
 }
+
+func TestRoutingRuntimeLinksConnectProxyProtocolPenaltySource(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	if runtime.routes == nil || runtime.routes.protocolPenaltySource == nil {
+		t.Fatal("routing runtime did not link H3 protocol health into route selection")
+	}
+}

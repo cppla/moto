@@ -7,6 +7,7 @@ import (
 	"io"
 	"moto/config"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -56,6 +57,584 @@ func TestBoostRuleKeyIncludesRouteIdentity(t *testing.T) {
 	}
 	if boostRuleKey(base) == boostRuleKey(differentTargets) {
 		t.Fatal("rules with different target sets share a boost cache key")
+	}
+}
+
+func TestDegradedProtocolEvictsCachedWinnerAndFreshRaceUsesHealthyTarget(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule("protocol-penalty-cache", "127.0.0.1:18005", "degraded:443", "healthy:443")
+	runtime.routes = newRouteHealthRegistry(func(_ *config.Rule, target *config.Target, _ time.Time) time.Duration {
+		if target.Address == "degraded:443" {
+			return 2 * time.Second
+		}
+		return 0
+	})
+	key := boostRuleKey(rule)
+	runtime.storeBoostWinner(key, "degraded:443")
+
+	if entry, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
+		t.Fatalf("degraded cached winner remained usable: %+v", entry)
+	}
+	if _, ok := runtime.loadBoostWinnerToken(key); ok {
+		t.Fatal("degraded cached winner was not evicted")
+	}
+
+	var dialed sync.Mutex
+	var addresses []string
+	peers := make(chan net.Conn, 1)
+	winner, err := runtime.raceBoostTargetsPrepared(
+		context.Background(),
+		rule,
+		func(_ context.Context, address string) (net.Conn, error) {
+			dialed.Lock()
+			addresses = append(addresses, address)
+			dialed.Unlock()
+			connection, peer := net.Pipe()
+			peers <- peer
+			return connection, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = winner.conn.Close()
+	_ = (<-peers).Close()
+	if winner.addr != "healthy:443" {
+		t.Fatalf("fresh Boost winner = %q, want healthy:443", winner.addr)
+	}
+	dialed.Lock()
+	defer dialed.Unlock()
+	if len(addresses) != 1 || addresses[0] != "healthy:443" {
+		t.Fatalf("fresh Boost dialed %v, want only healthy target", addresses)
+	}
+}
+
+func TestProtocolPenaltyFailsOpenAfterUnpenalizedTargetIsActivelyUnhealthy(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"protocol-penalty-active-health",
+		"127.0.0.1:18007",
+		"unhealthy-one:443",
+		"unhealthy-two:443",
+		"degraded:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+	check := config.HealthCheckConfig{FailureThreshold: 1, SuccessThreshold: 1}
+	rule.HealthCheck = &check
+	runtime.health.observe(activeHealthKey{rule: rule, address: "unhealthy-one:443"}, check, false)
+	runtime.health.observe(activeHealthKey{rule: rule, address: "unhealthy-two:443"}, check, false)
+	runtime.routes = newRouteHealthRegistry(func(_ *config.Rule, target *config.Target, _ time.Time) time.Duration {
+		if target.Address == "degraded:443" {
+			return 2 * time.Second
+		}
+		return 0
+	})
+
+	var dialed []string
+	var dialedMu sync.Mutex
+	peers := make(chan net.Conn, 1)
+	winner, err := runtime.raceBoostTargetsPrepared(
+		context.Background(),
+		rule,
+		func(_ context.Context, address string) (net.Conn, error) {
+			dialedMu.Lock()
+			dialed = append(dialed, address)
+			dialedMu.Unlock()
+			connection, peer := net.Pipe()
+			peers <- peer
+			return connection, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = winner.conn.Close()
+	_ = (<-peers).Close()
+	if winner.addr != "degraded:443" {
+		t.Fatalf("fail-open winner = %q, want degraded:443", winner.addr)
+	}
+	dialedMu.Lock()
+	defer dialedMu.Unlock()
+	if len(dialed) != 1 || dialed[0] != "degraded:443" {
+		t.Fatalf("dialed targets = %v, want only degraded fail-open target", dialed)
+	}
+}
+
+func TestCachedBoostActiveHealthExclusionDoesNotConsumeTargetAttempt(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"cached-active-health-attempt-budget",
+		"127.0.0.1:18009",
+		"cached-unhealthy:443",
+		"fallback-fails:443",
+		"fallback-works:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+
+	var dialedMu sync.Mutex
+	var dialed []string
+	peers := make(chan net.Conn, 1)
+	outcome, err := runtime.raceCachedBoostTargetWithDial(
+		context.Background(),
+		rule,
+		"cached-unhealthy:443",
+		func(_ context.Context, _ *config.Rule, address string, _ boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+			dialedMu.Lock()
+			dialed = append(dialed, address)
+			dialedMu.Unlock()
+			switch address {
+			case "cached-unhealthy:443":
+				return nil, routeAttempt{}, ErrActiveHealthUnhealthy
+			case "fallback-fails:443":
+				return nil, routeAttempt{}, errors.New("fallback failed")
+			case "fallback-works:443":
+				connection, peer := net.Pipe()
+				peers <- peer
+				return connection, routeAttempt{}, nil
+			default:
+				return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", address)
+			}
+		},
+		nil,
+		0,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = outcome.winner.conn.Close()
+	_ = (<-peers).Close()
+	if outcome.winner.addr != "fallback-works:443" {
+		t.Fatalf("winner = %q, want fallback-works:443", outcome.winner.addr)
+	}
+	dialedMu.Lock()
+	defer dialedMu.Unlock()
+	if len(dialed) != 3 {
+		t.Fatalf("dialed targets = %v, want cached exclusion plus two real attempts", dialed)
+	}
+}
+
+func TestFreshBoostPostAdmissionHealthExclusionReturnsAttemptBudget(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"fresh-active-health-attempt-budget",
+		"127.0.0.1:18010",
+		"health-flips:443",
+		"fallback-fails:443",
+		"fallback-works:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+	check := config.HealthCheckConfig{FailureThreshold: 1, SuccessThreshold: 1}
+	rule.HealthCheck = &check
+
+	peers := make(chan net.Conn, 1)
+	var unhealthyDialed atomic.Bool
+	winner, err := runtime.raceBoostTargetsPreparedWithAdmission(
+		context.Background(),
+		rule,
+		func(_ context.Context, address string) (net.Conn, error) {
+			switch address {
+			case "health-flips:443":
+				unhealthyDialed.Store(true)
+				return nil, errors.New("health-flipped target reached the network dial")
+			case "fallback-fails:443":
+				return nil, errors.New("fallback failed")
+			case "fallback-works:443":
+				connection, peer := net.Pipe()
+				peers <- peer
+				return connection, nil
+			}
+			return nil, fmt.Errorf("unexpected target %s", address)
+		},
+		nil,
+		func(_ context.Context, _ *config.Rule, address string, _ bool) (boostDialRelease, error) {
+			if address == "health-flips:443" {
+				runtime.health.observe(activeHealthKey{rule: rule, address: address}, check, false)
+			}
+			return func() {}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = winner.conn.Close()
+	_ = (<-peers).Close()
+	if winner.addr != "fallback-works:443" {
+		t.Fatalf("winner = %q, want fallback-works:443", winner.addr)
+	}
+	if unhealthyDialed.Load() {
+		t.Fatal("health-flipped target reached the network dial")
+	}
+}
+
+func TestCachedBoostCircuitExclusionDoesNotConsumeTargetAttempt(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"cached-circuit-attempt-budget",
+		"127.0.0.1:18012",
+		"cached-circuit:443",
+		"fallback-fails:443",
+		"fallback-works:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+	peers := make(chan net.Conn, 1)
+	outcome, err := runtime.raceCachedBoostTargetWithDial(
+		context.Background(),
+		rule,
+		"cached-circuit:443",
+		func(_ context.Context, _ *config.Rule, address string, _ boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+			switch address {
+			case "cached-circuit:443":
+				return nil, routeAttempt{}, ErrCircuitOpen
+			case "fallback-fails:443":
+				return nil, routeAttempt{}, errors.New("fallback failed")
+			case "fallback-works:443":
+				connection, peer := net.Pipe()
+				peers <- peer
+				return connection, routeAttempt{}, nil
+			default:
+				return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", address)
+			}
+		},
+		nil,
+		0,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = outcome.winner.conn.Close()
+	_ = (<-peers).Close()
+	if outcome.winner.addr != "fallback-works:443" {
+		t.Fatalf("winner = %q, want fallback-works:443", outcome.winner.addr)
+	}
+}
+
+func TestFreshBoostCircuitClaimReturnsAttemptBudget(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"fresh-circuit-attempt-budget",
+		"127.0.0.1:18013",
+		"circuit-flips:443",
+		"fallback-fails:443",
+		"fallback-works:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+	peers := make(chan net.Conn, 1)
+	winner, err := runtime.raceBoostTargetsPreparedWithAdmission(
+		context.Background(),
+		rule,
+		func(_ context.Context, address string) (net.Conn, error) {
+			switch address {
+			case "circuit-flips:443":
+				return nil, errors.New("circuit-open target reached network dial")
+			case "fallback-fails:443":
+				return nil, errors.New("fallback failed")
+			case "fallback-works:443":
+				connection, peer := net.Pipe()
+				peers <- peer
+				return connection, nil
+			default:
+				return nil, fmt.Errorf("unexpected target %s", address)
+			}
+		},
+		nil,
+		func(_ context.Context, _ *config.Rule, address string, _ bool) (boostDialRelease, error) {
+			if address == "circuit-flips:443" {
+				key := routeHealthKey{rule: boostRuleKey(rule), addr: address}
+				runtime.routes.Lock()
+				state := newRouteHealthState(rule)
+				state.observed = true
+				state.circuitOpen = true
+				state.openUntil = time.Now().Add(time.Minute)
+				runtime.routes.states[key] = state
+				runtime.routes.Unlock()
+			}
+			return func() {}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = winner.conn.Close()
+	_ = (<-peers).Close()
+	if winner.addr != "fallback-works:443" {
+		t.Fatalf("winner = %q, want fallback-works:443", winner.addr)
+	}
+}
+
+func TestCachedBoostTargetSaturationReturnsAttemptBudget(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"cached-target-capacity-attempt-budget",
+		"127.0.0.1:18015",
+		"cached-saturated:443",
+		"fallback-fails:443",
+		"fallback-works:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+	peers := make(chan net.Conn, 1)
+	outcome, err := runtime.raceCachedBoostTargetWithDial(
+		context.Background(),
+		rule,
+		"cached-saturated:443",
+		func(_ context.Context, _ *config.Rule, address string, _ boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+			switch address {
+			case "cached-saturated:443":
+				return nil, routeAttempt{}, &dialBulkheadError{
+					target: address, saturated: true, scope: dialSaturationTarget,
+				}
+			case "fallback-fails:443":
+				return nil, routeAttempt{}, errors.New("fallback failed")
+			case "fallback-works:443":
+				connection, peer := net.Pipe()
+				peers <- peer
+				return connection, routeAttempt{}, nil
+			default:
+				return nil, routeAttempt{}, fmt.Errorf("unexpected target %s", address)
+			}
+		},
+		nil,
+		0,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = outcome.winner.conn.Close()
+	_ = (<-peers).Close()
+	if outcome.winner.addr != "fallback-works:443" {
+		t.Fatalf("winner = %q, want fallback-works:443", outcome.winner.addr)
+	}
+}
+
+func TestFreshBoostTargetSaturationReturnsAttemptBudget(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"fresh-target-capacity-attempt-budget",
+		"127.0.0.1:18016",
+		"target-saturated:443",
+		"fallback-fails:443",
+		"fallback-works:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+	peers := make(chan net.Conn, 1)
+	var saturatedDialed atomic.Bool
+	winner, err := runtime.raceBoostTargetsPreparedWithAdmission(
+		context.Background(),
+		rule,
+		func(_ context.Context, address string) (net.Conn, error) {
+			switch address {
+			case "target-saturated:443":
+				saturatedDialed.Store(true)
+				return nil, errors.New("saturated target reached network dial")
+			case "fallback-fails:443":
+				return nil, errors.New("fallback failed")
+			case "fallback-works:443":
+				connection, peer := net.Pipe()
+				peers <- peer
+				return connection, nil
+			default:
+				return nil, fmt.Errorf("unexpected target %s", address)
+			}
+		},
+		nil,
+		func(_ context.Context, _ *config.Rule, address string, _ bool) (boostDialRelease, error) {
+			if address == "target-saturated:443" {
+				return nil, &dialBulkheadError{
+					target: address, saturated: true, scope: dialSaturationTarget,
+				}
+			}
+			return func() {}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = winner.conn.Close()
+	_ = (<-peers).Close()
+	if winner.addr != "fallback-works:443" {
+		t.Fatalf("winner = %q, want fallback-works:443", winner.addr)
+	}
+	if saturatedDialed.Load() {
+		t.Fatal("per-target saturated address reached network dial")
+	}
+}
+
+func TestProtocolPenaltyEvictionCannotDeleteConcurrentBoostWinner(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule("protocol-penalty-generation", "127.0.0.1:18006", "stale:443", "fresh:443")
+	key := boostRuleKey(rule)
+	stale := runtime.storeBoostWinner(key, "stale:443")
+	var replaced atomic.Bool
+	runtime.routes = newRouteHealthRegistry(func(_ *config.Rule, target *config.Target, _ time.Time) time.Duration {
+		if target.Address == stale.addr && replaced.CompareAndSwap(false, true) {
+			runtime.storeBoostWinner(key, "fresh:443")
+			return time.Second
+		}
+		return 0
+	})
+
+	if _, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
+		t.Fatal("stale degraded winner unexpectedly remained usable")
+	}
+	entry, ok := runtime.loadBoostWinnerToken(key)
+	if !ok || entry.addr != "fresh:443" || entry.generation == stale.generation {
+		t.Fatalf("generation-safe eviction removed concurrent winner: entry=%+v ok=%t", entry, ok)
+	}
+}
+
+func TestProtocolPenaltyCacheEvictionDoesNotConsumeRecoveryCanary(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule("protocol-penalty-canary", "127.0.0.1:18008", "degraded:443", "healthy:443")
+	key := boostRuleKey(rule)
+	runtime.storeBoostWinner(key, "degraded:443")
+	runtime.routes = newRouteHealthRegistry(func(_ *config.Rule, target *config.Target, _ time.Time) time.Duration {
+		if target.Address == "degraded:443" {
+			return 2 * time.Second
+		}
+		return 0
+	})
+	claims := 0
+	runtime.routes.protocolProbeClaim = func(_ *config.Rule, target *config.Target, _ time.Time) (uint64, bool) {
+		claims++
+		return uint64(claims), true
+	}
+
+	if _, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
+		t.Fatal("degraded cached target remained usable")
+	}
+	if claims != 0 {
+		t.Fatalf("cache inspection consumed %d recovery canary claim(s)", claims)
+	}
+}
+
+func TestBoostProtocolCanaryGetsExclusiveSetupAndReleasesLease(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	degraded := &config.Target{
+		Address: "degraded-h3:443",
+		ConnectProxy: &config.ConnectProxyConfig{
+			ServerName: "degraded-h3",
+			Protocols:  []string{config.ConnectProxyH3, config.ConnectProxyH2},
+		},
+	}
+	healthy := &config.Target{Address: "healthy:443"}
+	rule := &config.Rule{
+		Name:     "protocol-canary-release",
+		Listen:   "127.0.0.1:18011",
+		Mode:     config.ModeBoost,
+		Protocol: config.ProtocolSOCKS5,
+		Timeout:  1000,
+		Targets:  []*config.Target{degraded, healthy},
+	}
+	key := http3ConnectTransportKey{address: degraded.Address, serverName: degraded.ConnectProxy.ServerName}
+	runtime.connectProxy.noteHTTP3Degradation(key, http3DegradationReasonSustainedSignals)
+
+	peers := make(chan net.Conn, 1)
+	var healthyDialed atomic.Bool
+	winner, err := runtime.raceBoostTargetsPrepared(
+		context.Background(),
+		rule,
+		func(ctx context.Context, address string) (net.Conn, error) {
+			switch address {
+			case degraded.Address:
+				connection, peer := net.Pipe()
+				peers <- peer
+				return connection, nil
+			case healthy.Address:
+				healthyDialed.Store(true)
+				return nil, errors.New("healthy target raced protocol canary")
+			default:
+				return nil, fmt.Errorf("unexpected target %s", address)
+			}
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = winner.conn.Close()
+	_ = (<-peers).Close()
+	if winner.addr != degraded.Address {
+		t.Fatalf("winner = %q, want recovery canary %q", winner.addr, degraded.Address)
+	}
+	if healthyDialed.Load() {
+		t.Fatal("healthy target raced an exclusive protocol recovery canary")
+	}
+	runtime.connectProxy.h3FallbackMu.Lock()
+	state := *runtime.connectProxy.h3Fallback[key]
+	runtime.connectProxy.h3FallbackMu.Unlock()
+	if state.boostCanaryInFlight || state.boostCanaryToken != 0 || state.lastBoostCanary.IsZero() {
+		t.Fatalf("completed losing canary retained ownership: %+v", state)
+	}
+}
+
+func TestBoostProtocolCanaryFailureRefillsHealthyTarget(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	degraded := &config.Target{
+		Address: "degraded-h3:443",
+		ConnectProxy: &config.ConnectProxyConfig{
+			ServerName: "degraded-h3",
+			Protocols:  []string{config.ConnectProxyH3, config.ConnectProxyH2},
+		},
+	}
+	healthy := &config.Target{Address: "healthy:443"}
+	rule := &config.Rule{
+		Name:     "protocol-canary-fallback",
+		Listen:   "127.0.0.1:18014",
+		Mode:     config.ModeBoost,
+		Protocol: config.ProtocolSOCKS5,
+		Timeout:  1000,
+		Targets:  []*config.Target{degraded, healthy},
+	}
+	key := http3ConnectTransportKey{address: degraded.Address, serverName: degraded.ConnectProxy.ServerName}
+	runtime.connectProxy.noteHTTP3Degradation(key, http3DegradationReasonSustainedSignals)
+
+	var dialedMu sync.Mutex
+	var dialed []string
+	peers := make(chan net.Conn, 1)
+	winner, err := runtime.raceBoostTargetsPrepared(
+		context.Background(),
+		rule,
+		func(_ context.Context, address string) (net.Conn, error) {
+			dialedMu.Lock()
+			dialed = append(dialed, address)
+			dialedMu.Unlock()
+			if address == degraded.Address {
+				return nil, errors.New("canary failed")
+			}
+			connection, peer := net.Pipe()
+			peers <- peer
+			return connection, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = winner.conn.Close()
+	_ = (<-peers).Close()
+	if winner.addr != healthy.Address {
+		t.Fatalf("winner = %q, want healthy fallback %q", winner.addr, healthy.Address)
+	}
+	dialedMu.Lock()
+	defer dialedMu.Unlock()
+	if len(dialed) != 2 || dialed[0] != degraded.Address || dialed[1] != healthy.Address {
+		t.Fatalf("dial order = %v, want exclusive canary then healthy fallback", dialed)
 	}
 }
 
@@ -151,6 +730,130 @@ func TestCachedBoostHardFailureStartsFallbackWithoutHedgeDelay(t *testing.T) {
 	if snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeLaunched}] != 0 ||
 		snapshot.boostHedgeEvents[boostHedgeMetricKey{rule: rule.Name, outcome: boostHedgeWon}] != 0 {
 		t.Fatal("hard-failure fallback was counted as a delayed hedge")
+	}
+}
+
+func TestCachedBoostNeutralConnectFailurePreservesRuleWinner(t *testing.T) {
+	t.Run("alternative succeeds for this destination", func(t *testing.T) {
+		runtime := newRoutingRuntime()
+		defer runtime.stopBackground()
+		rule := boostTestRule("neutral-fallback", "127.0.0.1:18110", "cached:443", "fallback:443")
+		rule.Protocol = config.ProtocolSOCKS5
+		key := boostRuleKey(rule)
+		cachedToken := runtime.storeBoostWinner(key, "cached:443")
+		winnerConn, winnerPeer := net.Pipe()
+		defer winnerPeer.Close()
+
+		outcome, err := runtime.raceCachedBoostTargetWithDial(
+			context.Background(),
+			rule,
+			"cached:443",
+			func(_ context.Context, _ *config.Rule, addr string, _ boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+				if addr == "cached:443" {
+					return nil, routeAttempt{}, &connectProxyStatusError{
+						protocol: config.ConnectProxyH3, statusCode: 403,
+					}
+				}
+				return winnerConn, routeAttempt{}, nil
+			},
+			nil,
+			0,
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("neutral fallback decision: %v", err)
+		}
+		defer outcome.winner.conn.Close()
+		if outcome.cachedFailed || !outcome.cachedFailureNeutral || outcome.winner.addr != "fallback:443" {
+			t.Fatalf("neutral fallback outcome = %+v", outcome)
+		}
+		cacheHit, relayToken := runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, true)
+		if cacheHit || relayToken.generation != 0 {
+			t.Fatalf("neutral fallback cache result = hit:%t token:%+v", cacheHit, relayToken)
+		}
+		entry, ok := runtime.loadBoostWinnerToken(key)
+		if !ok || entry.addr != cachedToken.addr || entry.generation != cachedToken.generation {
+			t.Fatalf("destination fallback replaced rule winner: entry=%+v ok=%t", entry, ok)
+		}
+	})
+
+	t.Run("all destinations return bad gateway", func(t *testing.T) {
+		runtime := newRoutingRuntime()
+		defer runtime.stopBackground()
+		rule := boostTestRule("neutral-all-fail", "127.0.0.1:18111", "cached:443", "fallback:443", "standby:443")
+		rule.Protocol = config.ProtocolSOCKS5
+		key := boostRuleKey(rule)
+		cachedToken := runtime.storeBoostWinner(key, "cached:443")
+
+		outcome, err := runtime.raceCachedBoostTargetWithDial(
+			context.Background(),
+			rule,
+			"cached:443",
+			func(_ context.Context, _ *config.Rule, _ string, _ boostRouteDialOptions) (net.Conn, routeAttempt, error) {
+				return nil, routeAttempt{}, &connectProxyStatusError{
+					protocol: config.ConnectProxyH2, statusCode: 502,
+				}
+			},
+			nil,
+			0,
+			nil,
+		)
+		if err == nil {
+			t.Fatal("all-502 decision unexpectedly succeeded")
+		}
+		if outcome.cachedFailed || !outcome.cachedFailureNeutral {
+			t.Fatalf("all-502 outcome = %+v", outcome)
+		}
+		runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, false)
+		entry, ok := runtime.loadBoostWinnerToken(key)
+		if !ok || entry.addr != cachedToken.addr || entry.generation != cachedToken.generation {
+			t.Fatalf("all-502 decision evicted rule winner: entry=%+v ok=%t", entry, ok)
+		}
+	})
+}
+
+func TestBoostSOCKS5BoundsDistinctTargetsToTwo(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"bounded-native-proxy",
+		"127.0.0.1:18112",
+		"one.example:443",
+		"two.example:443",
+		"three.example:443",
+		"four.example:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+
+	var callsMu sync.Mutex
+	calls := make(map[string]int)
+	connection, err := runtime.raceBoostTargets(context.Background(), rule, func(_ context.Context, addr string) (net.Conn, error) {
+		callsMu.Lock()
+		calls[addr]++
+		callsMu.Unlock()
+		return nil, &connectProxyStatusError{
+			protocol:   config.ConnectProxyH2,
+			target:     addr,
+			statusCode: http.StatusServiceUnavailable,
+		}
+	})
+	if connection.conn != nil {
+		_ = connection.conn.Close()
+		t.Fatal("all-503 Boost race returned a connection")
+	}
+	if err == nil {
+		t.Fatal("all-503 Boost race unexpectedly succeeded")
+	}
+
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if len(calls) != connectProxyMaxTargetAttempts {
+		t.Fatalf("distinct target calls = %v, want exactly %d targets", calls, connectProxyMaxTargetAttempts)
+	}
+	for addr, count := range calls {
+		if count != 1 {
+			t.Fatalf("target %q called %d times, want once", addr, count)
+		}
 	}
 }
 

@@ -19,6 +19,7 @@ type routingRuntime struct {
 	health       *activeHealthManager
 	boost        *boostRuntime
 	prewarm      *prewarmManager
+	connectProxy *connectProxyManager
 	trafficDials *dialBulkhead
 	roundRobin   sync.Map // map[*config.Rule]*atomic.Uint64
 }
@@ -57,16 +58,20 @@ func newRoutingRuntimeWithDialResources(prewarmDialSem chan struct{}, trafficDia
 		trafficDials = newTrafficDialBulkhead()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	connectProxy := newConnectProxyManager()
 	runtime := &routingRuntime{
 		ctx:          ctx,
 		cancel:       cancel,
-		routes:       newRouteHealthRegistry(),
+		routes:       newRouteHealthRegistry(connectProxy.http3RoutePenalty),
 		health:       newActiveHealthManager(),
+		connectProxy: connectProxy,
 		trafficDials: trafficDials,
 		boost: &boostRuntime{
 			cache: &boostWinnerCacheRegistry{entries: make(map[string]boostWinnerEntry)},
 		},
 	}
+	runtime.routes.protocolProbeClaim = connectProxy.claimHTTP3BoostProbe
+	runtime.routes.protocolProbeRelease = connectProxy.releaseHTTP3BoostProbe
 	runtime.prewarm = &prewarmManager{
 		runtime: runtime,
 		pools:   make(map[string]*prewarmPool),
@@ -84,6 +89,7 @@ func (runtime *routingRuntime) stopBackground() {
 	}
 	runtime.prewarm.shutdown()
 	runtime.health.stop()
+	runtime.connectProxy.retire()
 }
 
 type unchangedRulePair struct {
@@ -209,6 +215,7 @@ func (runtime *routingRuntime) clear(rules []*config.Rule) {
 	}
 	runtime.waitBoostRevalidations(rules)
 	runtime.routes.clear(rules)
+	runtime.connectProxy.close()
 
 	runtime.boost.cache.Lock()
 	for _, rule := range rules {

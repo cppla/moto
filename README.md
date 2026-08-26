@@ -12,12 +12,13 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/cppla/moto" alt="License"></a>
 </p>
 
-Moto 是轻量级、自适应的 TCP 网关。应用只连接一个稳定入口，Moto 根据真实拨号延迟、近期故障和转发规则，从多个上游、隧道或跨地域节点中动态选路。
+Moto 是轻量级、自适应的 TCP 网关，也可以把本地 SOCKS5 CONNECT 转换为复用连接的 HTTP/2 或 HTTP/3 CONNECT。应用只连接一个稳定入口，Moto 根据真实连接延迟、近期故障和转发规则，从多个上游、隧道或跨地域节点中动态选路。
 
 ## 为什么是 Moto？
 
-- **自适应选路：** 顺序故障切换、首包与 TLS SNI/ALPN 分类、EWMA 延迟学习、Top-2 竞速、主动健康检查、熔断和恢复探测都在一个进程内完成。
-- **协议透明：** 不终止 TLS、不改写流量，也不要求接入 SDK；HTTP(S)、WebSocket、SSH、SOCKS5 和私有 TCP 协议均可直接使用。
+- **自适应选路：** 顺序故障切换、首包与 TLS SNI/ALPN 分类、线路质量学习、候选竞速、主动健康检查、故障隔离和恢复探测都在一个进程内完成。
+- **协议透明：** 默认 `protocol: "tcp"` 不终止 TLS、不改写流量，也不要求接入 SDK；HTTP(S)、WebSocket、SSH、SOCKS5 和私有 TCP 协议均可直接使用。
+- **SOCKS5 CONNECT 桥接：** `protocol: "socks5"` 接收标准 SOCKS5 CONNECT，向支持 CONNECT 的上游代理发送带可选 Basic Auth 的 HTTP/3 或 HTTP/2 请求；H3 不可用时在同一决策期限内回退 H2。
 - **高效转发：** 稳定字节流直接交给 `io.Copy`；Linux 上符合条件的 TCP→TCP 路径通常由 Go 运行时自动使用 `splice(2)` 零拷贝，不支持时自动回退。
 - **轻而可靠：** 单个 Go 二进制加一份 JSON 即可运行，同时内置严格配置校验、资源上限、访问控制、Prometheus 指标、优雅退出和跨平台发布。
 
@@ -34,7 +35,7 @@ go run . --config config/setting.json --check-config
 go run . --config config/setting.json
 ```
 
-配置路径优先级为 `--config`、`MOTO_CONFIG`、`config/setting.json`。Unix 下发送 `SIGHUP` 会校验并原子切换规则：旧连接继续使用旧规则，新连接只使用新规则；解析、校验或新端口绑定失败时继续运行原配置。最多允许 8 个旧 generation 同时排空，达到上限会拒绝下一次重载；Windows、日志或 metrics 监听变更需要重启。收到 `SIGINT` 或 `SIGTERM` 后，Moto 停止接收新连接，并为现有连接保留最多 10 秒的优雅退出时间。
+配置路径优先级为 `--config`、`MOTO_CONFIG`、`config/setting.json`。Unix 下发送 `SIGHUP` 会校验并原子切换规则：旧连接继续使用旧规则，新连接只使用新规则；解析、校验或新端口绑定失败时继续运行原配置。最多允许 8 个旧 generation 同时排空，达到上限会拒绝下一次重载；generation 本身会等待全部旧连接结束，但退役时会立即关闭空闲 H2/H3 transport，承载活动 CONNECT 的 transport 也会在自己的最后一条 stream 结束时关闭，不会再被同代的无关长连接钉住。Windows、日志或 metrics 监听变更需要重启。收到 `SIGINT` 或 `SIGTERM` 后，Moto 停止接收新连接，并为现有连接保留最多 10 秒的优雅退出时间。
 
 ## 工作方式
 
@@ -51,22 +52,18 @@ flowchart LR
 | --- | --- |
 | `normal` | 按配置顺序连接目标，直到成功 |
 | `regex` | 在最多 4 KiB 的客户端首包中匹配规则，再转发完整字节流 |
-| `boost` | 按 EWMA 评分竞速 Top-2 目标，缓存胜出线路并定期探索；可选自适应延迟备用拨号 |
+| `boost` | 按线路质量竞速候选目标，缓存胜出线路并定期探索；可选延迟备用拨号 |
 | `roundrobin` | 按规则独立轮询；单个目标失败时回退到竞速选择 |
 | `tls` | 解析 ClientHello 的 SNI/ALPN 选路，再原样转发 TLS 字节流 |
 
+`mode` 只决定如何在 targets 之间选路；监听协议由 `protocol` 独立决定。`normal`、`boost` 和 `roundrobin` 都可用于 SOCKS5 → H2/H3 CONNECT。
+
 <details>
-<summary><strong>选路、熔断与预热细节</strong></summary>
+<summary><strong>选路与可靠性</strong></summary>
 
-域名由 Go TCP Dialer 处理，并支持 IPv4/IPv6 快速回退。每条线路记录拨号延迟 EWMA；连续三次拨号失败或连接准备、首包写入等可明确归因于上游的失败后，线路进入 5 秒熔断冷却，重复失败时最长增加到 60 秒。冷却结束只允许一个半开探针，竞速取消的败者不会被误记为故障。稳定转发使用 `io.Copy`，其错误无法可靠区分客户端和上游，因此只进入日志与指标，不参与熔断；这类故障由后续拨号和主动健康检查发现。
+Moto 综合连接质量、近期结果和主动健康状态选择线路，并自动隔离、恢复异常上游。`boost` 与可选 `hedge` 用于降低连接建立的尾延迟，同时保持有界并发，避免故障放大。
 
-`boost` 冷缓存仍然只同时竞速 Top-2。配置 `hedge` 后，热缓存先拨缓存线路；若它在 `clamp(2 × EWMA, minDelay, maxDelay)` 内未完成，再启动一个备用目标，同时在途数仍不超过 2。缓存线路明确失败时不等待延迟，立即补齐备用目标。Hedge 计时从缓存线路通过健康、熔断和前台隔离舱准入后开始；延迟备用只使用立即可得的拨号额度，拿不到时保留主线路且不新增排队者。若主线路随后失败，备用会转为必要故障切换并恢复正常的有界准入等待。省略 `hedge` 完全保留原来的单线路热缓存行为。
-
-Hedge 只竞速 Moto 到上游的 TCP 建连与连接准备，不观察 SOCKS CONNECT、应用首字节或已建立连接的传输速度。命中预热连接时 TCP 建连已经完成，因此该请求通常不会再启动 Hedge；两者分别优化“已有可用连接”和“新建连接尾延迟”，收益不能直接相加。
-
-预热池默认关闭。启用后，每个目标最多 4 个并发补充拨号、进程最多 32 个、单份配置最多 256 个唯一预热目标。Unix 会用非消费式 `MSG_PEEK` 拒绝已收到 FIN/RST 的空闲连接；无法安全探测的平台使用新连接。`MSG_PEEK` 只能判断 TCP 是否已明确关闭，不能识别“socket 仍 open，但应用会话已过期”；启用前必须在同一条连接上等待接近 30 秒后完成真实协议请求，不能只测 TCP connect。线路熔断时旧池会被清空并暂停补充。
-
-前台新建上游连接经过 Server 级拨号隔离舱：同时最多 256 个真实拨号、同一配置目标最多 64 个，额度不足时最多等待 250 ms。热重载前后的 generation 共用同一份额度；预热连接命中不占前台额度，预热补池与 Boost 懒刷新合计使用 32 个独立后台拨号槽，主动健康检查另有 32 个探测槽。本地额度超时不会更新线路失败或抢占半开探针；全局容量已满时立即结束，仅单目标容量已满且全局仍有余量时，才会对其他已配置目标做无排队的立即准入尝试。详见 [拨号隔离舱](docs/dial-bulkhead.md)。
+预热仅适用于确认能够安全复用空闲连接的 TCP 上游。Moto 对前台拨号、后台维护和健康探测实施独立资源限制，以在高并发或上游故障时保护进程稳定性。
 
 </details>
 
@@ -120,18 +117,70 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `mode` | 无 | `normal`、`regex`、`boost`、`roundrobin` 或 `tls` |
+| `protocol` | `tcp` | `tcp` 为透明字节流；`socks5` 解析入站 CONNECT 并使用 target 的 `connectProxy` |
 | `timeout` | `regex` 为 500 ms；其余为 3 s | 拨号或首包决策期限，不限制已建立连接的寿命 |
 | `prewarm` | `false` | 仅在上游允许业务握手前保持空闲 TCP 时启用 |
 | `hedge` | 关闭 | 仅用于至少两个唯一目标的 `boost`；空对象默认延迟范围 25–250 ms，且 `maxDelay` 必须小于规则 `timeout` |
 | `healthCheck` | 关闭 | 可选 TCP 或明文 HTTP 主动探测，达到阈值后暂时排除目标 |
 | `proxyProtocol` | 关闭 | 从可信 CIDR 接收 PROXY v1/v2，或向上游发送 v1/v2 |
+| `userAgent` | 缺省 | 仅用于 `socks5` 规则；从非空数组中为每次入站 SOCKS5 CONNECT 随机选择一个上游 HTTP CONNECT User-Agent |
 | `allowlist` | 空 | CIDR 来源白名单；空值允许所有有效地址 |
 | `blacklist` | 空 | 兼容旧配置的精确 IP 拒绝表 |
 | `maxConnections` | `4096` | 单规则连接上限 |
 | `maxConnectionsPerIP` | `256` | 单 IP、单规则连接上限 |
 | `metrics` | 关闭 | 启用时默认监听 `127.0.0.1:9090` |
 
-配置采用严格校验：未知字段、重复 JSON 键、字段名大小写变体、未知模式、重复规则名或监听地址、非法 CIDR、空目标和非法正则都会阻止启动。所有监听地址会先一次性绑定，任一端口失败都不会留下部分服务继续运行。
+### SOCKS5 → HTTP/3/HTTP/2 CONNECT
+
+SOCKS5 到 H3/H2 CONNECT 的完整规则已经整合到 [config/setting.json](config/setting.json)。部署前请替换每个 target 中的上游代理用户名和密码：
+
+```json
+{
+  "name": "智能加速（SOCKS5 → H3/H2 CONNECT）",
+  "listen": "127.0.0.1:9005",
+  "mode": "boost",
+  "protocol": "socks5",
+  "prewarm": false,
+  "timeout": 3000,
+  "hedge": { "minDelay": 25, "maxDelay": 250 },
+  "healthCheck": { "type": "tcp", "interval": 10000, "timeout": 2000 },
+  "allowlist": ["127.0.0.0/8", "::1/128"],
+  "userAgent": [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:154.0) Gecko/20100101 Firefox/154.0"
+  ],
+  "targets": [
+    {
+      "address": "proxy-a.example.com:443",
+      "connectProxy": {
+        "protocols": ["h3", "h2"],
+        "serverName": "proxy-a.example.com",
+        "basicAuth": {
+          "username": "YOUR_PROXY_USER",
+          "password": "YOUR_PROXY_PASSWORD"
+        }
+      }
+    },
+    {
+      "address": "proxy-b.example.com:443",
+      "connectProxy": {
+        "protocols": ["h3", "h2"],
+        "serverName": "proxy-b.example.com",
+        "basicAuth": {
+          "username": "YOUR_PROXY_USER",
+          "password": "YOUR_PROXY_PASSWORD"
+        }
+      }
+    }
+  ]
+}
+```
+
+`protocols` 按配置顺序尝试。Moto 支持 H3/H2 连接复用、自动故障切换、恢复探测和自适应选路；这些策略由程序内部管理，无需额外调节。Moto 始终校验证书与 `serverName`，上游拒绝也不会被误报为 SOCKS 成功。
+
+`userAgent` 只设置上游 CONNECT 请求头，不代表浏览器 TLS 或 QUIC 指纹。任何支持 SOCKS5 CONNECT 的客户端都可以连接 `127.0.0.1:9005`；当前仅支持 TCP CONNECT。对外监听时必须使用防火墙、VPN 和 `allowlist` 限制来源。
+
+SOCKS5 模式使用独立的协议连接管理，因此必须保持 `prewarm: false`，也不能与 `regex`、`tls`、HTTP health check 或 PROXY protocol 组合。Basic Auth 凭据存放在 JSON 中，应严格限制配置文件权限。Moto 会在启动前校验配置，无效配置不会投入运行。
 
 <details>
 <summary><strong>TLS、健康检查与 PROXY protocol 示例</strong></summary>
@@ -177,7 +226,7 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
 
 - 示例配置只监听 `127.0.0.1` 并关闭预热，但各模式已启用 TCP 健康检查；启动后仍会周期连接配置的外部目标，部署前必须替换为自己的上游。
 - 进程最多同时处理 4,096 条客户端连接；若监听公网地址，应同时配置精确 `allowlist`，并使用防火墙或安全组限制来源。
-- Moto 是透明 TCP 转发器，不替代 TLS、应用认证或网络访问控制；观测端点只能监听数字形式的 loopback 地址。
+- 默认 TCP 规则是透明转发器；SOCKS5 bridge 会解析握手并终止到上游 proxy 的 TLS/QUIC，但不解密隧道内的最终 TLS。两种模式都不替代应用认证或网络访问控制；观测端点只能监听数字形式的 loopback 地址。
 
 ```bash
 curl -fsS http://127.0.0.1:9090/healthz
@@ -185,11 +234,13 @@ curl -fsS http://127.0.0.1:9090/readyz
 curl -fsS http://127.0.0.1:9090/metrics
 ```
 
-`healthz` 表示进程可响应，`readyz` 只在全部转发监听器就绪且未进入关闭流程时成功。Prometheus 指标覆盖 goroutine、连接数、转发字节与错误、拨号成功率与耗时、拨号隔离舱当前占用/等待/拒绝/等待耗时、Boost 缓存与 Hedge 调度/胜出/延迟/决策耗时、线路 EWMA/熔断、主动健康状态、预热池及当前/排空中的配置 generation。
+`healthz` 表示进程可响应，`readyz` 表示服务已准备接收流量。Prometheus 指标覆盖进程资源、连接、流量、路由健康和 CONNECT 运行状态，并限制标签范围，避免暴露客户端请求信息。
 
 ## WebSocket
 
 Moto 在 TCP 层透明支持 `ws://` 和 `wss://`。HTTP Upgrade、TLS 握手和 WebSocket 帧不会被改写，已建立会话也不受规则 `timeout` 限制；通用四种模式均有 Upgrade、文本帧、Ping/Pong 和长连接端到端测试，`tls` 模式另有真实 ClientHello 分片与原字节重放测试。
+
+上述零拷贝和透明 WebSocket 说明针对 `protocol: "tcp"`。SOCKS5 → H2/H3 需要 TLS/QUIC 加密和 HTTP DATA framing，不能使用 TCP→TCP 的 `splice(2)` 零拷贝路径。
 
 长连接会持续占用连接额度，并在 Moto 关闭超过 10 秒后被强制断开。`regex` 只能检查明文 WS 握手前 4 KiB；WSS 的 Host 和路径已加密，但 `tls` 模式可按 SNI/ALPN 分流。WebSocket 规则建议保持 `prewarm: false`。
 
@@ -212,22 +263,31 @@ make build
 <details>
 <summary><strong>Docker 与 systemd</strong></summary>
 
-Docker 镜像以非 root 用户运行，并从 `/etc/moto/setting.json` 读取挂载的配置；TCP 网关在 Linux 上通常直接使用 host network：
+Docker 镜像默认以非 root `65532:65532` 运行，包含系统 CA bundle，并从 `/etc/moto/setting.json` 读取挂载的配置。含 Basic Auth 的配置不要直接用工作区里通常为 `0644` 的文件；Linux 上先建立仅 root 与容器运行组可读的独立副本。当前示例监听 `9001`–`9005`，无需低端口绑定权限：
 
 ```bash
+sudo install -d -o root -g 65532 -m 0750 /etc/moto-container
+sudo install -o root -g 65532 -m 0640 \
+  config/setting.json /etc/moto-container/setting.json
+# 用 sudoedit 替换 Basic Auth
+sudoedit /etc/moto-container/setting.json
 docker build -t moto:local .
 docker run --rm --network host \
-  -v "$PWD/config/setting.json:/etc/moto/setting.json:ro" \
+  --user 65532:65532 \
+  --security-opt no-new-privileges:true \
+  -v /etc/moto-container/setting.json:/etc/moto/setting.json:ro \
   moto:local
 ```
 
-systemd unit 使用动态用户、只读系统目录和最小网络能力，`systemctl reload moto` 会发送 `SIGHUP`：
+systemd unit 使用专用 `moto` 用户、只读系统目录和最小网络能力，`systemctl reload moto` 会发送 `SIGHUP`：
 
 ```bash
 make build
+getent group moto >/dev/null || sudo groupadd --system moto
+id -u moto >/dev/null 2>&1 || sudo useradd --system --gid moto --home-dir /var/lib/moto --shell /usr/sbin/nologin moto
 sudo install -m 0755 bin/moto /usr/local/bin/moto
-sudo install -d -m 0755 /etc/moto
-sudo install -m 0644 config/setting.json /etc/moto/setting.json
+sudo install -d -o root -g moto -m 0750 /etc/moto
+sudo install -o root -g moto -m 0640 config/setting.json /etc/moto/setting.json
 sudo install -m 0644 packaging/moto.service /etc/systemd/system/moto.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now moto
@@ -235,7 +295,7 @@ sudo systemctl enable --now moto
 
 </details>
 
-CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达漏洞、示例配置、TLS/PROXY/热重载端到端测试和四种通用模式的本机闭环 smoke。推送 `v*` tag 会先通过完整门禁，再生成可复现的多平台压缩包、CycloneDX SBOM、SHA-256 校验文件和自动 release notes；归档内含二进制、README、LICENSE、示例配置和 systemd unit。
+CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达漏洞、示例配置、真实 TLS H2/H3 CONNECT、Basic Auth、SOCKS5 回复时序、TLS/PROXY/热重载端到端测试和四种通用模式的本机闭环 smoke。推送 `v*` tag 会先通过完整门禁，再生成可复现的多平台压缩包、CycloneDX SBOM、SHA-256 校验文件和自动 release notes；归档内含二进制、README、LICENSE、示例配置和 systemd unit。
 
 <details>
 <summary><strong>本地回归与性能采样</strong></summary>
@@ -265,7 +325,7 @@ SOCKS5 外部场景也可参数化运行：
 
 ```bash
 python3 test/bench.py \
-  --proxy-host 127.0.0.1 --proxy-port 84 \
+  --proxy-host 127.0.0.1 --proxy-port 9004 \
   --target-host www.baidu.com --target-port 80 \
   --concurrency 50 --total 500 \
   --min-success-rate 99

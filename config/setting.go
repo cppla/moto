@@ -39,6 +39,10 @@ const (
 	ModeBoost           = "boost"
 	ModeRoundRobin      = "roundrobin"
 	ModeTLS             = "tls"
+	ProtocolTCP         = "tcp"
+	ProtocolSOCKS5      = "socks5"
+	ConnectProxyH2      = "h2"
+	ConnectProxyH3      = "h3"
 	HealthCheckTCP      = "tcp"
 	HealthCheckHTTP     = "http"
 	ProxyProtocolV1     = "v1"
@@ -60,6 +64,9 @@ const (
 	maxAccessItems      = 4096
 	maxTLSMatchers      = 64
 	maxConfigFileBytes  = 16 << 20
+	maxBasicCredential  = 4 << 10
+	maxUserAgents       = 64
+	maxUserAgentBytes   = 1024
 )
 
 var validLogLevels = map[string]struct{}{
@@ -78,6 +85,11 @@ var validModes = map[string]struct{}{
 	ModeBoost:      {},
 	ModeRoundRobin: {},
 	ModeTLS:        {},
+}
+
+var validProtocols = map[string]struct{}{
+	ProtocolTCP:    {},
+	ProtocolSOCKS5: {},
 }
 
 // Config is the complete Moto configuration.
@@ -105,11 +117,28 @@ type LogConfig struct {
 // Target is one upstream endpoint. Regexp is used by regex-mode rules and Re
 // holds its validated, compiled form.
 type Target struct {
-	Regexp      string         `json:"regexp"`
-	Re          *regexp.Regexp `json:"-"`
-	Address     string         `json:"address"`
-	ServerNames []string       `json:"serverNames,omitempty"`
-	ALPN        []string       `json:"alpn,omitempty"`
+	Regexp       string              `json:"regexp"`
+	Re           *regexp.Regexp      `json:"-"`
+	Address      string              `json:"address"`
+	ServerNames  []string            `json:"serverNames,omitempty"`
+	ALPN         []string            `json:"alpn,omitempty"`
+	ConnectProxy *ConnectProxyConfig `json:"connectProxy,omitempty"`
+}
+
+// ConnectProxyConfig describes an ordered set of HTTP CONNECT transports for
+// one forward-proxy endpoint. HTTP/3 may be listed ahead of HTTP/2 so a runtime
+// with H3 support can fall back without changing the routing configuration.
+type ConnectProxyConfig struct {
+	Protocols  []string         `json:"protocols"`
+	ServerName string           `json:"serverName,omitempty"`
+	BasicAuth  *BasicAuthConfig `json:"basicAuth,omitempty"`
+}
+
+// BasicAuthConfig is sent only as an outbound Proxy-Authorization header. It
+// is never used for inbound SOCKS authentication.
+type BasicAuthConfig struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 // ProxyProtocolConfig enables trusted inbound PROXY v1/v2 metadata and/or a
@@ -150,6 +179,7 @@ type Rule struct {
 	Name                string               `json:"name"`
 	Listen              string               `json:"listen"`
 	Mode                string               `json:"mode"`
+	Protocol            string               `json:"protocol,omitempty"`
 	Prewarm             bool                 `json:"prewarm"`
 	Targets             []*Target            `json:"targets"`
 	Timeout             uint64               `json:"timeout"`
@@ -160,6 +190,7 @@ type Rule struct {
 	HealthCheck         *HealthCheckConfig   `json:"healthCheck,omitempty"`
 	Hedge               *HedgeConfig         `json:"hedge,omitempty"`
 	ProxyProtocol       *ProxyProtocolConfig `json:"proxyProtocol,omitempty"`
+	UserAgent           []string             `json:"userAgent,omitempty"`
 
 	allowPrefixes []netip.Prefix
 	blockedIPs    map[netip.Addr]struct{}
@@ -399,6 +430,41 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 	if _, ok := validModes[r.Mode]; !ok {
 		return fmt.Errorf("invalid mode %q", r.Mode)
 	}
+	if r.Protocol == "" {
+		r.Protocol = ProtocolTCP
+	}
+	if _, ok := validProtocols[r.Protocol]; !ok {
+		return fmt.Errorf("invalid protocol %q", r.Protocol)
+	}
+	if len(r.UserAgent) != 0 {
+		if r.Protocol != ProtocolSOCKS5 {
+			return errors.New("userAgent is only valid for protocol socks5")
+		}
+		if err := validateUserAgents(r.UserAgent); err != nil {
+			return err
+		}
+	}
+	if r.Protocol == ProtocolSOCKS5 {
+		if r.Mode == ModeRegex || r.Mode == ModeTLS {
+			return fmt.Errorf("protocol %q is not compatible with mode %q", r.Protocol, r.Mode)
+		}
+		if len(r.Allowlist) == 0 {
+			host, _, splitErr := net.SplitHostPort(r.Listen)
+			listenAddr, parseErr := netip.ParseAddr(host)
+			if splitErr != nil || parseErr != nil || !listenAddr.Unmap().IsLoopback() {
+				return errors.New("protocol socks5 on a non-loopback listener requires an explicit non-empty allowlist")
+			}
+		}
+		if r.Prewarm {
+			return errors.New("protocol socks5 cannot use prewarm")
+		}
+		if r.HealthCheck != nil && strings.ToLower(strings.TrimSpace(r.HealthCheck.Type)) == HealthCheckHTTP {
+			return errors.New("protocol socks5 cannot use HTTP healthCheck; use a TCP endpoint check")
+		}
+		if r.ProxyProtocol != nil {
+			return errors.New("protocol socks5 cannot use proxyProtocol")
+		}
+	}
 	if len(r.Targets) == 0 {
 		return errors.New("targets must not be empty")
 	}
@@ -468,7 +534,21 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		if err := validateEndpoint("address", target.Address); err != nil {
 			return fmt.Errorf("targets[%d]: %w", i, err)
 		}
+		_, duplicateTarget := uniqueTargets[target.Address]
 		uniqueTargets[target.Address] = struct{}{}
+		if r.Protocol == ProtocolSOCKS5 {
+			if duplicateTarget {
+				return fmt.Errorf("targets[%d]: protocol socks5 requires unique target addresses", i)
+			}
+			if target.ConnectProxy == nil {
+				return fmt.Errorf("targets[%d]: connectProxy is required for protocol socks5", i)
+			}
+			if err := target.ConnectProxy.Validate(); err != nil {
+				return fmt.Errorf("targets[%d].connectProxy: %w", i, err)
+			}
+		} else if target.ConnectProxy != nil {
+			return fmt.Errorf("targets[%d]: connectProxy is only valid for protocol socks5", i)
+		}
 		target.Re = nil
 		if r.Mode == ModeRegex {
 			compiled, err := regexp.Compile(target.Regexp)
@@ -525,6 +605,93 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		}
 	}
 	r.blockedIPs = blocked
+	return nil
+}
+
+func validateUserAgents(userAgents []string) error {
+	if len(userAgents) > maxUserAgents {
+		return fmt.Errorf("userAgent must not contain more than %d entries", maxUserAgents)
+	}
+	seen := make(map[string]struct{}, len(userAgents))
+	for index, userAgent := range userAgents {
+		if len(userAgent) == 0 || len(userAgent) > maxUserAgentBytes {
+			return fmt.Errorf("userAgent[%d] length must be between 1 and %d bytes", index, maxUserAgentBytes)
+		}
+		if userAgent != strings.TrimSpace(userAgent) {
+			return fmt.Errorf("userAgent[%d] must not have leading or trailing whitespace", index)
+		}
+		for _, value := range []byte(userAgent) {
+			if value < 0x20 || value > 0x7e {
+				return fmt.Errorf("userAgent[%d] must contain only printable ASCII", index)
+			}
+		}
+		if _, duplicate := seen[userAgent]; duplicate {
+			return fmt.Errorf("userAgent[%d]: duplicate value", index)
+		}
+		seen[userAgent] = struct{}{}
+	}
+	return nil
+}
+
+// Validate normalizes and checks an ordered CONNECT transport preference.
+func (c *ConnectProxyConfig) Validate() error {
+	if c == nil {
+		return errors.New("connect proxy config is nil")
+	}
+	if len(c.Protocols) == 0 {
+		c.Protocols = []string{ConnectProxyH2}
+	}
+	if len(c.Protocols) > 2 {
+		return errors.New("protocols must not contain more than h3 and h2")
+	}
+	seen := make(map[string]struct{}, len(c.Protocols))
+	for i, protocol := range c.Protocols {
+		if protocol != ConnectProxyH2 && protocol != ConnectProxyH3 {
+			return fmt.Errorf("protocols[%d]: invalid protocol %q", i, protocol)
+		}
+		if _, duplicate := seen[protocol]; duplicate {
+			return fmt.Errorf("protocols[%d]: duplicate protocol %q", i, protocol)
+		}
+		seen[protocol] = struct{}{}
+	}
+	if strings.TrimSpace(c.ServerName) != c.ServerName {
+		return errors.New("serverName must not contain leading or trailing whitespace")
+	}
+	if c.ServerName != "" && net.ParseIP(c.ServerName) == nil {
+		c.ServerName = strings.ToLower(c.ServerName)
+		if strings.Contains(c.ServerName, "*") {
+			return errors.New("serverName must not contain a wildcard")
+		}
+		if err := validateTLSServerNamePattern(c.ServerName); err != nil {
+			return fmt.Errorf("invalid serverName: %w", err)
+		}
+	}
+	if c.BasicAuth != nil {
+		if err := c.BasicAuth.Validate(); err != nil {
+			return fmt.Errorf("basicAuth: %w", err)
+		}
+	}
+	return nil
+}
+
+// Validate rejects credentials that could produce ambiguous Basic auth data or
+// unbounded request headers.
+func (c *BasicAuthConfig) Validate() error {
+	if c == nil {
+		return errors.New("basic auth config is nil")
+	}
+	if c.Username == "" {
+		return errors.New("username must not be empty")
+	}
+	if strings.Contains(c.Username, ":") {
+		return errors.New("username must not contain ':'")
+	}
+	if strings.ContainsAny(c.Username+c.Password, "\x00\r\n") {
+		return errors.New("credentials must not contain NUL, CR, or LF")
+	}
+	if len(c.Username)+len(c.Password) > maxBasicCredential {
+		return fmt.Errorf("credentials must not exceed %d bytes", maxBasicCredential)
+	}
 	return nil
 }
 

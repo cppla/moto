@@ -203,6 +203,81 @@ func TestRouteHealthCancelledProbeIsNeutralAndReleasesClaim(t *testing.T) {
 	}
 }
 
+func TestRouteReachableObservationClearsFailuresWithoutUpdatingEWMA(t *testing.T) {
+	resetRouteHealthForTest()
+	rule := routeHealthTestRule("one:1")
+	now := time.Date(2026, 8, 18, 10, 2, 35, 0, time.UTC)
+	observeRoute(t, rule, "one:1", 25*time.Millisecond, nil, now)
+
+	relayAttempt, err := routeBegin(rule, "one:1", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(relayAttempt, 30*time.Millisecond, nil, now.Add(time.Second))
+	routeReportFailure(relayAttempt, errors.New("relay failed"), now.Add(time.Second))
+	observeRoute(t, rule, "one:1", 40*time.Millisecond, errors.New("dial failed"), now.Add(2*time.Second))
+	before := routeSnapshot(rule, "one:1", now.Add(2*time.Second))
+	if before.ConsecutiveFailures != 1 || before.EWMA != 26*time.Millisecond {
+		t.Fatalf("snapshot before reachable response = %+v, want one failure and 26ms EWMA", before)
+	}
+
+	reachableAttempt, err := routeBegin(rule, "one:1", now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(
+		reachableAttempt,
+		2*time.Second,
+		fmt.Errorf("CONNECT returned a destination error: %w", errRouteReachable),
+		now.Add(3*time.Second),
+	)
+	after := routeSnapshot(rule, "one:1", now.Add(3*time.Second))
+	if after.ConsecutiveFailures != 0 || after.CircuitOpen || after.HalfOpen ||
+		!after.OpenUntil.IsZero() || after.Cooldown != 0 {
+		t.Fatalf("reachable response did not clear route failure state: %+v", after)
+	}
+	if after.EWMA != before.EWMA || after.HasEWMA != before.HasEWMA {
+		t.Fatalf("reachable response changed EWMA: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestRouteReachableHalfOpenProbeRecoversCircuit(t *testing.T) {
+	resetRouteHealthForTest()
+	rule := routeHealthTestRule("one:1")
+	now := time.Date(2026, 8, 18, 10, 2, 40, 0, time.UTC)
+	observeRoute(t, rule, "one:1", 20*time.Millisecond, nil, now)
+
+	staleAttempt, err := routeBegin(rule, "one:1", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tripRoute(t, rule, "one:1", now.Add(2*time.Second))
+	probeTime := now.Add(2*time.Second + routeInitialCooldown)
+	probe, err := routeBegin(rule, "one:1", probeTime)
+	if err != nil {
+		t.Fatalf("half-open routeBegin() = %v", err)
+	}
+	routeObserve(probe, 3*time.Second, fmt.Errorf("HTTP 503 service unavailable: %w", errRouteReachable), probeTime)
+
+	snapshot := routeSnapshot(rule, "one:1", probeTime)
+	if snapshot.CircuitOpen || snapshot.HalfOpen || snapshot.ProbeRequired ||
+		snapshot.ConsecutiveFailures != 0 || !snapshot.OpenUntil.IsZero() || snapshot.Cooldown != 0 {
+		t.Fatalf("reachable half-open response did not recover route: %+v", snapshot)
+	}
+	if snapshot.EWMA != 20*time.Millisecond {
+		t.Fatalf("reachable half-open response EWMA = %s, want existing 20ms", snapshot.EWMA)
+	}
+
+	// An attempt admitted before the circuit opened must not undo the recovery.
+	routeObserve(staleAttempt, time.Second, errors.New("late transport failure"), probeTime.Add(time.Second))
+	if snapshot = routeSnapshot(rule, "one:1", probeTime.Add(time.Second)); snapshot.CircuitOpen || snapshot.ConsecutiveFailures != 0 {
+		t.Fatalf("stale failure changed reachable recovery: %+v", snapshot)
+	}
+	if _, err := routeBegin(rule, "one:1", probeTime.Add(time.Second)); err != nil {
+		t.Fatalf("routeBegin() after reachable recovery = %v", err)
+	}
+}
+
 func TestRouteHealthIgnoresOutOfOrderPreCircuitResults(t *testing.T) {
 	resetRouteHealthForTest()
 	rule := routeHealthTestRule("one:1")
@@ -390,6 +465,111 @@ func TestSelectRouteTargetsKeepsBestAndRotatesUnobserved(t *testing.T) {
 	assertRouteAddresses(t, selectRouteTargets(rule, 2, now.Add(2*time.Second)), "best:1", "cancelled:1")
 }
 
+func TestSelectTargetsExcludingDefersProtocolPenaltyUntilHealthyAlternativesExhausted(t *testing.T) {
+	rule := routeHealthTestRule("degraded-h3:443", "healthy-one:443", "healthy-two:443")
+	now := time.Date(2026, 8, 26, 7, 0, 0, 0, time.UTC)
+	var registry *routeHealthRegistry
+	registry = newRouteHealthRegistry(func(_ *config.Rule, target *config.Target, _ time.Time) time.Duration {
+		// The protocol source owns another lock domain. Prove selection invokes it
+		// before routeHealthRegistry.Lock instead of nesting the locks.
+		if !registry.TryLock() {
+			t.Fatal("protocol penalty source was called while the route registry was locked")
+		}
+		registry.Unlock()
+		if target.Address == "degraded-h3:443" {
+			return 4 * time.Second
+		}
+		return 0
+	})
+
+	latencies := map[string]time.Duration{
+		"degraded-h3:443": 5 * time.Millisecond,
+		"healthy-one:443": 80 * time.Millisecond,
+		"healthy-two:443": 120 * time.Millisecond,
+	}
+	for address, latency := range latencies {
+		attempt, err := registry.begin(rule, address, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routeObserve(attempt, latency, nil, now)
+	}
+
+	selected := registry.selectTargetsExcluding(rule, 2, now, nil)
+	assertRouteAddresses(t, selected, "healthy-one:443", "healthy-two:443")
+
+	// Once both healthy alternatives have been attempted, fail open to the
+	// degraded route instead of pretending that no upstream remains.
+	excluded := map[string]struct{}{
+		"healthy-one:443": {},
+		"healthy-two:443": {},
+	}
+	selected = registry.selectTargetsExcluding(rule, 2, now, excluded)
+	assertRouteAddresses(t, selected, "degraded-h3:443")
+	if snapshot := registry.snapshot(rule, "degraded-h3:443", now); snapshot.ConsecutiveFailures != 0 || snapshot.CircuitOpen {
+		t.Fatalf("protocol penalty mutated target circuit state: %+v", snapshot)
+	}
+}
+
+func TestSelectTargetsExcludingReservesOnePenalizedProtocolCanary(t *testing.T) {
+	rule := routeHealthTestRule("degraded-h3:443", "healthy-one:443", "healthy-two:443")
+	now := time.Date(2026, 8, 26, 7, 30, 0, 0, time.UTC)
+	registry := newRouteHealthRegistry(func(_ *config.Rule, target *config.Target, _ time.Time) time.Duration {
+		if target.Address == "degraded-h3:443" {
+			return 2 * time.Second
+		}
+		return 0
+	})
+	claimed := false
+	released := false
+	registry.protocolProbeClaim = func(_ *config.Rule, target *config.Target, _ time.Time) (uint64, bool) {
+		if target.Address != "degraded-h3:443" || claimed {
+			return 0, false
+		}
+		claimed = true
+		return 1, true
+	}
+	registry.protocolProbeRelease = func(_ *config.Rule, target *config.Target, token uint64) {
+		if target.Address != "degraded-h3:443" || token != 1 {
+			t.Errorf("released protocol probe target=%q token=%d", target.Address, token)
+		}
+		released = true
+	}
+
+	selections := registry.selectTargetSelectionsExcluding(rule, 2, now, nil)
+	assertRouteSelectionAddresses(t, selections, "degraded-h3:443", "healthy-one:443")
+	registry.releaseProtocolProbe(rule, selections[0].target, selections[0].protocolProbe)
+	if !released {
+		t.Fatal("protocol canary ownership was not released")
+	}
+	selections = registry.selectTargetSelectionsExcluding(rule, 2, now, nil)
+	assertRouteSelectionAddresses(t, selections, "healthy-one:443", "healthy-two:443")
+}
+
+func TestSelectTargetsExcludingAddsProtocolPenaltyToFailOpenScore(t *testing.T) {
+	rule := routeHealthTestRule("lower-wire-latency:443", "lower-penalty:443")
+	now := time.Date(2026, 8, 26, 7, 1, 0, 0, time.UTC)
+	registry := newRouteHealthRegistry(func(_ *config.Rule, target *config.Target, _ time.Time) time.Duration {
+		if target.Address == "lower-wire-latency:443" {
+			return 4 * time.Second
+		}
+		return time.Second
+	})
+	for address, latency := range map[string]time.Duration{
+		"lower-wire-latency:443": 5 * time.Millisecond,
+		"lower-penalty:443":      500 * time.Millisecond,
+	} {
+		attempt, err := registry.begin(rule, address, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routeObserve(attempt, latency, nil, now)
+	}
+
+	selected := registry.selectTargetsExcluding(rule, 1, now, nil)
+	assertRouteAddresses(t, selected, "lower-penalty:443")
+}
+
 func assertRouteAddresses(t *testing.T, targets []*config.Target, want ...string) {
 	t.Helper()
 	if len(targets) != len(want) {
@@ -398,6 +578,18 @@ func assertRouteAddresses(t *testing.T, targets []*config.Target, want ...string
 	for i, target := range targets {
 		if target.Address != want[i] {
 			t.Fatalf("target[%d] = %q, want %q", i, target.Address, want[i])
+		}
+	}
+}
+
+func assertRouteSelectionAddresses(t *testing.T, selections []routeTargetSelection, want ...string) {
+	t.Helper()
+	if len(selections) != len(want) {
+		t.Fatalf("selected %d targets, want %d", len(selections), len(want))
+	}
+	for index, selection := range selections {
+		if selection.target.Address != want[index] {
+			t.Fatalf("selection[%d] = %q, want %q", index, selection.target.Address, want[index])
 		}
 	}
 }

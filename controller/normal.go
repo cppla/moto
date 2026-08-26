@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"moto/config"
 	"moto/utils"
 	"net"
@@ -23,6 +24,7 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 		ctx = context.Background()
 	}
 	defer conn.Close()
+	defer failPendingSOCKS5(conn)
 	dialCtx := ctx
 	cancelDial := func() {}
 	if rule.Timeout > 0 {
@@ -32,12 +34,22 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 
 	var target net.Conn
 	var targetAttempt routeAttempt
+	var dialFailures []error
+	lastFailedTarget := ""
+	targetAttempts := 0
+	targetAttemptLimit := connectProxyTargetAttemptLimit(rule)
 	tryCapacityFallback := false
 	for _, candidate := range rule.Targets {
+		if targetAttempts >= targetAttemptLimit {
+			break
+		}
+		targetAttempts++
 		candidateConn, attempt, err := runtime.outboundDialRouteWithOptions(
 			dialCtx, rule, candidate.Address, tryCapacityFallback, nil,
 		)
 		if err != nil {
+			dialFailures = append(dialFailures, err)
+			lastFailedTarget = candidate.Address
 			if isDialBulkheadError(err) {
 				if isDialTargetBulkheadSaturation(err) {
 					tryCapacityFallback = true
@@ -53,11 +65,13 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 					zap.Error(err))
 				return
 			}
-			utils.Logger.Error("无法建立连接，尝试下一个目标",
-				zap.String("ruleName", rule.Name),
-				zap.String("remoteAddr", connAddr(conn)),
-				zap.String("targetAddr", candidate.Address),
-				zap.Error(err))
+			if rule.Protocol != config.ProtocolSOCKS5 {
+				utils.Logger.Error("无法建立连接，尝试下一个目标",
+					zap.String("ruleName", rule.Name),
+					zap.String("remoteAddr", connAddr(conn)),
+					zap.String("targetAddr", candidate.Address),
+					zap.Error(err))
+			}
 			continue
 		}
 		configureTCP(candidateConn)
@@ -75,12 +89,21 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 		break
 	}
 	if target == nil {
-		utils.Logger.Error("所有目标均连接失败，无法处理连接",
-			zap.String("ruleName", rule.Name),
-			zap.String("remoteAddr", connAddr(conn)))
+		finalErr := errors.Join(dialFailures...)
+		if rule.Protocol == config.ProtocolSOCKS5 {
+			setPendingSOCKS5Failure(conn, finalErr)
+			logConnectProxyFailure(rule, lastFailedTarget, finalErr, "所有原生代理目标均连接失败")
+		} else {
+			utils.Logger.Error("所有目标均连接失败，无法处理连接",
+				zap.String("ruleName", rule.Name),
+				zap.String("remoteAddr", connAddr(conn)))
+		}
 		return
 	}
 	defer target.Close()
+	if err := markSOCKS5Connected(conn); err != nil {
+		return
+	}
 
 	utils.Logger.Debug("建立连接",
 		zap.String("ruleName", rule.Name),

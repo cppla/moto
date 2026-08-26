@@ -10,7 +10,7 @@
   "rules": [
     {
       "name": "正常模式",
-      "listen": "127.0.0.1:81",
+      "listen": "127.0.0.1:9001",
       "mode": "normal",
       "prewarm": false,
       "timeout": 3000,
@@ -36,7 +36,7 @@
     },
     {
       "name": "正则模式",
-      "listen": "127.0.0.1:82",
+      "listen": "127.0.0.1:9002",
       "mode": "regex",
       "prewarm": false,
       "timeout": 1000,
@@ -64,7 +64,7 @@
     },
     {
       "name": "智能加速",
-      "listen": "127.0.0.1:83",
+      "listen": "127.0.0.1:9003",
       "mode": "boost",
       "prewarm": false,
       "timeout": 3000,
@@ -89,15 +89,12 @@
         },
         {
           "address": "156.146.44.90:80"
-        },
-        {
-          "address": "84.17.57.27:80"
         }
       ]
     },
     {
       "name": "轮询模式",
-      "listen": "127.0.0.1:84",
+      "listen": "127.0.0.1:9004",
       "mode": "roundrobin",
       "prewarm": false,
       "timeout": 3000,
@@ -118,9 +115,63 @@
         },
         {
           "address": "156.146.44.90:80"
+        }
+      ]
+    },
+    {
+      "name": "SOCKS5 to H3/H2",
+      "listen": "127.0.0.1:9005",
+      "mode": "boost",
+      "protocol": "socks5",
+      "prewarm": false,
+      "timeout": 10000,
+      "hedge": {
+        "minDelay": 25,
+        "maxDelay": 250
+      },
+      "healthCheck": {
+        "type": "tcp",
+        "interval": 10000,
+        "timeout": 2000,
+        "failureThreshold": 3,
+        "successThreshold": 2
+      },
+      "allowlist": ["127.0.0.0/8", "::1/128"],
+      "maxConnections": 4096,
+      "maxConnectionsPerIP": 1024,
+      "blacklist": null,
+      "userAgent": [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.2 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:154.0) Gecko/20100101 Firefox/154.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/150.0.0.0 Mobile/15E148 Safari/604.1"
+      ],
+      "targets": [
+        {
+          "address": "proxy-a.example.com:443",
+          "connectProxy": {
+            "protocols": ["h3", "h2"],
+            "serverName": "proxy-a.example.com",
+            "basicAuth": {
+              "username": "a",
+              "password": "a"
+            }
+          }
         },
         {
-          "address": "84.17.57.27:80"
+          "address": "proxy-b.example.com:443",
+          "connectProxy": {
+            "protocols": ["h3", "h2"],
+            "serverName": "proxy-b.example.com",
+            "basicAuth": {
+              "username": "b",
+              "password": "b"
+            }
+          }
         }
       ]
     }

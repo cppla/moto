@@ -26,3 +26,6 @@ moto
 /bin/
 # moto log
 moto.log
+
+# Local protocol integration fixtures
+/test/native_proxy/

@@ -3,6 +3,7 @@ package controller
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -380,6 +381,93 @@ func TestActiveHealthManagerPassesOutboundProxyProtocol(t *testing.T) {
 	}
 	cancel()
 	manager.stop()
+}
+
+func TestActiveHealthTCPFailureDoesNotExcludeHTTP3CapableTarget(t *testing.T) {
+	tests := []struct {
+		name           string
+		protocols      []string
+		wantUnhealthy  bool
+		wantConclusive bool
+	}{
+		{
+			name:           "h2-only",
+			protocols:      []string{config.ConnectProxyH2},
+			wantUnhealthy:  true,
+			wantConclusive: true,
+		},
+		{
+			name:           "h3-only",
+			protocols:      []string{config.ConnectProxyH3},
+			wantUnhealthy:  false,
+			wantConclusive: false,
+		},
+		{
+			name:           "h3-with-h2-fallback",
+			protocols:      []string{config.ConnectProxyH3, config.ConnectProxyH2},
+			wantUnhealthy:  false,
+			wantConclusive: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rule := &config.Rule{
+				Name:                "native-health-" + test.name,
+				Listen:              "127.0.0.1:18080",
+				Mode:                config.ModeNormal,
+				Protocol:            config.ProtocolSOCKS5,
+				Timeout:             1_000,
+				MaxConnections:      16,
+				MaxConnectionsPerIP: 16,
+				HealthCheck: &config.HealthCheckConfig{
+					Type:             config.HealthCheckTCP,
+					Interval:         250,
+					Timeout:          100,
+					FailureThreshold: 1,
+					SuccessThreshold: 1,
+				},
+				Targets: []*config.Target{{
+					Address: "127.0.0.1:9",
+					ConnectProxy: &config.ConnectProxyConfig{
+						Protocols: test.protocols,
+					},
+				}},
+			}
+			if err := rule.Validate(); err != nil {
+				t.Fatalf("validate test rule: %v", err)
+			}
+			if got := activeHealthFailureConclusive(rule, rule.Targets[0]); got != test.wantConclusive {
+				t.Fatalf("failure conclusive = %v, want %v", got, test.wantConclusive)
+			}
+
+			manager := newActiveHealthManager()
+			manager.initialDelay = func(time.Duration) time.Duration { return 0 }
+			cycleDone := make(chan struct{})
+			var cycleOnce sync.Once
+			manager.nextDelay = func(time.Duration) time.Duration {
+				cycleOnce.Do(func() { close(cycleDone) })
+				return time.Hour
+			}
+			manager.probe = func(context.Context, string, config.HealthCheckConfig, string) error {
+				return errors.New("synthetic TCP failure")
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			manager.start(ctx, []*config.Rule{rule})
+			select {
+			case <-cycleDone:
+			case <-time.After(2 * time.Second):
+				cancel()
+				manager.stop()
+				t.Fatal("active health cycle did not finish")
+			}
+			if got := manager.unhealthy(rule, rule.Targets[0].Address); got != test.wantUnhealthy {
+				t.Fatalf("unhealthy = %v, want %v", got, test.wantUnhealthy)
+			}
+			cancel()
+			manager.stop()
+		})
+	}
 }
 
 func TestActiveHealthDisabledRuleStartsNoChecker(t *testing.T) {

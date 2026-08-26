@@ -39,10 +39,11 @@ type activeHealthState struct {
 }
 
 type activeHealthJob struct {
-	key           activeHealthKey
-	target        string
-	check         config.HealthCheckConfig
-	proxyProtocol string
+	key               activeHealthKey
+	target            string
+	check             config.HealthCheckConfig
+	proxyProtocol     string
+	failureConclusive bool
 }
 
 type activeHealthProbeFunc func(context.Context, string, config.HealthCheckConfig, string) error
@@ -96,7 +97,7 @@ func (manager *activeHealthManager) start(parent context.Context, rules []*confi
 	manager.cancel = cancel
 
 	jobs := make([]activeHealthJob, 0)
-	seen := make(map[activeHealthKey]struct{})
+	seen := make(map[activeHealthKey]int)
 	for _, rule := range rules {
 		if rule == nil || rule.HealthCheck == nil {
 			continue
@@ -106,19 +107,25 @@ func (manager *activeHealthManager) start(parent context.Context, rules []*confi
 				continue
 			}
 			key := activeHealthKey{rule: rule, address: target.Address}
-			if _, duplicate := seen[key]; duplicate {
+			if jobIndex, duplicate := seen[key]; duplicate {
+				// Duplicate addresses share one route-health key. A TCP failure
+				// remains inconclusive when any duplicate can still use HTTP/3.
+				if !activeHealthFailureConclusive(rule, target) {
+					jobs[jobIndex].failureConclusive = false
+				}
 				continue
 			}
-			seen[key] = struct{}{}
+			seen[key] = len(jobs)
 			proxyProtocol := ""
 			if rule.ProxyProtocol != nil {
 				proxyProtocol = rule.ProxyProtocol.Send
 			}
 			jobs = append(jobs, activeHealthJob{
-				key:           key,
-				target:        target.Address,
-				check:         *rule.HealthCheck,
-				proxyProtocol: proxyProtocol,
+				key:               key,
+				target:            target.Address,
+				check:             *rule.HealthCheck,
+				proxyProtocol:     proxyProtocol,
+				failureConclusive: activeHealthFailureConclusive(rule, target),
 			})
 		}
 	}
@@ -210,7 +217,26 @@ func (manager *activeHealthManager) runProbe(ctx context.Context, job activeHeal
 	if parentCanceled {
 		return false
 	}
-	manager.observe(job.key, job.check, err == nil)
+	// A TCP probe can prove the H2 leg is reachable, but its failure cannot
+	// prove an H3-capable proxy target is down: H3 uses UDP and may remain fully
+	// usable during a TCP outage. Keep the target eligible and let real H3/H2
+	// CONNECT attempts update passive route health instead.
+	if err == nil || job.failureConclusive {
+		manager.observe(job.key, job.check, err == nil)
+	}
+	return true
+}
+
+func activeHealthFailureConclusive(rule *config.Rule, target *config.Target) bool {
+	if rule == nil || target == nil || rule.HealthCheck == nil ||
+		rule.HealthCheck.Type != config.HealthCheckTCP || target.ConnectProxy == nil {
+		return true
+	}
+	for _, protocol := range target.ConnectProxy.Protocols {
+		if protocol == config.ConnectProxyH3 {
+			return false
+		}
+	}
 	return true
 }
 

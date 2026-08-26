@@ -518,7 +518,7 @@ func (runtime *routingRuntime) outboundDialRouteWithOptions(
 	if onStart != nil {
 		onStart()
 	}
-	conn, err := DialFastContext(ctx, addr)
+	conn, err := runtime.dialRouteTarget(ctx, rule, addr)
 	permit.release()
 	if err == nil && conn == nil {
 		err = errors.New("dial returned a nil connection")
@@ -528,7 +528,9 @@ func (runtime *routingRuntime) outboundDialRouteWithOptions(
 		conn = nil
 	}
 	latency := time.Since(started)
-	routeObserve(attempt, latency, err, time.Now())
+	// routeObserve treats context cancellation as a neutral completion and
+	// releases any half-open probe without recording a route failure.
+	routeObserve(attempt, latency, connectProxyRouteObservationError(err), time.Now())
 	if rule != nil {
 		metricDial(rule.Name, addr, latency, err)
 	}

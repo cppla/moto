@@ -32,7 +32,7 @@ race:
 	$(GO) test -race ./...
 
 fault-test:
-	$(GO) test -race ./controller -shuffle=on -count=10 -run 'Test(ConcurrentReload|ReloadRules|RouteHealth|RaceBoostTargets|CachedBoost|DialBulkhead|Prewarm|ActiveHealth|.*TLS|.*ProxyProtocol|ServerClose)'
+	$(GO) test -race ./controller -shuffle=on -count=10 -run 'Test(ConcurrentReload|ReloadRules|RouteHealth|RaceBoostTargets|CachedBoost|FreshBoost|BoostProtocolCanary|DialBulkhead|Prewarm|ActiveHealth|HTTP3|.*ProtocolPenalty|SelectTargetsExcluding|.*TLS|.*ProxyProtocol|ServerClose)'
 
 vet:
 	$(GO) vet ./...

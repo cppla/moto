@@ -3,6 +3,7 @@
 FROM golang:1.25.13-alpine@sha256:1e0126852075c9c60731c8ba49088448b91f63e2aed97ca9d1a9791622a05946 AS build
 
 WORKDIR /src
+RUN apk add --no-cache ca-certificates
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
@@ -18,6 +19,7 @@ RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
 FROM scratch
 
 COPY --from=build /out/moto /moto
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build --chown=65532:65532 /out/work /work
 
 USER 65532:65532

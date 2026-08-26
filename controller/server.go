@@ -563,6 +563,19 @@ func (s *Server) releaseGlobal() {
 }
 
 func (runtime *routingRuntime) dispatch(ctx context.Context, conn net.Conn, rule *config.Rule) {
+	if rule != nil && rule.Protocol == config.ProtocolSOCKS5 {
+		client, err := prepareSOCKS5Client(conn, rule)
+		if err != nil {
+			utils.Logger.Debug("SOCKS5 握手失败",
+				zap.String("ruleName", rule.Name),
+				zap.String("remoteAddr", connAddr(conn)),
+				zap.Error(err))
+			return
+		}
+		conn = client
+		ctx = withConnectDestination(ctx, client.destination)
+		ctx = withRandomConnectProxyUserAgent(ctx, rule.UserAgent)
+	}
 	switch rule.Mode {
 	case "normal":
 		runtime.handleNormal(ctx, conn, rule)

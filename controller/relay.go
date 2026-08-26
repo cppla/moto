@@ -2,30 +2,107 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"io"
 	"moto/config"
 	"moto/utils"
 	"net"
-	"sync"
+	"runtime"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+type relayDirection string
+
+const (
+	relayDirectionClientToTarget relayDirection = "client_to_target"
+	relayDirectionTargetToClient relayDirection = "target_to_client"
+)
+
+type relayStopKind uint8
+
+const (
+	relayStopUnknown relayStopKind = iota
+	relayStopCopyError
+	relayStopContext
+)
+
+type relayStopCause struct {
+	Kind      relayStopKind
+	Direction relayDirection
+}
+
+type relayStopPhase uint32
+
+const (
+	relayStopPhaseOpen relayStopPhase = iota
+	relayStopPhaseClaimed
+	relayStopPhaseClosing
+)
+
+type relayStopArbiter struct {
+	phase     atomic.Uint32
+	cause     relayStopCause
+	interrupt func()
+}
+
+func (arbiter *relayStopArbiter) claim(cause relayStopCause) bool {
+	if arbiter == nil || !arbiter.phase.CompareAndSwap(
+		uint32(relayStopPhaseOpen), uint32(relayStopPhaseClaimed),
+	) {
+		return false
+	}
+	// Publish the cause before announcing that close-induced errors may occur.
+	// A contender that observed the intermediate claimed phase is concurrent,
+	// not secondary, because endpoint shutdown has not started yet.
+	arbiter.cause = cause
+	arbiter.phase.Store(uint32(relayStopPhaseClosing))
+	if arbiter.interrupt != nil {
+		arbiter.interrupt()
+	}
+	return true
+}
+
+func (arbiter *relayStopArbiter) observeError(cause relayStopCause) relayErrorOrigin {
+	observedPhase := relayStopPhase(arbiter.phase.Load())
+	if arbiter.claim(cause) {
+		return relayErrorOriginPrimary
+	}
+	if observedPhase == relayStopPhaseClosing {
+		return relayErrorOriginSecondary
+	}
+	return relayErrorOriginConcurrent
+}
+
+type relayErrorOrigin uint8
+
+const (
+	relayErrorOriginUnknown relayErrorOrigin = iota
+	relayErrorOriginPrimary
+	relayErrorOriginConcurrent
+	relayErrorOriginSecondary
 )
 
 type relayDirectionResult struct {
-	Bytes int64
-	Err   error
+	Bytes  int64
+	Err    error
+	Origin relayErrorOrigin
 }
 
 type relayResult struct {
 	ClientToTarget relayDirectionResult
 	TargetToClient relayDirectionResult
 	Duration       time.Duration
+	StopCause      relayStopCause
 }
 
 type namedRelayResult struct {
-	clientToTarget bool
-	result         relayDirectionResult
+	direction relayDirection
+	result    relayDirectionResult
 }
 
 // relayBidirectional waits for both stream directions. A normal EOF only
@@ -39,55 +116,67 @@ func relayBidirectional(ctx context.Context, client, target net.Conn) relayResul
 	started := time.Now()
 	results := make(chan namedRelayResult, 2)
 	finished := make(chan struct{})
-	var interruptOnce sync.Once
+	watcherDone := make(chan struct{})
 	interrupt := func() {
 		_ = client.Close()
 		_ = target.Close()
 	}
+	stop := relayStopArbiter{interrupt: interrupt}
 
 	if ctx.Done() != nil {
 		go func() {
+			defer close(watcherDone)
 			select {
 			case <-ctx.Done():
-				interruptOnce.Do(interrupt)
+				stop.claim(relayStopCause{Kind: relayStopContext})
 			case <-finished:
 			}
 		}()
+	} else {
+		close(watcherDone)
 	}
 
-	copyDirection := func(dst, src net.Conn, clientToTarget bool) {
+	copyDirection := func(dst, src net.Conn, direction relayDirection) {
 		copied, err := copyConn(dst, src)
-		if closeErr := closeWrite(dst); err == nil && closeErr != nil {
-			err = closeErr
-		}
+		origin := relayErrorOriginUnknown
 		if err != nil {
 			// An actual copy/half-close failure must unblock the other direction.
 			// Normal EOF is represented by a nil io.Copy error and does not come
 			// through this path. Closing both endpoints wakes the peer direction.
-			interruptOnce.Do(interrupt)
+			origin = stop.observeError(relayStopCause{
+				Kind: relayStopCopyError, Direction: direction,
+			})
+		} else if closeErr := closeWrite(dst); closeErr != nil {
+			err = closeErr
+			origin = stop.observeError(relayStopCause{
+				Kind: relayStopCopyError, Direction: direction,
+			})
 		}
 		results <- namedRelayResult{
-			clientToTarget: clientToTarget,
+			direction: direction,
 			result: relayDirectionResult{
-				Bytes: copied,
-				Err:   err,
+				Bytes:  copied,
+				Err:    err,
+				Origin: origin,
 			},
 		}
 	}
 
-	go copyDirection(target, client, true)
-	go copyDirection(client, target, false)
+	go copyDirection(target, client, relayDirectionClientToTarget)
+	go copyDirection(client, target, relayDirectionTargetToClient)
 
 	var relay relayResult
 	for i := 0; i < 2; i++ {
 		completed := <-results
-		if completed.clientToTarget {
+		if completed.direction == relayDirectionClientToTarget {
 			relay.ClientToTarget = completed.result
 		} else {
 			relay.TargetToClient = completed.result
 		}
 	}
 	close(finished)
+	<-watcherDone
+	relay.StopCause = stop.cause
 	relay.Duration = time.Since(started)
 	return relay
 }
@@ -158,14 +247,135 @@ func logRelayResult(rule *config.Rule, client, target net.Conn, result relayResu
 		zap.Int64("clientToTargetBytes", result.ClientToTarget.Bytes),
 		zap.Int64("targetToClientBytes", result.TargetToClient.Bytes),
 		zap.Int64("durationMs", result.Duration.Milliseconds()),
+		zap.String("stopCause", relayStopCauseName(result.StopCause)),
 	}
 	if result.ClientToTarget.Err != nil {
-		utils.Logger.Warn("客户端到目标的转发异常",
-			append(fields, zap.Error(result.ClientToTarget.Err))...)
+		logRelayDirection(utils.Logger, "客户端到目标的转发异常", fields, result,
+			relayDirectionClientToTarget, result.ClientToTarget.Err)
 	}
 	if result.TargetToClient.Err != nil {
-		utils.Logger.Warn("目标到客户端的转发异常",
-			append(fields, zap.Error(result.TargetToClient.Err))...)
+		logRelayDirection(utils.Logger, "目标到客户端的转发异常", fields, result,
+			relayDirectionTargetToClient, result.TargetToClient.Err)
 	}
 	utils.Logger.Debug("连接转发结束", fields...)
+}
+
+const (
+	relayLogClassPrimary       = "primary_error"
+	relayLogClassConcurrent    = "concurrent_error"
+	relayLogClassSecondary     = "secondary_close"
+	relayLogClassExpectedClose = "expected_close"
+	relayLogClassContextClose  = "context_close"
+)
+
+type relayLogDecision struct {
+	Level   zapcore.Level
+	Class   string
+	Primary bool
+}
+
+func classifyRelayError(result relayResult, direction relayDirection, err error) relayLogDecision {
+	origin := relayDirectionResultFor(result, direction).Origin
+	if origin == relayErrorOriginSecondary {
+		class := relayLogClassSecondary
+		if result.StopCause.Kind == relayStopContext {
+			class = relayLogClassContextClose
+		}
+		return relayLogDecision{Level: zapcore.DebugLevel, Class: class}
+	}
+	if isExpectedRelayCloseError(direction, err) {
+		return relayLogDecision{
+			Level:   zapcore.DebugLevel,
+			Class:   relayLogClassExpectedClose,
+			Primary: origin != relayErrorOriginConcurrent,
+		}
+	}
+	if origin == relayErrorOriginConcurrent {
+		return relayLogDecision{Level: zapcore.WarnLevel, Class: relayLogClassConcurrent}
+	}
+	if result.StopCause.Kind == relayStopContext && origin == relayErrorOriginUnknown {
+		return relayLogDecision{Level: zapcore.DebugLevel, Class: relayLogClassContextClose}
+	}
+	return relayLogDecision{Level: zapcore.WarnLevel, Class: relayLogClassPrimary, Primary: true}
+}
+
+func relayDirectionResultFor(result relayResult, direction relayDirection) relayDirectionResult {
+	if direction == relayDirectionClientToTarget {
+		return result.ClientToTarget
+	}
+	return result.TargetToClient
+}
+
+func isExpectedRelayCloseError(direction relayDirection, err error) bool {
+	return isExpectedRelayCloseErrorForOS(runtime.GOOS, direction, err)
+}
+
+const (
+	windowsErrorBrokenPipe syscall.Errno = 109
+	windowsWSAENOTCONN     syscall.Errno = 10057
+	windowsWSAESHUTDOWN    syscall.Errno = 10058
+)
+
+func isExpectedRelayCloseErrorForOS(goos string, direction relayDirection, err error) bool {
+	if errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.ENOTCONN) {
+		return true
+	}
+	if goos == "windows" && (errors.Is(err, windowsWSAENOTCONN) ||
+		errors.Is(err, windowsWSAESHUTDOWN)) {
+		return true
+	}
+	// A broken pipe while writing target data back to the client means the
+	// client has already gone away. The same errno in the opposite direction
+	// may indicate an upstream failure and remains actionable.
+	return direction == relayDirectionTargetToClient && (errors.Is(err, syscall.EPIPE) ||
+		goos == "windows" && errors.Is(err, windowsErrorBrokenPipe))
+}
+
+func relayStopCauseName(cause relayStopCause) string {
+	switch cause.Kind {
+	case relayStopContext:
+		return "context"
+	case relayStopCopyError:
+		return string(cause.Direction)
+	default:
+		return "unknown"
+	}
+}
+
+func logRelayDirection(
+	logger *zap.Logger,
+	message string,
+	baseFields []zap.Field,
+	result relayResult,
+	direction relayDirection,
+	err error,
+) {
+	if logger == nil || err == nil {
+		return
+	}
+	decision := classifyRelayError(result, direction, err)
+	fields := append(baseFields,
+		zap.String("event", "relay_termination"),
+		zap.String("direction", string(direction)),
+		zap.String("origin", relayErrorOriginName(relayDirectionResultFor(result, direction).Origin)),
+		zap.String("class", decision.Class),
+		zap.Bool("primary", decision.Primary),
+		zap.Error(err),
+	)
+	logger.Log(decision.Level, message, fields...)
+}
+
+func relayErrorOriginName(origin relayErrorOrigin) string {
+	switch origin {
+	case relayErrorOriginPrimary:
+		return "primary"
+	case relayErrorOriginConcurrent:
+		return "concurrent"
+	case relayErrorOriginSecondary:
+		return "secondary"
+	default:
+		return "unknown"
+	}
 }

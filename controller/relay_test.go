@@ -6,8 +6,13 @@ import (
 	"io"
 	"moto/config"
 	"net"
+	"syscall"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestRelayBidirectionalPreservesResponseAfterRequestEOF(t *testing.T) {
@@ -156,6 +161,13 @@ func TestRelayBidirectionalStopsOnUpstreamReset(t *testing.T) {
 		if result.TargetToClient.Err == nil {
 			t.Fatal("upstream reset did not produce a target read error")
 		}
+		if result.TargetToClient.Origin != relayErrorOriginPrimary {
+			t.Fatalf("target-to-client origin = %v, want primary", result.TargetToClient.Origin)
+		}
+		if result.StopCause.Kind != relayStopCopyError ||
+			result.StopCause.Direction != relayDirectionTargetToClient {
+			t.Fatalf("stop cause = %+v, want target-to-client copy error", result.StopCause)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("relay did not stop after upstream reset")
 	}
@@ -191,6 +203,13 @@ func TestRelayBidirectionalStopsOnClientReset(t *testing.T) {
 	case result := <-resultCh:
 		if result.ClientToTarget.Err == nil {
 			t.Fatal("client reset did not produce a client read error")
+		}
+		if result.ClientToTarget.Origin != relayErrorOriginPrimary {
+			t.Fatalf("client-to-target origin = %v, want primary", result.ClientToTarget.Origin)
+		}
+		if result.StopCause.Kind != relayStopCopyError ||
+			result.StopCause.Direction != relayDirectionClientToTarget {
+			t.Fatalf("stop cause = %+v, want client-to-target copy error", result.StopCause)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("relay did not stop after client reset")
@@ -259,9 +278,256 @@ func TestRelayBidirectionalContextCancellationStopsIdleCopies(t *testing.T) {
 	cancel()
 
 	select {
-	case <-resultCh:
+	case result := <-resultCh:
+		if result.StopCause.Kind != relayStopContext {
+			t.Fatalf("stop cause = %+v, want context cancellation", result.StopCause)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("idle io.Copy calls did not stop after context cancellation")
+	}
+}
+
+func TestRelayStopArbiterKeepsCauseAndInterruptTogether(t *testing.T) {
+	interrupts := 0
+	arbiter := relayStopArbiter{interrupt: func() { interrupts++ }}
+	primaryCause := relayStopCause{
+		Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+	}
+	if origin := arbiter.observeError(primaryCause); origin != relayErrorOriginPrimary {
+		t.Fatalf("first origin = %v, want primary", origin)
+	}
+	if interrupts != 1 || arbiter.cause != primaryCause {
+		t.Fatalf("interrupts=%d cause=%+v, want one interrupt and %+v",
+			interrupts, arbiter.cause, primaryCause)
+	}
+	if arbiter.claim(relayStopCause{Kind: relayStopContext}) {
+		t.Fatal("second stop cause replaced the first")
+	}
+	if interrupts != 1 || arbiter.cause != primaryCause {
+		t.Fatalf("second claim changed stop: interrupts=%d cause=%+v", interrupts, arbiter.cause)
+	}
+}
+
+func TestRelayStopArbiterDistinguishesConcurrentAndSecondaryErrors(t *testing.T) {
+	claimed := relayStopArbiter{}
+	claimed.phase.Store(uint32(relayStopPhaseClaimed))
+	if origin := claimed.observeError(relayStopCause{
+		Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+	}); origin != relayErrorOriginConcurrent {
+		t.Fatalf("error observed before close origin = %v, want concurrent", origin)
+	}
+
+	closing := relayStopArbiter{}
+	closing.phase.Store(uint32(relayStopPhaseClosing))
+	if origin := closing.observeError(relayStopCause{
+		Kind: relayStopCopyError, Direction: relayDirectionTargetToClient,
+	}); origin != relayErrorOriginSecondary {
+		t.Fatalf("error observed after close began origin = %v, want secondary", origin)
+	}
+}
+
+func TestClassifyRelayError(t *testing.T) {
+	unexpected := errors.New("unexpected relay failure")
+	http2BodyClosed := errors.New("http2: response body closed")
+	expectedClose := &net.OpError{Op: "close", Net: "tcp", Err: syscall.ENOTCONN}
+	brokenPipe := &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}
+
+	tests := []struct {
+		name      string
+		result    relayResult
+		direction relayDirection
+		err       error
+		want      relayLogDecision
+	}{
+		{
+			name: "primary copy error stays warning",
+			result: relayResult{
+				ClientToTarget: relayDirectionResult{Origin: relayErrorOriginPrimary},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			direction: relayDirectionClientToTarget,
+			err:       unexpected,
+			want:      relayLogDecision{Level: zapcore.WarnLevel, Class: relayLogClassPrimary, Primary: true},
+		},
+		{
+			name: "other direction is secondary debug detail",
+			result: relayResult{
+				TargetToClient: relayDirectionResult{Origin: relayErrorOriginSecondary},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			direction: relayDirectionTargetToClient,
+			err:       http2BodyClosed,
+			want:      relayLogDecision{Level: zapcore.DebugLevel, Class: relayLogClassSecondary},
+		},
+		{
+			name: "context shutdown is debug detail",
+			result: relayResult{
+				TargetToClient: relayDirectionResult{Origin: relayErrorOriginSecondary},
+				StopCause:      relayStopCause{Kind: relayStopContext},
+			},
+			direction: relayDirectionTargetToClient,
+			err:       http2BodyClosed,
+			want:      relayLogDecision{Level: zapcore.DebugLevel, Class: relayLogClassContextClose},
+		},
+		{
+			name: "expected half-close failure is debug detail",
+			result: relayResult{
+				TargetToClient: relayDirectionResult{Origin: relayErrorOriginPrimary},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionTargetToClient,
+				},
+			},
+			direction: relayDirectionTargetToClient,
+			err:       expectedClose,
+			want: relayLogDecision{
+				Level: zapcore.DebugLevel, Class: relayLogClassExpectedClose, Primary: true,
+			},
+		},
+		{
+			name: "standalone h2 body close remains warning",
+			result: relayResult{
+				TargetToClient: relayDirectionResult{Origin: relayErrorOriginPrimary},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionTargetToClient,
+				},
+			},
+			direction: relayDirectionTargetToClient,
+			err:       http2BodyClosed,
+			want:      relayLogDecision{Level: zapcore.WarnLevel, Class: relayLogClassPrimary, Primary: true},
+		},
+		{
+			name: "concurrent independent error remains warning",
+			result: relayResult{
+				TargetToClient: relayDirectionResult{Origin: relayErrorOriginConcurrent},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			direction: relayDirectionTargetToClient,
+			err:       unexpected,
+			want:      relayLogDecision{Level: zapcore.WarnLevel, Class: relayLogClassConcurrent},
+		},
+		{
+			name: "client-bound broken pipe is expected close",
+			result: relayResult{
+				TargetToClient: relayDirectionResult{Origin: relayErrorOriginPrimary},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionTargetToClient,
+				},
+			},
+			direction: relayDirectionTargetToClient,
+			err:       brokenPipe,
+			want: relayLogDecision{
+				Level: zapcore.DebugLevel, Class: relayLogClassExpectedClose, Primary: true,
+			},
+		},
+		{
+			name: "upstream-bound broken pipe remains warning",
+			result: relayResult{
+				ClientToTarget: relayDirectionResult{Origin: relayErrorOriginPrimary},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			direction: relayDirectionClientToTarget,
+			err:       brokenPipe,
+			want:      relayLogDecision{Level: zapcore.WarnLevel, Class: relayLogClassPrimary, Primary: true},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyRelayError(test.result, test.direction, test.err); got != test.want {
+				t.Fatalf("classification = %+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestExpectedRelayCloseErrorWindowsErrnos(t *testing.T) {
+	tests := []struct {
+		name      string
+		direction relayDirection
+		err       error
+		want      bool
+	}{
+		{
+			name:      "winsock not connected",
+			direction: relayDirectionClientToTarget,
+			err:       &net.OpError{Op: "close", Net: "tcp", Err: windowsWSAENOTCONN},
+			want:      true,
+		},
+		{
+			name:      "winsock shutdown",
+			direction: relayDirectionClientToTarget,
+			err:       &net.OpError{Op: "write", Net: "tcp", Err: windowsWSAESHUTDOWN},
+			want:      true,
+		},
+		{
+			name:      "client-bound broken pipe",
+			direction: relayDirectionTargetToClient,
+			err:       &net.OpError{Op: "write", Net: "tcp", Err: windowsErrorBrokenPipe},
+			want:      true,
+		},
+		{
+			name:      "upstream-bound broken pipe",
+			direction: relayDirectionClientToTarget,
+			err:       &net.OpError{Op: "write", Net: "tcp", Err: windowsErrorBrokenPipe},
+			want:      false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isExpectedRelayCloseErrorForOS("windows", test.direction, test.err); got != test.want {
+				t.Fatalf("expected close = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLogRelayDirectionEmitsBoundedClassification(t *testing.T) {
+	core, observed := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core)
+	result := relayResult{
+		ClientToTarget: relayDirectionResult{Origin: relayErrorOriginPrimary},
+		TargetToClient: relayDirectionResult{Origin: relayErrorOriginSecondary},
+		StopCause: relayStopCause{
+			Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+		},
+	}
+	baseFields := []zap.Field{zap.String("ruleName", "relay-log-test")}
+
+	logRelayDirection(logger, "primary", baseFields, result,
+		relayDirectionClientToTarget, errors.New("client reset"))
+	logRelayDirection(logger, "secondary", baseFields, result,
+		relayDirectionTargetToClient, errors.New("http2: response body closed"))
+
+	entries := observed.AllUntimed()
+	if len(entries) != 2 {
+		t.Fatalf("log entries = %d, want 2", len(entries))
+	}
+	if entries[0].Level != zapcore.WarnLevel {
+		t.Fatalf("primary level = %s, want warn", entries[0].Level)
+	}
+	if entries[1].Level != zapcore.DebugLevel {
+		t.Fatalf("secondary level = %s, want debug", entries[1].Level)
+	}
+	primaryFields := entries[0].ContextMap()
+	if primaryFields["class"] != relayLogClassPrimary || primaryFields["primary"] != true ||
+		primaryFields["direction"] != string(relayDirectionClientToTarget) ||
+		primaryFields["origin"] != "primary" || primaryFields["event"] != "relay_termination" {
+		t.Fatalf("primary fields = %#v", primaryFields)
+	}
+	secondaryFields := entries[1].ContextMap()
+	if secondaryFields["class"] != relayLogClassSecondary || secondaryFields["primary"] != false ||
+		secondaryFields["direction"] != string(relayDirectionTargetToClient) ||
+		secondaryFields["origin"] != "secondary" || secondaryFields["event"] != "relay_termination" {
+		t.Fatalf("secondary fields = %#v", secondaryFields)
 	}
 }
 

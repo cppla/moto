@@ -1,9 +1,14 @@
 package controller
 
 import (
+	"context"
+	"io"
 	"moto/config"
+	"net"
+	"net/http"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRoundRobinCountersAreIndependentPerRule(t *testing.T) {
@@ -64,5 +69,72 @@ func TestRoundRobinCounterIsConcurrentSafe(t *testing.T) {
 		if count != calls/len(rule.Targets) {
 			t.Fatalf("target %d received %d selections, want %d", index, count, calls/len(rule.Targets))
 		}
+	}
+}
+
+func TestRoundRobinSOCKS5CapacityFallbackPreservesHTTPStatus(t *testing.T) {
+	bulkhead := newDialBulkhead(2, 1, 0)
+	runtime := newRoutingRuntimeWithDialResources(make(chan struct{}, 1), bulkhead)
+	defer runtime.stopBackground()
+
+	const (
+		firstTarget  = "capacity.example:443"
+		secondTarget = "policy.example:443"
+	)
+	holder, _, err := bulkhead.acquire(context.Background(), firstTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.release()
+
+	proxyConfig := &config.ConnectProxyConfig{Protocols: []string{config.ConnectProxyH2}}
+	rule := &config.Rule{
+		Name:     "roundrobin-capacity-status",
+		Mode:     config.ModeRoundRobin,
+		Protocol: config.ProtocolSOCKS5,
+		Timeout:  1000,
+		Targets: []*config.Target{
+			{Address: firstTarget, ConnectProxy: proxyConfig},
+			{Address: secondTarget, ConnectProxy: proxyConfig},
+		},
+	}
+	runtime.connectProxy.dialers = map[string]connectProxyDialFunc{
+		config.ConnectProxyH2: func(_ context.Context, target *config.Target, _ string) (net.Conn, error) {
+			if target.Address != secondTarget {
+				t.Errorf("CONNECT reached unexpected target %q", target.Address)
+			}
+			return nil, &connectProxyStatusError{
+				protocol:   config.ConnectProxyH2,
+				target:     target.Address,
+				statusCode: http.StatusForbidden,
+			}
+		},
+	}
+
+	motoSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	client := &socks5ClientConn{Conn: motoSide, destination: "destination.example:443"}
+	done := make(chan struct{})
+	go func() {
+		runtime.handleRoundrobin(
+			withConnectDestination(context.Background(), client.destination),
+			client,
+			rule,
+		)
+		close(done)
+	}()
+
+	_ = clientSide.SetReadDeadline(time.Now().Add(2 * time.Second))
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(clientSide, reply); err != nil {
+		t.Fatalf("read SOCKS5 failure: %v", err)
+	}
+	if reply[1] != socks5ReplyNotAllowed {
+		t.Fatalf("SOCKS5 reply = %#x, want policy denied %#x", reply[1], socks5ReplyNotAllowed)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RoundRobin handler did not stop")
 	}
 }

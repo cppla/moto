@@ -6,7 +6,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-DynamicUser=yes
+User=moto
+Group=moto
 StateDirectory=moto
 WorkingDirectory=/var/lib/moto
 ExecStart=/usr/local/bin/moto --config /etc/moto/setting.json

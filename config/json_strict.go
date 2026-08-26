@@ -12,12 +12,14 @@ var (
 	configLogFields      = stringSet("level", "path")
 	configMetricsFields  = stringSet("enabled", "listen")
 	configRuleFields     = stringSet(
-		"name", "listen", "mode", "prewarm", "targets", "timeout",
+		"name", "listen", "mode", "protocol", "prewarm", "targets", "timeout",
 		"blacklist", "allowlist", "maxConnections", "maxConnectionsPerIP",
-		"healthCheck", "hedge", "proxyProtocol",
+		"healthCheck", "hedge", "proxyProtocol", "userAgent",
 	)
-	configTargetFields = stringSet("regexp", "address", "serverNames", "alpn")
-	configHealthFields = stringSet(
+	configTargetFields       = stringSet("regexp", "address", "serverNames", "alpn", "connectProxy")
+	configConnectProxyFields = stringSet("protocols", "serverName", "basicAuth")
+	configBasicAuthFields    = stringSet("username", "password")
+	configHealthFields       = stringSet(
 		"type", "interval", "timeout", "failureThreshold", "successThreshold",
 		"path", "statusMin", "statusMax",
 	)
@@ -134,6 +136,24 @@ func validateStrictConfigJSON(data []byte) error {
 			}
 			if err := validateObjectFields(targetPath, target, configTargetFields); err != nil {
 				return err
+			}
+			if raw, exists := target["connectProxy"]; exists && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+				proxy, proxyErr := decodeJSONObject(raw, targetPath+".connectProxy")
+				if proxyErr != nil {
+					return proxyErr
+				}
+				if err := validateObjectFields(targetPath+".connectProxy", proxy, configConnectProxyFields); err != nil {
+					return err
+				}
+				if rawAuth, authExists := proxy["basicAuth"]; authExists && !bytes.Equal(bytes.TrimSpace(rawAuth), []byte("null")) {
+					auth, authErr := decodeJSONObject(rawAuth, targetPath+".connectProxy.basicAuth")
+					if authErr != nil {
+						return authErr
+					}
+					if err := validateObjectFields(targetPath+".connectProxy.basicAuth", auth, configBasicAuthFields); err != nil {
+						return err
+					}
+				}
 			}
 		}
 	}

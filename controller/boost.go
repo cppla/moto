@@ -61,10 +61,23 @@ type boostRouteDialOptions struct {
 type boostRouteDialFunc func(context.Context, *config.Rule, string, boostRouteDialOptions) (net.Conn, routeAttempt, error)
 
 type cachedBoostOutcome struct {
-	winner          dialResult
-	cachedFailed    bool
-	fallbackStarted bool
-	hedged          bool
+	winner               dialResult
+	cachedFailed         bool
+	cachedFailureNeutral bool
+	fallbackStarted      bool
+	hedged               bool
+}
+
+func targetByAddress(rule *config.Rule, address string) *config.Target {
+	if rule == nil || address == "" {
+		return nil
+	}
+	for _, target := range rule.Targets {
+		if target != nil && target.Address == address {
+			return target
+		}
+	}
+	return nil
 }
 
 // boostRuleKey includes the listener and the ordered target set. Rules with the
@@ -120,6 +133,37 @@ func (runtime *routingRuntime) loadBoostWinnerToken(key string) (boostWinnerEntr
 	return entry, true
 }
 
+// loadUsableBoostWinnerToken rejects a cached winner whose currently selected
+// protocol is degraded. Eviction uses the generation token loaded with the
+// entry, so a concurrent refresh cannot be deleted by this stale observation.
+func (runtime *routingRuntime) loadUsableBoostWinnerToken(key string, rule *config.Rule, now time.Time) (boostWinnerEntry, bool) {
+	if runtime == nil {
+		return boostWinnerEntry{}, false
+	}
+	entry, ok := runtime.loadBoostWinnerToken(key)
+	if !ok || runtime.routes == nil {
+		return entry, ok
+	}
+	var target *config.Target
+	if rule != nil {
+		for _, candidate := range rule.Targets {
+			if candidate != nil && candidate.Address == entry.addr {
+				target = candidate
+				break
+			}
+		}
+	}
+	if target == nil || runtime.routes.protocolPenalty(rule, target, now) == 0 {
+		return entry, true
+	}
+	runtime.deleteBoostWinnerIfCurrent(boostWinnerToken{
+		key:        key,
+		addr:       entry.addr,
+		generation: entry.generation,
+	})
+	return boostWinnerEntry{}, false
+}
+
 func storeBoostWinner(key, addr string) boostWinnerToken {
 	return defaultRoutingRuntime.storeBoostWinner(key, addr)
 }
@@ -168,6 +212,32 @@ func (runtime *routingRuntime) deleteBoostWinnerIfCurrent(token boostWinnerToken
 	}
 	delete(runtime.boost.cache.entries, token.key)
 	return true
+}
+
+// reconcileCachedBoostWinner keeps destination-specific CONNECT failures from
+// mutating the rule-wide Boost winner. A fallback may serve this one request,
+// but a 403/502/504 from the cached proxy is not evidence that another proxy is
+// globally faster or healthier for unrelated destinations.
+func (runtime *routingRuntime) reconcileCachedBoostWinner(
+	key string,
+	cachedToken boostWinnerToken,
+	outcome cachedBoostOutcome,
+	succeeded bool,
+) (cacheHit bool, winnerToken boostWinnerToken) {
+	if !succeeded {
+		if outcome.cachedFailed {
+			runtime.deleteBoostWinnerIfCurrent(cachedToken)
+		}
+		return false, boostWinnerToken{}
+	}
+	cacheHit = outcome.winner.addr == cachedToken.addr
+	if cacheHit {
+		return true, cachedToken
+	}
+	if outcome.cachedFailureNeutral {
+		return false, boostWinnerToken{}
+	}
+	return false, runtime.storeBoostWinner(key, outcome.winner.addr)
 }
 
 // finishBoostRelay never attributes an io.Copy error to either endpoint, so it
@@ -271,6 +341,8 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 	defer cancelTimer()
 	results := make(chan dialResult, len(rule.Targets))
 	attempted := map[string]struct{}{cachedAddr: {}}
+	targetAttemptLimit := connectProxyTargetAttemptLimit(rule)
+	actualAttempts := 1
 	active := 0
 	hedgingEnabled := false
 	delayedHedge := false
@@ -328,7 +400,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 		})
 	}
 
-	launch := func(addr string, primary, delayed, tryOnly bool) {
+	launch := func(addr string, primary, delayed, tryOnly bool, probe routeProtocolProbeLease) {
 		active++
 		go func() {
 			options := boostRouteDialOptions{tryOnly: tryOnly}
@@ -353,28 +425,54 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 					err = prepareErr
 				}
 			}
+			runtime.routes.releaseProtocolProbe(rule, targetByAddress(rule, addr), probe)
 			results <- dialResult{conn: connection, addr: addr, attempt: attempt, err: err, delayed: delayed}
 		}()
 	}
 
 	launchAlternatives := func(limit int, delayed, tryOnly bool) int {
-		if limit <= 0 || globalCapacityLimited {
+		if limit <= 0 || globalCapacityLimited || actualAttempts >= targetAttemptLimit {
 			return 0
 		}
-		candidates := runtime.routes.selectTargetsExcluding(rule, len(rule.Targets), time.Now(), attempted)
 		launched := 0
-		for _, target := range candidates {
-			if launched == limit {
+		for launched == 0 && actualAttempts < targetAttemptLimit && len(attempted) < len(rule.Targets) {
+			// A protocol recovery canary must get one complete setup attempt;
+			// otherwise a still-healthy cached primary can repeatedly win and
+			// cancel the lazy warming H3 candidate forever.
+			reserveProtocolProbe := active == 0 && actualAttempts == 0
+			candidates := runtime.routes.selectTargetSelections(
+				rule,
+				len(rule.Targets),
+				time.Now(),
+				attempted,
+				reserveProtocolProbe,
+			)
+			if len(candidates) == 0 {
 				break
 			}
-			addr := target.Address
-			attempted[addr] = struct{}{}
-			if runtime.health.unhealthy(rule, addr) {
-				healthExcluded = true
-				continue
+			before := len(attempted)
+			for _, candidate := range candidates {
+				if launched == limit || actualAttempts >= targetAttemptLimit {
+					break
+				}
+				target := candidate.target
+				addr := target.Address
+				attempted[addr] = struct{}{}
+				if runtime.health.unhealthy(rule, addr) {
+					healthExcluded = true
+					runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
+					continue
+				}
+				actualAttempts++
+				launch(addr, false, delayed, tryOnly, candidate.protocolProbe)
+				launched++
+				if candidate.protocolProbe.token != 0 {
+					break
+				}
 			}
-			launch(addr, false, delayed, tryOnly)
-			launched++
+			if len(attempted) == before {
+				break
+			}
 		}
 		if launched > 0 {
 			outcome.fallbackStarted = true
@@ -401,7 +499,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 		}
 	}
 
-	launch(cachedAddr, true, false, false)
+	launch(cachedAddr, true, false, false, routeProtocolProbeLease{})
 	for active > 0 {
 		select {
 		case result := <-results:
@@ -425,6 +523,29 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 			observeDelayedResult(result)
 
 			isCached := result.addr == cachedAddr
+			if errors.Is(result.err, ErrActiveHealthUnhealthy) || errors.Is(result.err, ErrCircuitOpen) {
+				// The target became unhealthy after selection/admission and no
+				// network dial was made, or another request won its half-open route
+				// claim. Keep the address excluded from this request, but return its
+				// SOCKS target-attempt budget to a later candidate.
+				if errors.Is(result.err, ErrActiveHealthUnhealthy) {
+					healthExcluded = true
+				}
+				if actualAttempts > 0 {
+					actualAttempts--
+				}
+				if isCached {
+					outcome.cachedFailed = true
+					primaryFailed = true
+					delayedHedge = false
+					hedgingEnabled = true
+					hedgeReady = nil
+				}
+				if hedgingEnabled && !globalCapacityLimited {
+					launchAlternatives(2-active, delayedHedge, delayedHedge || capacityFallbackTryOnly)
+				}
+				continue
+			}
 			if isDialBulkheadError(result.err) {
 				if result.delayed && !isCached {
 					// A delayed hedge is optional and uses immediate-only admission.
@@ -433,6 +554,9 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 					// later fail, this address becomes eligible again as a required
 					// fallback using the normal bounded admission wait.
 					delete(attempted, result.addr)
+					if actualAttempts > 0 {
+						actualAttempts--
+					}
 					if primaryFailed {
 						delayedHedge = false
 						launchAlternatives(2-active, false, capacityFallbackTryOnly)
@@ -441,6 +565,12 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 				}
 				capacityErr = result.err
 				if isDialTargetBulkheadSaturation(result.err) {
+					// Per-target capacity rejected this address before any socket was
+					// created. Keep it excluded, but return its target-attempt budget
+					// so unrelated upstream capacity remains usable.
+					if actualAttempts > 0 {
+						actualAttempts--
+					}
 					// A per-target limit leaves unrelated foreground capacity usable.
 					// Fill the open Top-2 slot only with immediate admission so this
 					// degraded request cannot create another waiter.
@@ -461,7 +591,11 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 			if result.err != nil && !errors.Is(result.err, context.Canceled) {
 				dialErrors = append(dialErrors, fmt.Errorf("%s: %w", result.addr, result.err))
 				if isCached {
-					outcome.cachedFailed = true
+					if rule.Protocol == config.ProtocolSOCKS5 && connectProxyErrorIsRouteNeutral(result.err) {
+						outcome.cachedFailureNeutral = true
+					} else {
+						outcome.cachedFailed = true
+					}
 					primaryFailed = true
 				}
 			}
@@ -558,6 +692,8 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 	defer cancel()
 	results := make(chan dialResult, len(rule.Targets))
 	attempted := make(map[string]struct{}, len(rule.Targets))
+	targetAttemptLimit := connectProxyTargetAttemptLimit(rule)
+	actualAttempts := 0
 	active := 0
 	healthExcluded := false
 	maintenanceCapacityLimited := false
@@ -565,63 +701,94 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 	foregroundFallbackTryOnly := false
 	var foregroundCapacityErr error
 	launchAvailable := func(tryOnly bool) bool {
+		if actualAttempts >= targetAttemptLimit {
+			return false
+		}
 		capacity := 2 - active
 		if capacity <= 0 {
 			return false
 		}
-		candidates := runtime.routes.selectTargetsExcluding(rule, len(rule.Targets), time.Now(), attempted)
 		launched := 0
-		for _, target := range candidates {
-			if launched == capacity {
+		for launched == 0 && actualAttempts < targetAttemptLimit && len(attempted) < len(rule.Targets) {
+			candidates := runtime.routes.selectTargetSelections(
+				rule,
+				len(rule.Targets),
+				time.Now(),
+				attempted,
+				active == 0 && actualAttempts == 0,
+			)
+			if len(candidates) == 0 {
 				break
 			}
-			addr := target.Address
-			attempted[addr] = struct{}{}
-			if runtime.health.unhealthy(rule, addr) {
-				healthExcluded = true
-				continue
-			}
-			active++
-			launched++
-			go func() {
-				releaseDial, acquireErr := acquire(raceCtx, rule, addr, tryOnly)
-				if acquireErr != nil {
-					results <- dialResult{addr: addr, err: acquireErr}
-					return
+			before := len(attempted)
+			for _, candidate := range candidates {
+				if launched == capacity || actualAttempts >= targetAttemptLimit {
+					break
 				}
+				target := candidate.target
+				addr := target.Address
+				attempted[addr] = struct{}{}
 				if runtime.health.unhealthy(rule, addr) {
-					releaseDial()
-					results <- dialResult{addr: addr, err: ErrActiveHealthUnhealthy}
-					return
+					healthExcluded = true
+					runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
+					continue
 				}
-				started := time.Now()
-				attempt, err := runtime.routes.begin(rule, addr, started)
-				if err != nil {
-					releaseDial()
-					results <- dialResult{addr: addr, err: err}
-					return
-				}
-				// The selected admission budget protects the socket-creating operation.
-				// Any protocol setup runs after release under the decision context.
-				conn, err := func() (net.Conn, error) {
-					defer releaseDial()
-					return dial(raceCtx, addr)
-				}()
-				if err == nil && conn == nil {
-					err = errors.New("dial returned a nil connection")
-				}
-				if err == nil && prepare != nil {
-					if prepareErr := prepare(raceCtx, conn, addr); prepareErr != nil {
-						_ = conn.Close()
-						conn = nil
-						err = prepareErr
+				actualAttempts++
+				active++
+				launched++
+				go func() {
+					finish := func(result dialResult) {
+						runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
+						results <- result
 					}
+					releaseDial, acquireErr := acquire(raceCtx, rule, addr, tryOnly)
+					if acquireErr != nil {
+						finish(dialResult{addr: addr, err: acquireErr})
+						return
+					}
+					if runtime.health.unhealthy(rule, addr) {
+						releaseDial()
+						finish(dialResult{addr: addr, err: ErrActiveHealthUnhealthy})
+						return
+					}
+					started := time.Now()
+					attempt, err := runtime.routes.begin(rule, addr, started)
+					if err != nil {
+						releaseDial()
+						finish(dialResult{addr: addr, err: err})
+						return
+					}
+					// The selected admission budget protects the socket-creating operation.
+					// Any protocol setup runs after release under the decision context.
+					conn, err := func() (net.Conn, error) {
+						defer releaseDial()
+						return dial(raceCtx, addr)
+					}()
+					if err == nil && conn == nil {
+						err = errors.New("dial returned a nil connection")
+					}
+					if err == nil && prepare != nil {
+						if prepareErr := prepare(raceCtx, conn, addr); prepareErr != nil {
+							_ = conn.Close()
+							conn = nil
+							err = prepareErr
+						}
+					}
+					latency := time.Since(started)
+					routeObserve(attempt, latency, connectProxyRouteObservationError(err), time.Now())
+					metricDial(rule.Name, addr, latency, err)
+					finish(dialResult{conn: conn, addr: addr, attempt: attempt, err: err})
+				}()
+				if candidate.protocolProbe.token != 0 {
+					// Do not race a recovery canary against a healthy route. The
+					// canary must receive one legal response (or fail) to promote the
+					// lazy H3 replacement; ordinary alternatives refill on failure.
+					break
 				}
-				latency := time.Since(started)
-				routeObserve(attempt, latency, err, time.Now())
-				metricDial(rule.Name, addr, latency, err)
-				results <- dialResult{conn: conn, addr: addr, attempt: attempt, err: err}
-			}()
+			}
+			if len(attempted) == before {
+				break
+			}
 		}
 		return launched > 0
 	}
@@ -660,12 +827,33 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 			if result.conn != nil {
 				_ = result.conn.Close()
 			}
+			if errors.Is(result.err, ErrActiveHealthUnhealthy) || errors.Is(result.err, ErrCircuitOpen) {
+				// The post-admission health recheck prevented any network attempt.
+				// A concurrent circuit half-open claim is likewise route admission,
+				// not a network attempt. Preserve the address exclusion but give its
+				// bounded attempt slot to another configured target.
+				if errors.Is(result.err, ErrActiveHealthUnhealthy) {
+					healthExcluded = true
+				}
+				if actualAttempts > 0 {
+					actualAttempts--
+				}
+				if !maintenanceCapacityLimited && !foregroundGlobalCapacityLimited {
+					launchAvailable(foregroundFallbackTryOnly)
+				}
+				continue
+			}
 			// Local overload is not evidence that another route is healthier. Stop
 			// launching new candidates, but let an independent candidate that is
 			// already in flight finish instead of canceling a likely success.
 			if isDialBulkheadError(result.err) {
 				foregroundCapacityErr = result.err
 				if isDialTargetBulkheadSaturation(result.err) {
+					// Admission failed before the network dial. Preserve this address
+					// in attempted while returning its SOCKS target-attempt slot.
+					if actualAttempts > 0 {
+						actualAttempts--
+					}
 					foregroundFallbackTryOnly = true
 					launchAvailable(true)
 					continue
@@ -807,6 +995,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		return
 	}
 	defer conn.Close()
+	defer failPendingSOCKS5(conn)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -834,23 +1023,25 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		}
 	}
 
-	if cached, ok := runtime.loadBoostWinnerToken(key); ok {
+	if cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
 		cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
-		triggerLazy := time.Until(cached.expires) < boostRevalidateAfter
+		triggerLazy := rule.Protocol != config.ProtocolSOCKS5 && time.Until(cached.expires) < boostRevalidateAfter
 		outcome, err := runtime.raceCachedBoostTarget(decisionCtx, rule, cached.addr, prepare)
 		if err == nil {
-			cacheHit := outcome.winner.addr == cached.addr
-			winnerToken := cachedToken
+			cacheHit, winnerToken := runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, true)
 			if cacheHit {
 				metricBoostCache(rule.Name, true)
 			} else {
 				metricBoostCache(rule.Name, false)
-				winnerToken = runtime.storeBoostWinner(key, outcome.winner.addr)
 			}
 			defer outcome.winner.conn.Close()
+			if err := markSOCKS5Connected(conn); err != nil {
+				return
+			}
 			// A true cache hit deliberately does not extend expires. Otherwise
 			// steady traffic would postpone lazy revalidation forever. A fallback or
-			// hedge win is fresh route evidence and replaces the cached winner.
+			// hedge win is fresh route evidence and replaces the cached winner, except
+			// when a destination-specific CONNECT response preserved the old winner.
 			fields := []zap.Field{
 				zap.String("ruleName", rule.Name),
 				zap.String("remoteAddr", connAddr(conn)),
@@ -859,6 +1050,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 				zap.Bool("boostCacheHit", cacheHit),
 				zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
 				zap.Bool("boostHedged", outcome.hedged),
+				zap.Bool("boostWinnerPreserved", outcome.cachedFailureNeutral),
 			}
 			if cacheHit && triggerLazy {
 				fields = append(fields, zap.Bool("boostLazyRefresh", true))
@@ -872,9 +1064,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 			runtime.finishBoostRelay(winnerToken, outcome.winner.attempt, result)
 			return
 		}
-		if outcome.cachedFailed {
-			runtime.deleteBoostWinnerIfCurrent(cachedToken)
-		}
+		runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, false)
 		if isDialBulkheadError(err) && !outcome.cachedFailed {
 			// Local dial pressure says nothing about the cached route's health. Keep
 			// the winner so a later connection can reuse it after capacity drains.
@@ -888,17 +1078,24 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		if ctx.Err() != nil {
 			return
 		}
-		utils.Logger.Error("缓存线路及备选均不可用",
-			zap.String("ruleName", rule.Name),
-			zap.String("targetAddr", cached.addr),
-			zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
-			zap.Bool("boostHedged", outcome.hedged),
-			zap.Error(err))
+		if rule.Protocol == config.ProtocolSOCKS5 {
+			setPendingSOCKS5Failure(conn, err)
+			logConnectProxyFailure(rule, cached.addr, err, "缓存原生代理线路及备选均不可用")
+		} else {
+			utils.Logger.Error("缓存线路及备选均不可用",
+				zap.String("ruleName", rule.Name),
+				zap.String("targetAddr", cached.addr),
+				zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
+				zap.Bool("boostHedged", outcome.hedged),
+				zap.Error(err))
+		}
 		return
 	}
 	metricBoostCache(rule.Name, false)
 
-	dial := boostDialFunc(DialFastContext)
+	dial := boostDialFunc(func(dialCtx context.Context, addr string) (net.Conn, error) {
+		return runtime.dialRouteTarget(dialCtx, rule, addr)
+	})
 	winner, err := runtime.raceBoostTargetsPrepared(decisionCtx, rule, dial, prepare)
 	if err != nil {
 		if isDialBulkheadError(err) {
@@ -906,11 +1103,19 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 				zap.String("ruleName", rule.Name), zap.Error(err))
 			return
 		}
-		utils.Logger.Error("加速决策失败：所有线路均不可用",
-			zap.String("ruleName", rule.Name), zap.Error(err))
+		if rule.Protocol == config.ProtocolSOCKS5 {
+			setPendingSOCKS5Failure(conn, err)
+			logConnectProxyFailure(rule, "", err, "原生代理加速决策失败")
+		} else {
+			utils.Logger.Error("加速决策失败：所有线路均不可用",
+				zap.String("ruleName", rule.Name), zap.Error(err))
+		}
 		return
 	}
 	defer winner.conn.Close()
+	if err := markSOCKS5Connected(conn); err != nil {
+		return
+	}
 	winnerToken := runtime.storeBoostWinner(key, winner.addr)
 	utils.Logger.Debug("建立连接",
 		zap.String("ruleName", rule.Name),
