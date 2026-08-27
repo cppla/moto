@@ -173,6 +173,32 @@
           }
         }
       ]
+    },
+    {
+      "name": "TLS SNI/ALPN 分流示例",
+      "listen": "127.0.0.1:9006",
+      "protocol": "tcp",
+      "mode": "tls",
+      "prewarm": false,
+      "timeout": 3000,
+      "allowlist": ["127.0.0.0/8", "::1/128"],
+      "maxConnections": 4096,
+      "maxConnectionsPerIP": 1024,
+      "blacklist": null,
+      "targets": [
+        {
+          "address": "127.0.0.1:9443",
+          "serverNames": ["api.example.com"],
+          "alpn": ["h2", "http/1.1"]
+        },
+        {
+          "address": "127.0.0.1:9444",
+          "serverNames": ["*.example.com"]
+        },
+        {
+          "address": "127.0.0.1:9445"
+        }
+      ]
     }
   ]
 }
