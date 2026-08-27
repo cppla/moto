@@ -262,7 +262,10 @@ func snapshotHTTP3Gauges(manager *connectProxyManager) http3GaugeSnapshot {
 		}
 		policy.halfOpen = policy.halfOpen || state.probing
 		policy.boostCanary = policy.boostCanary || state.boostCanaryInFlight
-		policy.fallbackPending = policy.fallbackPending || state.pending
+		// pending alone means repeated degradation made this endpoint eligible
+		// for H2 validation. fallbackPending counts requests that actually joined
+		// the validation window, including H2 siblings of a half-open H3 probe.
+		policy.fallbackPending = policy.fallbackPending || state.fallbackPending > 0
 	}
 	manager.h3FallbackMu.Unlock()
 	for _, policy := range aggregates {

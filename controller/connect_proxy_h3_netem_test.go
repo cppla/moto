@@ -21,6 +21,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	xhttp2 "golang.org/x/net/http2"
 )
 
 // TestHTTP3NetemDegradationCreatesAndPromotesCandidate is intentionally opt-in:
@@ -221,7 +222,7 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 		return transport
 	})
 	defer h3Manager.close()
-	h2Manager := newHTTP2ConnectManager(func(key http2ConnectTransportKey) *http.Transport {
+	h2Manager := newHTTP2ConnectManager(func(key http2ConnectTransportKey) *xhttp2.Transport {
 		transport := newHTTP2ConnectTransport(key)
 		transport.TLSClientConfig.RootCAs = roots
 		return transport

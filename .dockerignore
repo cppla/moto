@@ -2,6 +2,7 @@
 .github
 .idea
 bin
+config/setting.json
 docs
 *.log
 *.out

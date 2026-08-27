@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"moto/config"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -184,4 +186,156 @@ func TestOperationalGaugesExposeAggregatedHTTP3DegradationState(t *testing.T) {
 	if strings.Contains(body, key.serverName) {
 		t.Fatalf("metrics leaked HTTP/3 TLS server name %q", key.serverName)
 	}
+}
+
+func TestHTTP3FallbackPendingGaugeRequiresActiveMixedValidation(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	manager := runtime.connectProxy
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+
+	const address = "shared-proxy.example:443"
+	h3Only := &config.Target{
+		Address:      address,
+		ConnectProxy: &config.ConnectProxyConfig{Protocols: []string{config.ConnectProxyH3}},
+	}
+	mixed := &config.Target{
+		Address: address,
+		ConnectProxy: &config.ConnectProxyConfig{
+			Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2},
+		},
+	}
+	key := http3ConnectTransportKey{address: address}
+
+	h3Calls := 0
+	h2Calls := 0
+	firstH2Started := make(chan struct{})
+	releaseFirstH2 := make(chan struct{})
+	h3ProbeStarted := make(chan struct{})
+	releaseH3Probe := make(chan struct{})
+	siblingH2Started := make(chan struct{})
+	releaseSiblingH2 := make(chan struct{})
+	var releaseFirstH2Once sync.Once
+	var releaseH3ProbeOnce sync.Once
+	var releaseSiblingH2Once sync.Once
+	releaseFirstH2Dial := func() { releaseFirstH2Once.Do(func() { close(releaseFirstH2) }) }
+	releaseH3ProbeDial := func() { releaseH3ProbeOnce.Do(func() { close(releaseH3Probe) }) }
+	releaseSiblingH2Dial := func() { releaseSiblingH2Once.Do(func() { close(releaseSiblingH2) }) }
+	t.Cleanup(func() {
+		releaseFirstH2Dial()
+		releaseH3ProbeDial()
+		releaseSiblingH2Dial()
+	})
+	newConnection := func() net.Conn {
+		connection, peer := net.Pipe()
+		_ = peer.Close()
+		return connection
+	}
+	manager.dialers[config.ConnectProxyH3] = func(context.Context, *config.Target, string) (net.Conn, error) {
+		h3Calls++
+		if h3Calls == 2 {
+			close(h3ProbeStarted)
+			<-releaseH3Probe
+		}
+		return newConnection(), nil
+	}
+	manager.dialers[config.ConnectProxyH2] = func(context.Context, *config.Target, string) (net.Conn, error) {
+		h2Calls++
+		switch h2Calls {
+		case 1:
+			close(firstH2Started)
+			<-releaseFirstH2
+		case 2:
+			close(siblingH2Started)
+			<-releaseSiblingH2
+		}
+		return newConnection(), nil
+	}
+
+	assertFallbackPending := func(want string) {
+		t.Helper()
+		var output strings.Builder
+		runtime.renderOperationalGauges(&output)
+		line := `moto_connect_proxy_h3_fallback_pending{target="` + address + `"} ` + want
+		if !strings.Contains(output.String(), line) {
+			t.Fatalf("metrics output missing %q\noutput:\n%s", line, output.String())
+		}
+	}
+
+	manager.noteHTTP3Degradation(key, http3DegradationReasonSustainedSignals)
+	manager.noteHTTP3Recovery(key)
+	manager.noteHTTP3Degradation(key, http3DegradationReasonSevereLossAndWrite)
+	assertFallbackPending("0")
+
+	// The H3-only rule sharing this endpoint remains fail-open and does not
+	// create a fictitious H2 validation participant.
+	connection, err := manager.dial(context.Background(), h3Only, "h3-only.example:443")
+	if err != nil {
+		t.Fatalf("H3-only shared-endpoint dial: %v", err)
+	}
+	_ = connection.Close()
+	if h3Calls != 1 || h2Calls != 0 {
+		t.Fatalf("H3-only calls = h3:%d h2:%d, want 1/0", h3Calls, h2Calls)
+	}
+	assertFallbackPending("0")
+
+	type dialResult struct {
+		connection net.Conn
+		err        error
+	}
+	result := make(chan dialResult, 1)
+	go func() {
+		connection, err := manager.dial(context.Background(), mixed, "mixed.example:443")
+		result <- dialResult{connection: connection, err: err}
+	}()
+	<-firstH2Started
+	assertFallbackPending("1")
+	releaseFirstH2Dial()
+	completed := <-result
+	if completed.err != nil {
+		t.Fatalf("mixed H2 validation: %v", completed.err)
+	}
+	_ = completed.connection.Close()
+	if h3Calls != 1 || h2Calls != 1 {
+		t.Fatalf("shared-endpoint calls = h3:%d h2:%d, want 1/1", h3Calls, h2Calls)
+	}
+	assertFallbackPending("0")
+
+	// When a half-open H3 probe owns recovery, a concurrent mixed request joins
+	// through H2 with pending=false. The participant counter must still expose
+	// that real validation while both attempts are in flight.
+	manager.h3FallbackMu.Lock()
+	now = manager.h3Fallback[key].retryAt
+	manager.h3FallbackMu.Unlock()
+	probeResult := make(chan dialResult, 1)
+	go func() {
+		connection, err := manager.dial(context.Background(), mixed, "half-open.example:443")
+		probeResult <- dialResult{connection: connection, err: err}
+	}()
+	<-h3ProbeStarted
+	siblingResult := make(chan dialResult, 1)
+	go func() {
+		connection, err := manager.dial(context.Background(), mixed, "half-open-sibling.example:443")
+		siblingResult <- dialResult{connection: connection, err: err}
+	}()
+	<-siblingH2Started
+	assertFallbackPending("1")
+
+	releaseH3ProbeDial()
+	probe := <-probeResult
+	if probe.err != nil {
+		t.Fatalf("half-open H3 validation: %v", probe.err)
+	}
+	_ = probe.connection.Close()
+	releaseSiblingH2Dial()
+	sibling := <-siblingResult
+	if sibling.err != nil {
+		t.Fatalf("half-open sibling H2 validation: %v", sibling.err)
+	}
+	_ = sibling.connection.Close()
+	if h3Calls != 2 || h2Calls != 2 {
+		t.Fatalf("half-open calls = h3:%d h2:%d, want 2/2 total", h3Calls, h2Calls)
+	}
+	assertFallbackPending("0")
 }

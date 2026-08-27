@@ -294,8 +294,8 @@ func TestHTTP2ConnectOpensBeyondEightConnectionsForLowPeerStreamLimit(t *testing
 }
 
 func TestHTTP2ConnectManagerRetireClosesTransportsAfterActiveTunnelsDrain(t *testing.T) {
-	manager := newHTTP2ConnectManager(func(http2ConnectTransportKey) *http.Transport {
-		return &http.Transport{}
+	manager := newHTTP2ConnectManager(func(http2ConnectTransportKey) *xhttp2.Transport {
+		return &xhttp2.Transport{}
 	})
 	key := http2ConnectTransportKey{address: "proxy.example:443", serverName: "proxy.example"}
 
@@ -509,7 +509,7 @@ func TestSOCKS5NormalUsesHTTP2ConnectAndRepliesAfterProxyAcceptance(t *testing.T
 	defer clientSide.Close()
 	done := make(chan struct{})
 	go func() {
-		runtime.dispatch(context.Background(), serverSide, rule)
+		runtime.dispatch(context.Background(), serverSide, rule, userAgent)
 		close(done)
 	}()
 	performSOCKS5DomainRequest(t, clientSide, "service.example", 443)
@@ -549,7 +549,7 @@ func TestSOCKS5DoesNotAcknowledgeRejectedHTTP2Connect(t *testing.T) {
 	defer clientSide.Close()
 	done := make(chan struct{})
 	go func() {
-		runtime.dispatch(context.Background(), serverSide, rule)
+		runtime.dispatch(context.Background(), serverSide, rule, "")
 		close(done)
 	}()
 	performSOCKS5DomainRequest(t, clientSide, "service.example", 443)
@@ -579,7 +579,7 @@ func newHTTP2ConnectTestServer(t *testing.T, handler http.HandlerFunc) *httptest
 func newHTTP2ConnectTestManager(server *httptest.Server) *http2ConnectManager {
 	roots := x509.NewCertPool()
 	roots.AddCert(server.Certificate())
-	return newHTTP2ConnectManager(func(key http2ConnectTransportKey) *http.Transport {
+	return newHTTP2ConnectManager(func(key http2ConnectTransportKey) *xhttp2.Transport {
 		transport := newHTTP2ConnectTransport(key)
 		transport.TLSClientConfig.RootCAs = roots
 		return transport

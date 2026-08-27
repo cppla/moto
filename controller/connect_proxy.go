@@ -645,7 +645,7 @@ func (manager *connectProxyManager) noteHTTP3Degradation(key http3ConnectTranspo
 	defer func() {
 		manager.h3FallbackMu.Unlock()
 		if activatedFallback {
-			utils.Logger.Warn("HTTP/3 短时间内连续退化，开始验证 HTTP/2 回退",
+			utils.Logger.Warn("HTTP/3 短时间内连续退化，进入恢复评估窗口",
 				zap.String("targetAddr", key.address),
 				zap.Int("degradationStrikes", strikes),
 				zap.String("reason", string(reason)))

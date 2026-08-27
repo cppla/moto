@@ -46,6 +46,70 @@ flowchart LR
     M -. 故障切换 / 周期探索 .-> S[其他 Targets]
 ```
 
+### SOCKS5 上游协议工作方式
+
+`mode` 先决定选哪个 target，`connectProxy.protocols` 再决定如何连接该 target。下列判断都以每个新的 SOCKS5 CONNECT 为单位；已建立的隧道会继续使用原协议，不会在 H3 和 H2 之间迁移。
+
+#### `["h3", "h2"]`：H3 优先，H2 兜底
+
+```mermaid
+flowchart TD
+    A[新 SOCKS5 CONNECT] --> B{H3 状态}
+    B -->|正常| C[尝试 H3]
+    B -->|冷却中或需要验证 H2 可达| D[直接尝试 H2]
+    B -->|冷却到期| P[放行一个 H3 半开探测]
+    P --> C
+    P -. 其他并发请求 .-> D
+    C -->|成功| E[使用 H3；半开时恢复 H3 优先]
+    C -->|可安全回退的故障| D
+    C -->|明确的上游拒绝| R[返回失败，不改试 H2]
+    E -. 持续退化 .-> Q[平滑轮换到新的 H3 连接]
+    Q -. 短时间再次退化 .-> D
+    D --> G{H2 结果}
+    G -->|CONNECT 成功| H[使用 H2]
+    G -->|代理已响应但请求失败| F[返回失败]
+    G -->|路径不可达| I[返回失败，不锁死 H3]
+    H -. 若确认 H3 路径故障 .-> J[进入或延长 H3 冷却]
+    F -. 若 H2 证明可达且 H3 路径故障 .-> J
+    J --> B
+```
+
+只有传输、超时或协议兼容性等可安全重试的故障才会改试 H2；明确的认证、访问控制或限流等上游响应会直接返回。H3 持续退化时也会先确认 H2 可达，再冷却 H3；若 H2 也不可达，则保持 H3 可尝试。H3 本地容量不足时可就本次请求改试 H2，但不会因此触发冷却。适合默认生产使用：正常时优先 H3，UDP/QUIC 路径异常时仍可使用 H2。
+
+#### `["h3"]`：仅使用 H3
+
+```mermaid
+flowchart LR
+    A[新 SOCKS5 CONNECT] --> B[尝试 H3]
+    B -->|成功| C[使用 H3]
+    C -. 持续退化 .-> H[平滑轮换到新的 H3 连接]
+    H --> C
+    B -->|失败| D[当前 Target 失败]
+    D --> E{选路仍有候选 Target}
+    E -->|是| F[按 mode 尝试下一候选]
+    F --> B
+    E -->|否| G[返回失败]
+    D -.-> I[无 H2 回退，无跨协议冷却或半开]
+```
+
+H3 失败不会因缺少 H2 而将该协议长期锁死，后续新请求仍可尝试 H3。适合验证 H3/UDP 路径，或确定网络始终可用 H3 的环境。
+
+#### `["h2"]`：仅使用 H2
+
+```mermaid
+flowchart LR
+    A[新 SOCKS5 CONNECT] --> B[尝试 H2]
+    B -->|成功| C[使用 H2]
+    B -->|失败| D[当前 Target 失败]
+    D --> E{选路仍有候选 Target}
+    E -->|是| F[按 mode 尝试下一候选]
+    F --> B
+    E -->|否| G[返回失败]
+    D -.-> H[无 H3 尝试、冷却或半开]
+```
+
+适合 UDP/QUIC 被限制、H3 路径长期不稳定，或明确优先使用 TCP/TLS 路径的环境。
+
 ## 运行模式
 
 | 模式 | 行为 |
@@ -123,7 +187,7 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
 | `hedge` | 关闭 | 仅用于至少两个唯一目标的 `boost`；空对象默认延迟范围 25–250 ms，且 `maxDelay` 必须小于规则 `timeout` |
 | `healthCheck` | 关闭 | 可选 TCP 或明文 HTTP 主动探测，达到阈值后暂时排除目标 |
 | `proxyProtocol` | 关闭 | 从可信 CIDR 接收 PROXY v1/v2，或向上游发送 v1/v2 |
-| `userAgent` | 缺省 | 仅用于 `socks5` 规则；从非空数组中为每次入站 SOCKS5 CONNECT 随机选择一个上游 HTTP CONNECT User-Agent |
+| `userAgent` | 缺省 | 仅用于 `socks5` 规则；Moto 启动时从非空数组中为每条规则随机选择一个上游身份，并在本次进程运行期间保持稳定 |
 | `allowlist` | 空 | CIDR 来源白名单；空值允许所有有效地址 |
 | `blacklist` | 空 | 兼容旧配置的精确 IP 拒绝表 |
 | `maxConnections` | `4096` | 单规则连接上限 |
@@ -146,8 +210,8 @@ SOCKS5 到 H3/H2 CONNECT 的完整规则已经整合到 [config/setting.json](co
   "healthCheck": { "type": "tcp", "interval": 10000, "timeout": 2000 },
   "allowlist": ["127.0.0.0/8", "::1/128"],
   "userAgent": [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:154.0) Gecko/20100101 Firefox/154.0"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0"
   ],
   "targets": [
     {
@@ -177,8 +241,6 @@ SOCKS5 到 H3/H2 CONNECT 的完整规则已经整合到 [config/setting.json](co
 ```
 
 `protocols` 按配置顺序尝试。Moto 支持 H3/H2 连接复用、自动故障切换、恢复探测和自适应选路；这些策略由程序内部管理，无需额外调节。Moto 始终校验证书与 `serverName`，上游拒绝也不会被误报为 SOCKS 成功。
-
-`userAgent` 只设置上游 CONNECT 请求头，不代表浏览器 TLS 或 QUIC 指纹。任何支持 SOCKS5 CONNECT 的客户端都可以连接 `127.0.0.1:9005`；当前仅支持 TCP CONNECT。对外监听时必须使用防火墙、VPN 和 `allowlist` 限制来源。
 
 SOCKS5 模式使用独立的协议连接管理，因此必须保持 `prewarm: false`，也不能与 `regex`、`tls`、HTTP health check 或 PROXY protocol 组合。Basic Auth 凭据存放在 JSON 中，应严格限制配置文件权限。Moto 会在启动前校验配置，无效配置不会投入运行。
 

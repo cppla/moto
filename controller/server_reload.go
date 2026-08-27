@@ -47,6 +47,7 @@ func (s *Server) ReloadRules(ctx context.Context, rules []*config.Rule) (ReloadR
 	if err != nil {
 		return ReloadResult{}, fmt.Errorf("prepare reload: %w", err)
 	}
+	preserveConnectProxyUserAgentSelections(old, next)
 	result := ReloadResult{FromGeneration: old.id, ToGeneration: next.id}
 	if next.fingerprint == old.fingerprint {
 		next.retire()

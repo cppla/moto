@@ -866,7 +866,7 @@ func TestSOCKS5NormalUsesHTTP3Connect(t *testing.T) {
 	defer clientSide.Close()
 	done := make(chan struct{})
 	go func() {
-		runtime.dispatch(context.Background(), serverSide, rule)
+		runtime.dispatch(context.Background(), serverSide, rule, userAgent)
 		close(done)
 	}()
 	performSOCKS5DomainRequest(t, clientSide, "service.example", 443)

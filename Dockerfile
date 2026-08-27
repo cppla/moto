@@ -20,6 +20,8 @@ FROM scratch
 
 COPY --from=build /out/moto /moto
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /src/LICENSE /licenses/moto/LICENSE
+COPY --from=build /src/THIRD_PARTY_NOTICES /licenses/moto/THIRD_PARTY_NOTICES
 COPY --from=build --chown=65532:65532 /out/work /work
 
 USER 65532:65532

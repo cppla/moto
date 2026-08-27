@@ -69,7 +69,7 @@ jobs:
             go build -trimpath -buildvcs=false \
             -ldflags "-s -w -buildid= -X main.version=${GITHUB_REF_NAME} -X main.commit=${commit} -X main.buildDate=${build_date}" \
             -o "${package_dir}/${binary}" .
-          install -m 0644 README.md LICENSE "${package_dir}/"
+          install -m 0644 README.md LICENSE THIRD_PARTY_NOTICES "${package_dir}/"
           install -m 0644 config/setting.json "${package_dir}/config/"
           install -m 0644 packaging/moto.service "${package_dir}/packaging/"
           tar --sort=name --mtime="@${epoch}" --owner=0 --group=0 --numeric-owner \
@@ -151,6 +151,7 @@ jobs:
               "${package}/${binary}" \
               "${package}/LICENSE" \
               "${package}/README.md" \
+              "${package}/THIRD_PARTY_NOTICES" \
               "${package}/config/setting.json" \
               "${package}/packaging/moto.service" | LC_ALL=C sort)"
             test "${actual}" = "${expected}"

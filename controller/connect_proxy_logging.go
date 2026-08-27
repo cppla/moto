@@ -21,6 +21,9 @@ func logConnectProxyFailure(rule *config.Rule, fallbackTarget string, err error,
 		target = "multiple"
 	}
 	if protocol == "" {
+		protocol = configuredConnectProxyProtocol(rule)
+	}
+	if protocol == "" {
 		protocol = "mixed"
 	}
 	if class == "" {
@@ -55,4 +58,33 @@ func logConnectProxyFailure(rule *config.Rule, fallbackTarget string, err error,
 	default:
 		utils.Logger.Info(message, fields...)
 	}
+}
+
+// configuredConnectProxyProtocol provides a bounded protocol identity when a
+// final generic transport error has no concrete HTTP response to identify the
+// attempt. All targets must be protocol-homogeneous before the summary may be
+// labeled h2 or h3; any ambiguity remains mixed.
+func configuredConnectProxyProtocol(rule *config.Rule) string {
+	if rule == nil || len(rule.Targets) == 0 {
+		return ""
+	}
+	configured := ""
+	for _, target := range rule.Targets {
+		if target == nil || target.ConnectProxy == nil || len(target.ConnectProxy.Protocols) == 0 {
+			return ""
+		}
+		for _, protocol := range target.ConnectProxy.Protocols {
+			if protocol != config.ConnectProxyH2 && protocol != config.ConnectProxyH3 {
+				return ""
+			}
+			if configured == "" {
+				configured = protocol
+				continue
+			}
+			if configured != protocol {
+				return "mixed"
+			}
+		}
+	}
+	return configured
 }
