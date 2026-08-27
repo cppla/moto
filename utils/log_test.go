@@ -1,13 +1,16 @@
 package utils
 
 import (
+	"encoding/json"
 	"moto/config"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func TestLoggerHasSafeDefault(t *testing.T) {
@@ -59,4 +62,35 @@ func TestConfigureAllowsStdoutOnly(t *testing.T) {
 		t.Fatalf("Configure() error = %v", err)
 	}
 	Logger.Warn("stdout-only")
+}
+
+func TestTimeEncoderUsesLocalTimeWithSecondPrecision(t *testing.T) {
+	previousLocation := time.Local
+	time.Local = time.FixedZone("UTC+8", 8*60*60)
+	t.Cleanup(func() { time.Local = previousLocation })
+
+	encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
+		TimeKey:    "ts",
+		MessageKey: "msg",
+		EncodeTime: TimeEncoder,
+	})
+	entry := zapcore.Entry{
+		Time:    time.Date(2026, time.August, 27, 9, 3, 6, 987654321, time.UTC),
+		Message: "time-format-test",
+	}
+	buffer, err := encoder.EncodeEntry(entry, nil)
+	if err != nil {
+		t.Fatalf("EncodeEntry() error = %v", err)
+	}
+	defer buffer.Free()
+
+	var decoded struct {
+		Timestamp string `json:"ts"`
+	}
+	if err := json.Unmarshal(buffer.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode log entry: %v", err)
+	}
+	if decoded.Timestamp != "2026-08-27 17:03:06" {
+		t.Fatalf("timestamp = %q, want %q", decoded.Timestamp, "2026-08-27 17:03:06")
+	}
 }

@@ -67,8 +67,10 @@ var levelMap = map[string]zapcore.Level{
 	"fatal":  zapcore.FatalLevel,
 }
 
+const logTimeLayout = "2006-01-02 15:04:05"
+
 func TimeEncoder(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-	enc.AppendString(t.UTC().Format(time.RFC3339Nano))
+	enc.AppendString(t.In(time.Local).Format(logTimeLayout))
 }
 
 // optional helpers for structured fields (used in some modules)
