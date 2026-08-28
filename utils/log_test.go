@@ -65,14 +65,14 @@ func TestConfigureAllowsStdoutOnly(t *testing.T) {
 }
 
 func TestTimeEncoderUsesLocalTimeWithSecondPrecision(t *testing.T) {
-	previousLocation := time.Local
-	time.Local = time.FixedZone("UTC+8", 8*60*60)
-	t.Cleanup(func() { time.Local = previousLocation })
+	location := time.FixedZone("UTC+8", 8*60*60)
 
 	encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
 		TimeKey:    "ts",
 		MessageKey: "msg",
-		EncodeTime: TimeEncoder,
+		EncodeTime: func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+			appendTimeInLocation(t, location, enc)
+		},
 	})
 	entry := zapcore.Entry{
 		Time:    time.Date(2026, time.August, 27, 9, 3, 6, 987654321, time.UTC),

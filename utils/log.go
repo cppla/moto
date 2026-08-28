@@ -70,7 +70,11 @@ var levelMap = map[string]zapcore.Level{
 const logTimeLayout = "2006-01-02 15:04:05"
 
 func TimeEncoder(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-	enc.AppendString(t.In(time.Local).Format(logTimeLayout))
+	appendTimeInLocation(t, time.Local, enc)
+}
+
+func appendTimeInLocation(t time.Time, location *time.Location, enc zapcore.PrimitiveArrayEncoder) {
+	enc.AppendString(t.In(location).Format(logTimeLayout))
 }
 
 // optional helpers for structured fields (used in some modules)
