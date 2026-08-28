@@ -13,7 +13,7 @@
       "listen": "127.0.0.1:9001",
       "mode": "normal",
       "prewarm": false,
-      "timeout": 3000,
+      "timeout": 1000,
       "healthCheck": {
         "type": "tcp",
         "interval": 10000,
@@ -67,7 +67,7 @@
       "listen": "127.0.0.1:9003",
       "mode": "boost",
       "prewarm": false,
-      "timeout": 3000,
+      "timeout": 2000,
       "hedge": {
         "minDelay": 25,
         "maxDelay": 250
@@ -97,7 +97,7 @@
       "listen": "127.0.0.1:9004",
       "mode": "roundrobin",
       "prewarm": false,
-      "timeout": 3000,
+      "timeout": 2000,
       "healthCheck": {
         "type": "tcp",
         "interval": 10000,
@@ -124,7 +124,7 @@
       "mode": "boost",
       "protocol": "socks5",
       "prewarm": false,
-      "timeout": 10000,
+      "timeout": 2000,
       "hedge": {
         "minDelay": 25,
         "maxDelay": 250
@@ -180,7 +180,7 @@
       "protocol": "tcp",
       "mode": "tls",
       "prewarm": false,
-      "timeout": 3000,
+      "timeout": 2000,
       "allowlist": ["127.0.0.0/8", "::1/128"],
       "maxConnections": 4096,
       "maxConnectionsPerIP": 1024,
