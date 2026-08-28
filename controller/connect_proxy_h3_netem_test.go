@@ -162,14 +162,17 @@ func TestHTTP3NetemDegradationCreatesAndPromotesCandidate(t *testing.T) {
 	}
 }
 
-// TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery is the
-// production-isomorphic lifecycle gate. It runs real HTTP/3 and HTTP/2 CONNECT
-// servers on the same IP:port, degrades only UDP twice, validates the TCP
-// fallback, and proves the cooldown's single half-open QUIC recovery.
+// TestHTTP3NetemRuleBreakerCooldownAndDataPlaneProbation is the
+// production-isomorphic rule-breaker lifecycle gate. It runs real HTTP/3 and
+// HTTP/2 CONNECT servers on the same IP:port, degrades two independent QUIC
+// generations, validates the TCP fallback, and proves that only one half-open
+// QUIC probation is admitted. A successful CONNECT alone is insufficient: the
+// rule returns to H3 only after the probation carries real payload and records
+// three healthy samples over the production minimum duration.
 //
 // The test is intentionally opt-in because it replaces the loopback qdisc. Run
 // it only in a disposable privileged Linux container or network namespace.
-func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) {
+func TestHTTP3NetemRuleBreakerCooldownAndDataPlaneProbation(t *testing.T) {
 	if os.Getenv("MOTO_NETEM_LIFECYCLE_TEST") != "1" {
 		t.Skip("set MOTO_NETEM_LIFECYCLE_TEST=1 in a disposable privileged Linux container")
 	}
@@ -188,20 +191,20 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 
 	var h2Requests atomic.Int64
 	var h3Requests atomic.Int64
-	var blockHalfOpen atomic.Bool
-	halfOpenStarted := make(chan struct{}, 1)
-	releaseHalfOpen := make(chan struct{})
-	var releaseHalfOpenOnce sync.Once
+	var blockProbation atomic.Bool
+	probationStarted := make(chan struct{}, 1)
+	releaseProbation := make(chan struct{})
+	var releaseProbationOnce sync.Once
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.ProtoMajor == 3 {
 			h3Requests.Add(1)
-			if blockHalfOpen.Load() {
+			if blockProbation.Load() {
 				select {
-				case halfOpenStarted <- struct{}{}:
+				case probationStarted <- struct{}{}:
 				default:
 				}
 				select {
-				case <-releaseHalfOpen:
+				case <-releaseProbation:
 				case <-request.Context().Done():
 					return
 				}
@@ -248,8 +251,12 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 			config.ConnectProxyH3: h3Manager.dial,
 		},
 	}
+	manager.h3RuleBreaker = newHTTP3RuleBreaker(manager.timeNow)
 	h3Manager.onDegraded = manager.noteHTTP3Degradation
 	h3Manager.onRecovered = manager.noteHTTP3Recovery
+	h3Manager.onConnectionDegraded = manager.noteHTTP3RuleDegradation
+	h3Manager.onConnectionSample = manager.noteHTTP3RuleSample
+	const ruleName = "netem-mixed"
 	target := &config.Target{
 		Address: endpoint,
 		ConnectProxy: &config.ConnectProxyConfig{
@@ -263,7 +270,7 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		connection, err := manager.dial(ctx, target, destination)
+		connection, err := manager.dialForRule(ctx, ruleName, target, destination)
 		if err != nil {
 			t.Fatalf("dial %s: %v", destination, err)
 		}
@@ -310,6 +317,13 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 	enableHTTP3OnlyLoopbackNetem(t, endpoint)
 	_ = waitForHTTP3Replacement(t, h3Manager, second, "second degradation")
 	assertHTTP3PolicyState(t, manager, key, 2, true, false, false)
+	assertHTTP3RuleBreakerPhase(t, manager, ruleName, http3RuleBreakerEvaluating)
+	manager.h3RuleBreaker.mu.Lock()
+	ruleEvents := append([]http3RuleDegradationEvent(nil), manager.h3RuleBreaker.rules[ruleName].recent...)
+	manager.h3RuleBreaker.mu.Unlock()
+	if len(ruleEvents) != 2 || ruleEvents[0].generationID == ruleEvents[1].generationID {
+		t.Fatalf("rule breaker degradation generations = %+v, want two independent generations", ruleEvents)
+	}
 	if got := connectionCount.Load(); got != 2 {
 		t.Fatalf("lazy second replacement established QUIC before H2 validation: %d", got)
 	}
@@ -323,11 +337,19 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 	}
 	_ = h2Validation.Close()
 	assertHTTP3PolicyState(t, manager, key, 2, false, true, false)
+	assertHTTP3RuleBreakerPhase(t, manager, ruleName, http3RuleBreakerCooldown)
 	manager.h3FallbackMu.Lock()
-	cooldownUntil := manager.h3Fallback[key].retryAt
+	targetCooldownUntil := manager.h3Fallback[key].retryAt
 	manager.h3FallbackMu.Unlock()
-	if duration := cooldownUntil.Sub(time.Unix(0, policyNow.Load())); duration != http3DegradedCooldownBase {
+	if duration := targetCooldownUntil.Sub(time.Unix(0, policyNow.Load())); duration != http3DegradedCooldownBase {
 		t.Fatalf("degradation cooldown = %s, want %s", duration, http3DegradedCooldownBase)
+	}
+	manager.h3RuleBreaker.mu.Lock()
+	ruleCooldownUntil := manager.h3RuleBreaker.rules[ruleName].retryAt
+	ruleFailures := manager.h3RuleBreaker.rules[ruleName].failures
+	manager.h3RuleBreaker.mu.Unlock()
+	if duration := ruleCooldownUntil.Sub(time.Unix(0, policyNow.Load())); duration != http3RuleCooldownSteps[0] || ruleFailures != 1 {
+		t.Fatalf("rule cooldown = %s failures=%d, want %s/1", duration, ruleFailures, http3RuleCooldownSteps[0])
 	}
 	h3BeforeCooldown := h3Requests.Load()
 	h2BeforeCooldown := h2Requests.Load()
@@ -348,7 +370,7 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 	// this cooldown request succeeding over H2 prove TCP fallback is unaffected.
 	deleteNetem()
 
-	policyNow.Store(cooldownUntil.UnixNano())
+	policyNow.Store(ruleCooldownUntil.UnixNano())
 	const concurrent = 8
 	start := make(chan struct{})
 	results := make(chan net.Conn, concurrent)
@@ -360,7 +382,7 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 		// failed assertion cannot leave the test handler blocked while server
 		// shutdown waits for it. Cancel and join every concurrent dial before
 		// closing any shared transport.
-		releaseHalfOpenOnce.Do(func() { close(releaseHalfOpen) })
+		releaseProbationOnce.Do(func() { close(releaseProbation) })
 		cancelProbes()
 		probeWG.Wait()
 		for {
@@ -374,7 +396,7 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 			}
 		}
 	}()
-	blockHalfOpen.Store(true)
+	blockProbation.Store(true)
 	for request := 0; request < concurrent; request++ {
 		probeWG.Add(1)
 		go func(index int) {
@@ -382,7 +404,7 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 			<-start
 			ctx, cancel := context.WithTimeout(probeCtx, 10*time.Second)
 			defer cancel()
-			connection, err := manager.dial(ctx, target, "half-open-"+strconv.Itoa(index)+".example:443")
+			connection, err := manager.dialForRule(ctx, ruleName, target, "probation-"+strconv.Itoa(index)+".example:443")
 			if err != nil {
 				errorsFound <- err
 				return
@@ -392,9 +414,9 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 	}
 	close(start)
 	select {
-	case <-halfOpenStarted:
+	case <-probationStarted:
 	case <-time.After(5 * time.Second):
-		t.Fatal("single HTTP/3 half-open request did not reach the proxy")
+		t.Fatal("single HTTP/3 probation request did not reach the proxy")
 	}
 
 	h2WhileProbe := 0
@@ -414,22 +436,76 @@ func TestHTTP3NetemRepeatedDegradationCooldownAndHalfOpenRecovery(t *testing.T) 
 		}
 	}
 	assertHTTP3PolicyState(t, manager, key, 2, false, true, true)
-	releaseHalfOpenOnce.Do(func() { close(releaseHalfOpen) })
+	assertHTTP3RuleBreakerPhase(t, manager, ruleName, http3RuleBreakerProbation)
+	releaseProbationOnce.Do(func() { close(releaseProbation) })
+	var probationTunnel net.Conn
 	select {
 	case err := <-errorsFound:
-		t.Fatalf("HTTP/3 half-open failed: %v", err)
+		t.Fatalf("HTTP/3 probation failed: %v", err)
 	case connection := <-results:
 		if network := connection.RemoteAddr().Network(); network != config.ConnectProxyH3 {
 			_ = connection.Close()
-			t.Fatalf("half-open protocol = %s, want h3", network)
+			t.Fatalf("probation protocol = %s, want h3", network)
 		}
-		_ = connection.Close()
+		probationTunnel = connection
 	case <-time.After(5 * time.Second):
-		t.Fatal("HTTP/3 half-open did not complete after release")
+		t.Fatal("HTTP/3 probation did not complete after release")
 	}
+	defer probationTunnel.Close()
 	assertHTTP3PolicyState(t, manager, key, 0, false, false, false)
+	assertHTTP3RuleBreakerPhase(t, manager, ruleName, http3RuleBreakerProbation)
 	if got := connectionCount.Load(); got != 3 {
-		t.Fatalf("physical QUIC connections after half-open = %d, want 3", got)
+		t.Fatalf("physical QUIC connections after probation CONNECT = %d, want 3", got)
+	}
+
+	// CONNECT success must not restore H3 for sibling requests. The admitted
+	// probation remains the only H3 stream until its data-plane evidence passes.
+	h2BeforeEvidence := h2Requests.Load()
+	beforeEvidence := dial("before-data-plane-evidence.example:443")
+	if network := beforeEvidence.RemoteAddr().Network(); network != config.ConnectProxyH2 {
+		_ = beforeEvidence.Close()
+		t.Fatalf("pre-evidence sibling protocol = %s, want h2", network)
+	}
+	_ = beforeEvidence.Close()
+	if h2Requests.Load() != h2BeforeEvidence+1 {
+		t.Fatalf("pre-evidence sibling did not use H2: %d->%d", h2BeforeEvidence, h2Requests.Load())
+	}
+
+	exerciseHTTP3NetemTunnel(t, probationTunnel, int(http3RuleProbationMinPayload)*2)
+	stopSamplerForNetemTest(h3Manager)
+	manager.h3RuleBreaker.mu.Lock()
+	probationEstablishedAt := manager.h3RuleBreaker.rules[ruleName].probation.establishedAt
+	manager.h3RuleBreaker.mu.Unlock()
+
+	// The payload threshold alone cannot recover early. This first real sample
+	// is deliberately inside the 30-second production probation interval.
+	earlySampleAt := probationEstablishedAt.Add(2 * time.Second)
+	policyNow.Store(earlySampleAt.UnixNano())
+	h3Manager.sampleHTTP3DegradationAt(earlySampleAt)
+	manager.h3RuleBreaker.mu.Lock()
+	earlyState := *manager.h3RuleBreaker.rules[ruleName]
+	manager.h3RuleBreaker.mu.Unlock()
+	if earlyState.phase != http3RuleBreakerProbation ||
+		earlyState.probation.payloadBytes < http3RuleProbationMinPayload {
+		t.Fatalf("early data-plane probation state = %+v, want probation with >=%d payload bytes",
+			earlyState, http3RuleProbationMinPayload)
+	}
+
+	// Two further healthy samples at and after the minimum duration complete
+	// three consecutive observations without changing production constants.
+	for _, sampleAt := range []time.Time{
+		probationEstablishedAt.Add(http3RuleProbationMinDuration),
+		probationEstablishedAt.Add(http3RuleProbationMinDuration + http3DegradationSampleInterval),
+	} {
+		policyNow.Store(sampleAt.UnixNano())
+		h3Manager.sampleHTTP3DegradationAt(sampleAt)
+	}
+	assertHTTP3RuleBreakerPhase(t, manager, ruleName, http3RuleBreakerClosed)
+	manager.h3RuleBreaker.mu.Lock()
+	recoveredState := *manager.h3RuleBreaker.rules[ruleName]
+	manager.h3RuleBreaker.mu.Unlock()
+	if recoveredState.failures != 0 || recoveredState.events["recovered"] != 1 {
+		t.Fatalf("data-plane recovery state = %+v", recoveredState)
 	}
 
 	h2BeforeRecovered := h2Requests.Load()
@@ -530,7 +606,11 @@ func enableHTTP3OnlyLoopbackNetem(t *testing.T, endpoint string) {
 	}
 	commands := [][]string{
 		{"qdisc", "replace", "dev", "lo", "root", "handle", "1:", "prio"},
-		{"qdisc", "replace", "dev", "lo", "parent", "1:3", "handle", "30:", "netem", "delay", "350ms", "30ms", "loss", "10%", "rate", "2mbit"},
+		// Keep enough wire traffic in the 12-second production window to cross
+		// the packet/byte gate while making both RTT and loss independently bad.
+		// A very low rate here makes the test host's CPU scheduling determine
+		// whether enough QUIC packets are observed, which is unnecessarily flaky.
+		{"qdisc", "replace", "dev", "lo", "parent", "1:3", "handle", "30:", "netem", "delay", "175ms", "20ms", "loss", "12%", "rate", "10mbit"},
 		{"filter", "replace", "dev", "lo", "protocol", "ip", "parent", "1:0", "prio", "3", "u32", "match", "ip", "protocol", "17", "0xff", "match", "ip", "dport", portText, "0xffff", "flowid", "1:3"},
 		{"filter", "replace", "dev", "lo", "protocol", "ip", "parent", "1:0", "prio", "4", "u32", "match", "ip", "protocol", "17", "0xff", "match", "ip", "sport", portText, "0xffff", "flowid", "1:3"},
 	}
@@ -548,7 +628,7 @@ func waitForHTTP3Replacement(
 	stage string,
 ) *http3ConnectTransportSlot {
 	t.Helper()
-	deadline := time.Now().Add(24 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(http3DegradationSampleInterval)
 		manager.sampleHTTP3DegradationAt(time.Now())
@@ -597,6 +677,52 @@ func startHTTP3NetemTraffic(connection net.Conn) func() {
 			<-doneWriting
 			<-doneReading
 		})
+	}
+}
+
+func exerciseHTTP3NetemTunnel(t *testing.T, connection net.Conn, size int) {
+	t.Helper()
+	if size <= 0 {
+		t.Fatal("HTTP/3 netem payload size must be positive")
+	}
+	payload := bytes.Repeat([]byte("moto-h3-probation"), size/len("moto-h3-probation")+1)[:size]
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := connection.Write(payload)
+		writeDone <- err
+	}()
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(connection, received); err != nil {
+		t.Fatalf("read HTTP/3 probation echo: %v", err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write HTTP/3 probation payload: %v", err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("HTTP/3 probation echo payload mismatch")
+	}
+}
+
+func assertHTTP3RuleBreakerPhase(
+	t *testing.T,
+	manager *connectProxyManager,
+	rule string,
+	want http3RuleBreakerPhase,
+) {
+	t.Helper()
+	if manager == nil || manager.h3RuleBreaker == nil {
+		t.Fatal("HTTP/3 rule breaker is not configured")
+	}
+	manager.h3RuleBreaker.mu.Lock()
+	state := manager.h3RuleBreaker.rules[rule]
+	if state == nil {
+		manager.h3RuleBreaker.mu.Unlock()
+		t.Fatalf("HTTP/3 rule breaker state for %q was not registered", rule)
+	}
+	got := state.phase
+	manager.h3RuleBreaker.mu.Unlock()
+	if got != want {
+		t.Fatalf("HTTP/3 rule breaker phase = %s, want %s", got, want)
 	}
 }
 

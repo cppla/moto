@@ -140,6 +140,45 @@ func TestHTTP3ConnectTunnelFullDuplexAndReuse(t *testing.T) {
 	}
 }
 
+func TestHTTP3RuleProbationCandidateFailureDoesNotRedial(t *testing.T) {
+	var transports atomic.Int32
+	var physicalDials atomic.Int32
+	manager := newHTTP3ConnectManager(func(key http3ConnectTransportKey, owner context.Context) *http3.Transport {
+		transports.Add(1)
+		transport := newHTTP3ConnectTransportWithOwner(key, owner)
+		transport.Dial = func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error) {
+			physicalDials.Add(1)
+			return nil, errors.New("synthetic probation handshake failure")
+		}
+		return transport
+	})
+	defer manager.close()
+
+	target := &config.Target{
+		Address: "proxy.example:443",
+		ConnectProxy: &config.ConnectProxyConfig{
+			Protocols:  []string{config.ConnectProxyH3, config.ConnectProxyH2},
+			ServerName: "proxy.example",
+		},
+	}
+	ctx, cancel := context.WithTimeout(withHTTP3RuleProbation(context.Background()), time.Second)
+	defer cancel()
+	connection, err := manager.dial(ctx, target, "destination.example:443")
+	if connection != nil {
+		_ = connection.Close()
+		t.Fatal("failed rule probation returned a tunnel")
+	}
+	if err == nil {
+		t.Fatal("failed rule probation returned no error")
+	}
+	if got := transports.Load(); got != 1 {
+		t.Fatalf("rule probation transports = %d, want exactly one", got)
+	}
+	if got := physicalDials.Load(); got != 1 {
+		t.Fatalf("rule probation physical dials = %d, want exactly one", got)
+	}
+}
+
 func TestHTTP3ConnectPoolSpreadsLongTunnelsBeforePeerStreamLimit(t *testing.T) {
 	const tunnelCount = 129
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -389,7 +428,10 @@ func TestHTTP3ConnectPoolAdaptsToLowerPeerStreamCredit(t *testing.T) {
 		},
 	}
 
-	firstCtx, cancelFirst := context.WithTimeout(context.Background(), 3*time.Second)
+	// This test validates peer stream-credit adaptation, not first-handshake
+	// latency. Match the later tunnel attempts so race-enabled CI pauses cannot
+	// turn an unrelated scheduler stall into a transport regression.
+	firstCtx, cancelFirst := context.WithTimeout(context.Background(), 10*time.Second)
 	first, err := manager.dial(firstCtx, target, "first.example:443")
 	cancelFirst()
 	if err != nil {

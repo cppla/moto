@@ -72,9 +72,10 @@ type http3PolicyGauge struct {
 }
 
 type http3GaugeSnapshot struct {
-	transports []http3TransportGauge
-	rotations  []http3RotationGauge
-	policies   []http3PolicyGauge
+	transports   []http3TransportGauge
+	rotations    []http3RotationGauge
+	policies     []http3PolicyGauge
+	ruleBreakers []http3RuleBreakerGauge
 }
 
 // renderOperationalGauges snapshots route-health and prewarm state without
@@ -196,7 +197,7 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 	for _, transport := range http3.transports {
 		writeMetricSample(output, "moto_connect_proxy_h3_healthy_payload_bytes_per_second", http3TransportGaugeLabels(transport), strconv.FormatFloat(transport.healthyBytesPerSecond, 'g', -1, 64))
 	}
-	writeMetricHeader(output, "moto_connect_proxy_h3_rotation_events", "Cumulative HTTP/3 degradation and graceful rotation events in the current routing generation.", "gauge")
+	writeMetricHeader(output, "moto_connect_proxy_h3_rotation_events", "Cumulative HTTP/3 degradation, rotation, and bounded forced-drain events in the current routing generation.", "gauge")
 	for _, rotation := range http3.rotations {
 		writeMetricSample(output, "moto_connect_proxy_h3_rotation_events", []prometheusLabel{{"target", rotation.target}, {"reason", rotation.reason}, {"outcome", rotation.outcome}}, strconv.FormatUint(rotation.count, 10))
 	}
@@ -228,6 +229,53 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 	for _, policy := range http3.policies {
 		writeMetricSample(output, "moto_connect_proxy_h3_fallback_pending", []prometheusLabel{{"target", policy.target}}, boolMetric(policy.fallbackPending))
 	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_cooldown_active", "Whether a mixed-protocol rule is routing new connections over HTTP/2 after path-wide HTTP/3 degradation.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_cooldown_active", []prometheusLabel{{"rule", rule.rule}}, boolMetric(rule.cooldown))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_cooldown_remaining_seconds", "Time remaining before a mixed-protocol rule may admit one HTTP/3 data-plane probation connection.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_cooldown_remaining_seconds", []prometheusLabel{{"rule", rule.rule}}, strconv.FormatFloat(float64(rule.remaining)/float64(time.Second), 'g', -1, 64))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_fallback_validation_active", "Whether a mixed-protocol rule is validating HTTP/2 reachability before committing an HTTP/3 cooldown.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_fallback_validation_active", []prometheusLabel{{"rule", rule.rule}}, boolMetric(rule.evaluating))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_probe_due", "Whether a mixed-protocol rule is ready for one exclusive HTTP/3 data-plane probation attempt.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_probe_due", []prometheusLabel{{"rule", rule.rule}}, boolMetric(rule.probeDue))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_probe_in_flight", "Whether one Boost route owns the exclusive HTTP/3 probation setup lease for a mixed-protocol rule.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_probe_in_flight", []prometheusLabel{{"rule", rule.rule}}, boolMetric(rule.probeInFlight))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_probation_active", "Whether exactly one HTTP/3 data-plane probation connection owns recovery for a mixed-protocol rule.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_probation_active", []prometheusLabel{{"rule", rule.rule}}, boolMetric(rule.probation))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_probation_healthy_samples", "Consecutive healthy two-second samples collected by the current rule-level HTTP/3 probation connection.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_probation_healthy_samples", []prometheusLabel{{"rule", rule.rule}}, strconv.Itoa(rule.healthySamples))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_probation_payload_bytes", "Application payload bytes transferred by the current rule-level HTTP/3 probation connection.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_probation_payload_bytes", []prometheusLabel{{"rule", rule.rule}}, strconv.FormatUint(rule.payloadBytes, 10))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_probation_packets_sent", "QUIC packets sent by the current rule-level HTTP/3 probation connection.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		writeMetricSample(output, "moto_connect_proxy_h3_rule_probation_packets_sent", []prometheusLabel{{"rule", rule.rule}}, strconv.FormatUint(rule.packetsSent, 10))
+	}
+	writeMetricHeader(output, "moto_connect_proxy_h3_rule_breaker_events", "Cumulative rule-level HTTP/3 breaker transitions in the current routing generation.", "gauge")
+	for _, rule := range http3.ruleBreakers {
+		outcomes := make([]string, 0, len(rule.events))
+		for outcome := range rule.events {
+			outcomes = append(outcomes, outcome)
+		}
+		sort.Strings(outcomes)
+		for _, outcome := range outcomes {
+			writeMetricSample(output, "moto_connect_proxy_h3_rule_breaker_events", []prometheusLabel{{"rule", rule.rule}, {"outcome", outcome}}, strconv.FormatUint(rule.events[outcome], 10))
+		}
+	}
 }
 
 func snapshotHTTP3Gauges(manager *connectProxyManager) http3GaugeSnapshot {
@@ -237,6 +285,12 @@ func snapshotHTTP3Gauges(manager *connectProxyManager) http3GaugeSnapshot {
 	snapshot := http3GaugeSnapshot{}
 	if manager.h3 != nil {
 		snapshot = manager.h3.snapshotGauges()
+	}
+	if manager.h3RuleBreaker != nil {
+		snapshot.ruleBreakers = manager.h3RuleBreaker.snapshot()
+		sort.Slice(snapshot.ruleBreakers, func(i, j int) bool {
+			return snapshot.ruleBreakers[i].rule < snapshot.ruleBreakers[j].rule
+		})
 	}
 	now := manager.timeNow()
 	manager.h3FallbackMu.Lock()

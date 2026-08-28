@@ -47,6 +47,7 @@ type http3RotationMetricKey struct {
 
 type http3TunnelStats struct {
 	slot         *http3ConnectTransportSlot
+	probation    http3RuleProbationBinding
 	pending      atomic.Int64
 	writeStarted atomic.Int64
 }
@@ -121,6 +122,12 @@ func (manager *http3ConnectManager) observeHTTP3PhysicalDial(
 	}
 	slot.connection = connection
 	slot.connectionID++
+	manager.nextGenerationID++
+	if manager.nextGenerationID == 0 {
+		manager.nextGenerationID++
+	}
+	slot.generationID = manager.nextGenerationID
+	slot.remoteIP = http3RemoteIP(connection.RemoteAddr())
 	connectionID := slot.connectionID
 	slot.detector = newHTTP3DegradationDetector(now)
 	slot.lastDecision = http3DegradationDecision{}
@@ -176,6 +183,15 @@ func (manager *http3ConnectManager) observeHTTP3ConnectionClosed(
 		cause = context.Canceled
 	}
 	manager.applyHTTP3DegradationSample(http3DegradationSnapshot{
+		key:          key,
+		slot:         slot,
+		connection:   connection,
+		connectionID: connectionID,
+	}, http3DegradationSample{
+		At:            manager.timeNow(),
+		ConnectionErr: cause,
+	})
+	manager.publishHTTP3RuleSample(http3DegradationSnapshot{
 		key:          key,
 		slot:         slot,
 		connection:   connection,
@@ -294,6 +310,7 @@ func (manager *http3ConnectManager) sampleHTTP3DegradationAt(now time.Time) {
 			sample.ConnectionErr = err
 		}
 		manager.applyHTTP3DegradationSample(snapshot, sample)
+		manager.publishHTTP3RuleSample(snapshot, sample)
 	}
 }
 
@@ -306,6 +323,8 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 	}
 	var transition *http3DegradationLogEvent
 	var degraded func(http3ConnectTransportKey, http3DegradationReason)
+	var connectionDegraded func(http3RuleDegradationEvent)
+	var connectionEvent http3RuleDegradationEvent
 	manager.mu.Lock()
 	slot := snapshot.slot
 	if manager.retired || !manager.containsSlotLocked(snapshot.key, slot) ||
@@ -343,6 +362,14 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 		if !manager.hasHealthyHTTP3ServingSlotLocked(snapshot.key) {
 			degraded = manager.onDegraded
 		}
+		connectionDegraded = manager.onConnectionDegraded
+		connectionEvent = http3RuleDegradationEvent{
+			key:          snapshot.key,
+			remoteIP:     slot.remoteIP,
+			generationID: slot.generationID,
+			at:           sample.At,
+			reason:       decision.Reason,
+		}
 	}
 	candidate, err := manager.ensureHTTP3RotationCandidateLocked(snapshot.key, slot, sample.At)
 	if err != nil {
@@ -368,6 +395,9 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 	if degraded != nil {
 		degraded(snapshot.key, transition.decision.Reason)
 		manager.observerMu.Unlock()
+	}
+	if connectionDegraded != nil {
+		connectionDegraded(connectionEvent)
 	}
 }
 
@@ -519,6 +549,7 @@ func (manager *http3ConnectManager) promoteHTTP3Candidate(
 		return
 	}
 	var closeSource *http3ConnectTransportSlot
+	var forcedDrain *http3ForcedDrainMonitor
 	var recovered func(http3ConnectTransportKey)
 	manager.mu.Lock()
 	if candidate.lifecycle != http3TransportWarming || !manager.containsSlotLocked(key, candidate) {
@@ -545,6 +576,8 @@ func (manager *http3ConnectManager) promoteHTTP3Candidate(
 		if source.active == 0 {
 			manager.removeSlotLocked(key, source)
 			closeSource = source
+		} else {
+			forcedDrain = manager.prepareHTTP3ForcedDrainLocked(key, source, manager.timeNow())
 		}
 	}
 	manager.recordHTTP3RotationEventLocked(key, string(candidate.rotationReason), "promoted")
@@ -558,6 +591,9 @@ func (manager *http3ConnectManager) promoteHTTP3Candidate(
 	manager.mu.Unlock()
 	if closeSource != nil {
 		closeSource.close()
+	}
+	if forcedDrain != nil {
+		manager.startHTTP3ForcedDrainMonitor(forcedDrain)
 	}
 	if recovered != nil {
 		recovered(key)
@@ -573,8 +609,17 @@ func (manager *http3ConnectManager) registerHTTP3Tunnel(slot *http3ConnectTransp
 	if manager == nil || slot == nil {
 		return nil
 	}
-	stats := &http3TunnelStats{slot: slot}
 	manager.mu.Lock()
+	binding := http3RuleProbationBinding{}
+	if slot.connection != nil && slot.generationID != 0 {
+		binding = http3RuleProbationBinding{
+			generationID: slot.generationID,
+			remoteIP:     slot.remoteIP,
+			stats:        slot.connection.ConnectionStats(),
+			payloadBytes: saturatingAdd(slot.payloadRead.Load(), slot.payloadWritten.Load()),
+		}
+	}
+	stats := &http3TunnelStats{slot: slot, probation: binding}
 	if slot.tunnels == nil {
 		slot.tunnels = make(map[*http3TunnelStats]struct{})
 	}

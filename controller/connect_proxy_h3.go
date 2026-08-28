@@ -56,6 +56,8 @@ type http3ConnectTransportSlot struct {
 	health             http3TransportHealth
 	connection         http3StatsConnection
 	connectionID       uint64
+	generationID       uint64
+	remoteIP           string
 	detector           *http3DegradationDetector
 	lastDecision       http3DegradationDecision
 	replaces           *http3ConnectTransportSlot
@@ -63,6 +65,8 @@ type http3ConnectTransportSlot struct {
 	rotationFailures   int
 	rotationReason     http3DegradationReason
 	retryAt            time.Time
+	forcedDrainArmed   bool
+	forcedDrainConnID  uint64
 	tunnels            map[*http3TunnelStats]struct{}
 	lastSampledPayload uint64
 
@@ -143,23 +147,26 @@ func (err *http3SetupError) Unwrap() error {
 // CONNECT request gets an independent HTTP/3 stream. Pooling avoids waiting on
 // the peer's MAX_STREAMS credit when many long tunnels are active.
 type http3ConnectManager struct {
-	mu                  sync.Mutex
-	observerMu          sync.Mutex
-	transports          map[http3ConnectTransportKey][]*http3ConnectTransportSlot
-	learnedStreamLimits map[http3ConnectTransportKey]int
-	newTransport        func(http3ConnectTransportKey, context.Context) *http3.Transport
-	dialCtx             context.Context
-	cancelDials         context.CancelFunc
-	streamsPerTransport int
-	maxTransportsPerKey int
-	retired             bool
-	now                 func() time.Time
-	healthyRTT          map[http3ConnectTransportKey]time.Duration
-	rotationEvents      map[http3RotationMetricKey]uint64
-	samplerCancel       context.CancelFunc
-	samplerDone         chan struct{}
-	onDegraded          func(http3ConnectTransportKey, http3DegradationReason)
-	onRecovered         func(http3ConnectTransportKey)
+	mu                   sync.Mutex
+	observerMu           sync.Mutex
+	transports           map[http3ConnectTransportKey][]*http3ConnectTransportSlot
+	learnedStreamLimits  map[http3ConnectTransportKey]int
+	newTransport         func(http3ConnectTransportKey, context.Context) *http3.Transport
+	dialCtx              context.Context
+	cancelDials          context.CancelFunc
+	streamsPerTransport  int
+	maxTransportsPerKey  int
+	retired              bool
+	now                  func() time.Time
+	healthyRTT           map[http3ConnectTransportKey]time.Duration
+	rotationEvents       map[http3RotationMetricKey]uint64
+	samplerCancel        context.CancelFunc
+	samplerDone          chan struct{}
+	onDegraded           func(http3ConnectTransportKey, http3DegradationReason)
+	onRecovered          func(http3ConnectTransportKey)
+	onConnectionDegraded func(http3RuleDegradationEvent)
+	onConnectionSample   func(http3RuleSampleEvent)
+	nextGenerationID     uint64
 }
 
 func newHTTP3ConnectManager(factory func(http3ConnectTransportKey, context.Context) *http3.Transport) *http3ConnectManager {
@@ -605,7 +612,15 @@ func (manager *http3ConnectManager) dial(ctx context.Context, target *config.Tar
 		return nil, errors.New("HTTP/3 CONNECT target is not configured")
 	}
 	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
-	transport, transportSlot, releaseTransport, err := manager.acquireTransport(key)
+	var transport *http3.Transport
+	var transportSlot *http3ConnectTransportSlot
+	var releaseTransport func()
+	var err error
+	if http3RuleProbationFromContext(ctx) {
+		transport, transportSlot, releaseTransport, err = manager.acquireHTTP3RuleProbationTransport(key)
+	} else {
+		transport, transportSlot, releaseTransport, err = manager.acquireTransport(key)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -693,11 +708,13 @@ func (manager *http3ConnectManager) dial(ctx context.Context, target *config.Tar
 		cancelStream()
 		_ = requestWriter.CloseWithError(setupErr)
 		_ = requestReader.CloseWithError(setupErr)
-		if candidateFailed && ctx.Err() == nil && !managedProbe {
+		if candidateFailed && ctx.Err() == nil && !managedProbe && !http3RuleProbationFromContext(ctx) {
 			// The canary is an internal maintenance choice. If it fails while the
 			// verified old transport is still available, retry this untouched
 			// CONNECT request there instead of leaking the maintenance failure into
-			// H2 fallback, route health, or the browser.
+			// H2 fallback, route health, or the browser. Rule-level probation is
+			// already the exclusive recovery attempt, so its failure must return to
+			// dialForRule instead of recursively creating replacement candidates.
 			return manager.dial(ctx, target, destination)
 		}
 		return nil, setupErr
@@ -774,6 +791,17 @@ type http3TunnelConn struct {
 	remoteAddr net.Addr
 	closeOnce  sync.Once
 	stats      *http3TunnelStats
+}
+
+func (conn *http3TunnelConn) http3RuleProbationBinding() (http3RuleProbationBinding, bool) {
+	if conn == nil || conn.stats == nil || conn.stats.slot == nil {
+		return http3RuleProbationBinding{}, false
+	}
+	binding := conn.stats.probation
+	if binding.generationID == 0 {
+		return http3RuleProbationBinding{}, false
+	}
+	return binding, true
 }
 
 func (conn *http3TunnelConn) Read(buffer []byte) (int, error) {

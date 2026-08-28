@@ -341,6 +341,16 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 	defer cancelTimer()
 	results := make(chan dialResult, len(rule.Targets))
 	attempted := map[string]struct{}{cachedAddr: {}}
+	cachedTarget := targetByAddress(rule, cachedAddr)
+	var cachedProtocolProbe routeProtocolProbeLease
+	protocolProbeNow := time.Now()
+	if cachedTarget != nil && runtime.routes.protocolPenalty(rule, cachedTarget, protocolProbeNow) > 0 {
+		cachedProtocolProbe, _ = runtime.routes.claimProtocolProbe(rule, cachedTarget, protocolProbeNow)
+	}
+	// A due protocol-recovery probe owns this request's complete setup window.
+	// In particular, don't let the normal cached-route hedge cancel a slow H3
+	// canary before it can collect the data-plane evidence needed for recovery.
+	exclusiveCachedProtocolProbe := cachedProtocolProbe.token != 0
 	targetAttemptLimit := connectProxyTargetAttemptLimit(rule)
 	actualAttempts := 1
 	active := 0
@@ -364,7 +374,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 	var primaryStartOnce sync.Once
 	onPrimaryStart := func() {
 		primaryStartOnce.Do(func() {
-			if rule.Hedge == nil {
+			if rule.Hedge == nil || exclusiveCachedProtocolProbe {
 				return
 			}
 			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= hedgeDelay {
@@ -403,13 +413,14 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 	launch := func(addr string, primary, delayed, tryOnly bool, probe routeProtocolProbeLease) {
 		active++
 		go func() {
+			dialCtx := withRouteProtocolProbeLease(raceCtx, probe)
 			options := boostRouteDialOptions{tryOnly: tryOnly}
 			if primary {
 				options.onStart = onPrimaryStart
 			} else if delayed {
 				options.onStart = onDelayedStart
 			}
-			connection, attempt, err := dial(raceCtx, rule, addr, options)
+			connection, attempt, err := dial(dialCtx, rule, addr, options)
 			if err == nil && connection == nil {
 				err = errors.New("cached boost dial returned a nil connection")
 			}
@@ -499,7 +510,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 		}
 	}
 
-	launch(cachedAddr, true, false, false, routeProtocolProbeLease{})
+	launch(cachedAddr, true, false, false, cachedProtocolProbe)
 	for active > 0 {
 		select {
 		case result := <-results:
@@ -741,7 +752,8 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 						runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
 						results <- result
 					}
-					releaseDial, acquireErr := acquire(raceCtx, rule, addr, tryOnly)
+					dialCtx := withRouteProtocolProbeLease(raceCtx, candidate.protocolProbe)
+					releaseDial, acquireErr := acquire(dialCtx, rule, addr, tryOnly)
 					if acquireErr != nil {
 						finish(dialResult{addr: addr, err: acquireErr})
 						return
@@ -762,7 +774,7 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 					// Any protocol setup runs after release under the decision context.
 					conn, err := func() (net.Conn, error) {
 						defer releaseDial()
-						return dial(raceCtx, addr)
+						return dial(dialCtx, addr)
 					}()
 					if err == nil && conn == nil {
 						err = errors.New("dial returned a nil connection")

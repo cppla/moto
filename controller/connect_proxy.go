@@ -96,6 +96,7 @@ type connectProxyManager struct {
 	degradationWindow      time.Duration
 	degradationPenaltyBase time.Duration
 	degradationPenaltyMax  time.Duration
+	h3RuleBreaker          *http3RuleBreaker
 }
 
 type http3FallbackState struct {
@@ -140,8 +141,11 @@ func newConnectProxyManager() *connectProxyManager {
 			config.ConnectProxyH3: h3.dial,
 		},
 	}
+	manager.h3RuleBreaker = newHTTP3RuleBreaker(manager.timeNow)
 	h3.onDegraded = manager.noteHTTP3Degradation
 	h3.onRecovered = manager.noteHTTP3Recovery
+	h3.onConnectionDegraded = manager.noteHTTP3RuleDegradation
+	h3.onConnectionSample = manager.noteHTTP3RuleSample
 	return manager
 }
 
@@ -157,13 +161,16 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 		return nil, errors.New("CONNECT proxy target is not configured")
 	}
 	ctx = withConnectProxyRuleName(ctx, rule)
+	manager.registerHTTP3RuleTarget(rule, target)
 	var failures []error
 	var pendingHTTP3Failure error
 	var pendingHTTP3ManagedProbe bool
 	var pendingHTTP3Token uint64
 	var pendingHTTP3FallbackReason string
 	var joinedHTTP3PendingToken uint64
+	var pendingHTTP3RuleValidationToken uint64
 	fallbackReachable := false
+	ruleH2Reachable := false
 	defer func() {
 		if pendingHTTP3Failure != nil {
 			manager.observeHTTP3Attempt(
@@ -183,6 +190,14 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 				fallbackReachable,
 			)
 		}
+		if pendingHTTP3RuleValidationToken != 0 {
+			manager.observeHTTP3RuleValidation(
+				rule,
+				pendingHTTP3RuleValidationToken,
+				ctx.Err(),
+				ruleH2Reachable,
+			)
+		}
 	}()
 	protocols := target.ConnectProxy.Protocols
 	for index, protocol := range protocols {
@@ -194,8 +209,30 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 			pendingHTTP3FallbackReason = ""
 		}
 		useHTTP3Cooldown := protocol == config.ConnectProxyH3 && protocolAppearsAfter(protocols, index, config.ConnectProxyH2)
+		var ruleProbeToken uint64
+		if useHTTP3Cooldown {
+			var ruleAllowed bool
+			var ruleProbation bool
+			ruleProbeToken, ruleProbation, ruleAllowed = manager.beginHTTP3RuleAttempt(ctx, rule, target)
+			if !ruleAllowed {
+				if ruleProbeToken != 0 {
+					pendingHTTP3RuleValidationToken = ruleProbeToken
+				}
+				if joinedHTTP3PendingToken == 0 {
+					joinedHTTP3PendingToken = manager.joinHTTP3PendingFallback(target)
+				}
+				metricConnectProxyAttempt(rule, target.Address, protocol, connectProxyAttemptCooldown, 0, false)
+				pendingHTTP3FallbackReason = connectProxyFallbackCooldown
+				failures = append(failures, fmt.Errorf("%s: %w", protocol, errConnectProxyProtocolCoolingDown))
+				continue
+			}
+			if ruleProbation {
+				ctx = withHTTP3RuleProbation(ctx)
+			}
+		}
 		dial := manager.dialers[protocol]
 		if dial == nil {
+			manager.abortHTTP3RuleProbation(rule, ruleProbeToken, "protocol_unavailable")
 			metricConnectProxyAttempt(rule, target.Address, protocol, connectProxyAttemptUnavailable, 0, false)
 			if useHTTP3Cooldown {
 				pendingHTTP3FallbackReason = connectProxyFallbackUnavailable
@@ -209,6 +246,7 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 			var allowed bool
 			attemptToken, managedProbe, allowed = manager.beginHTTP3Attempt(ctx, target)
 			if !allowed {
+				manager.abortHTTP3RuleProbation(rule, ruleProbeToken, "target_cooldown")
 				// A non-zero token means this request joined an H3 failure
 				// window that is still waiting for a useful H2 observation.
 				// Its fallback result must participate so an earlier request
@@ -230,17 +268,29 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 		cancelAttempt()
 		metricConnectProxyAttempt(rule, target.Address, protocol, connectProxyAttemptOutcome(err), setupDuration, true)
 		if err == nil {
+			if protocol == config.ConnectProxyH3 && ruleProbeToken != 0 {
+				connection = manager.establishHTTP3RuleProbation(rule, target, ruleProbeToken, connection)
+			}
 			if protocol == config.ConnectProxyH3 && useHTTP3Cooldown {
 				manager.observeHTTP3Attempt(target, attemptToken, managedProbe, nil, ctx.Err(), false)
 			}
 			if protocol == config.ConnectProxyH2 && (pendingHTTP3Failure != nil || joinedHTTP3PendingToken != 0) {
 				fallbackReachable = true
 			}
+			if protocol == config.ConnectProxyH2 && pendingHTTP3RuleValidationToken != 0 {
+				ruleH2Reachable = true
+			}
 			return connection, nil
 		}
 		failures = append(failures, fmt.Errorf("%s CONNECT: %w", protocol, err))
 		var statusErr *connectProxyStatusError
 		if errors.As(err, &statusErr) {
+			if protocol == config.ConnectProxyH2 && pendingHTTP3RuleValidationToken != 0 {
+				ruleH2Reachable = true
+			}
+			if protocol == config.ConnectProxyH3 {
+				manager.failHTTP3RuleProbation(rule, ruleProbeToken, connectProxyAttemptOutcome(err))
+			}
 			if protocol == config.ConnectProxyH2 && (pendingHTTP3Failure != nil || joinedHTTP3PendingToken != 0) {
 				// Any H2 HTTP response proves that the fallback path reached the
 				// proxy. The requested destination may still be denied or broken,
@@ -268,12 +318,20 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 		}
 		if protocol == config.ConnectProxyH3 && useHTTP3Cooldown &&
 			errors.Is(err, errConnectProxyProtocolCapacity) {
+			manager.abortHTTP3RuleProbation(rule, ruleProbeToken, "capacity")
 			// Local pool saturation says nothing about UDP or proxy health.
 			// Release this admitted H3 state participant and use H2 without
 			// activating endpoint-wide failure cooldown.
 			pendingHTTP3FallbackReason = connectProxyFallbackCapacity
 			manager.abandonHTTP3Attempt(target, attemptToken)
 			continue
+		}
+		if protocol == config.ConnectProxyH3 {
+			if errors.Is(err, context.Canceled) {
+				manager.abortHTTP3RuleProbation(rule, ruleProbeToken, "canceled")
+			} else {
+				manager.failHTTP3RuleProbation(rule, ruleProbeToken, connectProxyAttemptOutcome(err))
+			}
 		}
 		if protocol == config.ConnectProxyH3 && useHTTP3Cooldown {
 			pendingHTTP3FallbackReason = connectProxyFallbackReason(err)
@@ -410,6 +468,25 @@ func (manager *connectProxyManager) beginHTTP3Attempt(_ context.Context, target 
 	token = state.epoch
 	manager.h3FallbackMu.Unlock()
 	return token, true, true
+}
+
+// joinHTTP3PendingFallback lets a rule-level H2 bypass participate in an
+// endpoint-level fallback window without admitting or fabricating an H3
+// attempt. This prevents the broader rule breaker from starving the existing
+// target policy of the H2 reachability evidence it needs to settle its state.
+func (manager *connectProxyManager) joinHTTP3PendingFallback(target *config.Target) uint64 {
+	if manager == nil || target == nil || target.ConnectProxy == nil {
+		return 0
+	}
+	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	manager.h3FallbackMu.Lock()
+	defer manager.h3FallbackMu.Unlock()
+	state := manager.h3Fallback[key]
+	if state == nil || !state.pending && !state.probing {
+		return 0
+	}
+	state.fallbackPending++
+	return state.epoch
 }
 
 func (manager *connectProxyManager) observeHTTP3PendingFallback(
@@ -707,9 +784,31 @@ func (manager *connectProxyManager) noteHTTP3Recovery(key http3ConnectTransportK
 
 // http3RoutePenalty is a protocol-only Boost signal. It never mutates the
 // target-wide circuit breaker, so a slow H3 path cannot suppress healthy H2.
-func (manager *connectProxyManager) http3RoutePenalty(_ *config.Rule, target *config.Target, now time.Time) time.Duration {
-	if manager == nil || target == nil || target.ConnectProxy == nil || len(target.ConnectProxy.Protocols) == 0 ||
-		target.ConnectProxy.Protocols[0] != config.ConnectProxyH3 {
+func (manager *connectProxyManager) http3RoutePenalty(rule *config.Rule, target *config.Target, now time.Time) time.Duration {
+	if manager == nil || target == nil || target.ConnectProxy == nil || len(target.ConnectProxy.Protocols) == 0 {
+		return 0
+	}
+	if rule != nil && manager.h3RuleBreaker != nil {
+		// When rule recovery is due, penalize every cached/selected target for this
+		// one decision so Boost performs a fresh selection and can reserve the
+		// eligible mixed-protocol canary even if the previous winner was H2-only.
+		if manager.h3RuleBreaker.recoveryProbeDue(rule.Name, now) {
+			return http3DegradationPenaltyBase
+		}
+		if manager.h3RuleBreaker.restrictsOrdinaryH3(rule.Name, now) {
+			if targetUsesMixedHTTP3First(target) {
+				// dialForRule will use H2 for ordinary siblings while evaluation,
+				// cooldown, or probation owns the rule.
+				return 0
+			}
+			if target.ConnectProxy.Protocols[0] == config.ConnectProxyH3 {
+				// Prefer any H2-capable route, but retain fail-open behavior when
+				// every configured/healthy candidate is H3-only.
+				return http3DegradationPenaltyBase
+			}
+		}
+	}
+	if target.ConnectProxy.Protocols[0] != config.ConnectProxyH3 {
 		return 0
 	}
 	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
@@ -746,10 +845,19 @@ func (manager *connectProxyManager) http3RoutePenalty(_ *config.Rule, target *co
 // selectors keep preferring healthy alternatives while a single canary gets a
 // chance to promote the replacement connection. The H3 transport itself also
 // enforces one warming canary in flight.
-func (manager *connectProxyManager) claimHTTP3BoostProbe(_ *config.Rule, target *config.Target, now time.Time) (uint64, bool) {
+func (manager *connectProxyManager) claimHTTP3BoostProbe(rule *config.Rule, target *config.Target, now time.Time) (uint64, bool) {
 	if manager == nil || target == nil || target.ConnectProxy == nil || len(target.ConnectProxy.Protocols) == 0 ||
 		target.ConnectProxy.Protocols[0] != config.ConnectProxyH3 {
 		return 0, false
+	}
+	if rule != nil && manager.h3RuleBreaker != nil && targetUsesMixedHTTP3First(target) {
+		key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+		if token, claimed := manager.h3RuleBreaker.claimRecoveryRouteProbe(rule.Name, key, now); claimed {
+			return token, true
+		}
+		if manager.h3RuleBreaker.bypassing(rule.Name) {
+			return 0, false
+		}
 	}
 	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
 	manager.h3FallbackMu.Lock()
@@ -783,8 +891,14 @@ func (manager *connectProxyManager) claimHTTP3BoostProbe(_ *config.Rule, target 
 	return token, true
 }
 
-func (manager *connectProxyManager) releaseHTTP3BoostProbe(_ *config.Rule, target *config.Target, token uint64) {
+func (manager *connectProxyManager) releaseHTTP3BoostProbe(rule *config.Rule, target *config.Target, token uint64) {
 	if manager == nil || target == nil || target.ConnectProxy == nil || token == 0 {
+		return
+	}
+	if token&http3RuleRouteProbeTokenMask != 0 {
+		if rule != nil && manager.h3RuleBreaker != nil {
+			manager.h3RuleBreaker.releaseRecoveryRouteProbe(rule.Name, token)
+		}
 		return
 	}
 	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}

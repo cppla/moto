@@ -156,6 +156,26 @@ type routeProtocolProbeLease struct {
 	token uint64
 }
 
+type routeProtocolProbeContextKey struct{}
+
+func withRouteProtocolProbeLease(ctx context.Context, lease routeProtocolProbeLease) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if lease.token == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, routeProtocolProbeContextKey{}, lease.token)
+}
+
+func routeProtocolProbeTokenFromContext(ctx context.Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	token, _ := ctx.Value(routeProtocolProbeContextKey{}).(uint64)
+	return token
+}
+
 type routeTargetSelection struct {
 	target        *config.Target
 	protocolProbe routeProtocolProbeLease
@@ -578,13 +598,12 @@ func (registry *routeHealthRegistry) selectTargetSelections(
 	}
 	registry.Unlock()
 
-	// A degraded H3 route is normally omitted while an unpenalized alternative
-	// remains. Before filtering it, atomically reserve at most one due protocol
-	// canary and put that target first. This gives a lazy H3 replacement one real
-	// CONNECT request without allowing concurrent traffic to stampede back onto
-	// the degraded path.
+	// Atomically reserve at most one due protocol canary and put that target
+	// first. Usually an unpenalized alternative exists; a rule-wide H3 recovery
+	// probe is the exception because every target in that rule is deliberately
+	// penalized until one exclusive data-plane probation is admitted.
 	var protocolProbe routeTargetSelection
-	if hasUnpenalized && reserveProtocolProbe {
+	if reserveProtocolProbe {
 		probeCandidates := make([]routeCandidate, 0, len(unobserved)+len(observed))
 		for _, candidate := range unobserved {
 			if candidate.penalty > 0 {
@@ -608,8 +627,34 @@ func (registry *routeHealthRegistry) selectTargetSelections(
 				break
 			}
 		}
-		unobserved = filterUnpenalizedRouteCandidates(unobserved)
-		observed = filterUnpenalizedRouteCandidates(observed)
+		if protocolProbe.target == nil && len(probeCandidates) > 0 {
+			// A concurrent selector may have claimed the protocol lease after our
+			// initial penalty snapshot but before this claim loop. Refresh outside
+			// the route lock so siblings immediately see H2-capable targets as safe
+			// and keep an H3-only target from bypassing the exclusive probation.
+			hasUnpenalized = false
+			refresh := func(candidates []routeCandidate) {
+				for index := range candidates {
+					candidate := &candidates[index]
+					penalty := registry.protocolPenalty(rule, candidate.target, now)
+					candidate.score += penalty - candidate.penalty
+					candidate.penalty = penalty
+					if penalty == 0 {
+						hasUnpenalized = true
+					}
+				}
+			}
+			refresh(unobserved)
+			refresh(observed)
+		}
+		if protocolProbe.target != nil {
+			unobserved = filterRouteCandidateAddress(unobserved, protocolProbe.target.Address)
+			observed = filterRouteCandidateAddress(observed, protocolProbe.target.Address)
+		}
+		if hasUnpenalized {
+			unobserved = filterUnpenalizedRouteCandidates(unobserved)
+			observed = filterUnpenalizedRouteCandidates(observed)
+		}
 	} else if hasUnpenalized {
 		unobserved = filterUnpenalizedRouteCandidates(unobserved)
 		observed = filterUnpenalizedRouteCandidates(observed)
@@ -703,6 +748,16 @@ func filterUnpenalizedRouteCandidates(candidates []routeCandidate) []routeCandid
 	filtered := candidates[:0]
 	for _, candidate := range candidates {
 		if candidate.penalty == 0 {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
+}
+
+func filterRouteCandidateAddress(candidates []routeCandidate, address string) []routeCandidate {
+	filtered := candidates[:0]
+	for _, candidate := range candidates {
+		if candidate.target == nil || candidate.target.Address != address {
 			filtered = append(filtered, candidate)
 		}
 	}
