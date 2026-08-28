@@ -3,6 +3,7 @@ package controller
 import (
 	"moto/config"
 	"moto/utils"
+	"net/http"
 
 	"go.uber.org/zap"
 )
@@ -33,6 +34,8 @@ func logConnectProxyFailure(rule *config.Rule, fallbackTarget string, err error,
 	if !allowed {
 		return
 	}
+	statusErr := connectProxyFinalStatusError(err)
+	message = connectProxyStatusLogMessage(message, statusErr)
 	fields := []zap.Field{
 		zap.String("ruleName", rule.Name),
 		zap.String("targetAddr", target),
@@ -40,7 +43,7 @@ func logConnectProxyFailure(rule *config.Rule, fallbackTarget string, err error,
 		zap.String("class", class),
 		zap.Uint64("suppressed", suppressed),
 	}
-	if statusErr := connectProxyFinalStatusError(err); statusErr != nil {
+	if statusErr != nil {
 		fields = append(fields, zap.Int("statusCode", statusErr.statusCode))
 		if statusErr.hasRetryAfter {
 			fields = append(fields, zap.Int64("retryAfterMs", statusErr.retryAfter.Milliseconds()))
@@ -57,6 +60,25 @@ func logConnectProxyFailure(rule *config.Rule, fallbackTarget string, err error,
 		utils.Logger.Warn(message, fields...)
 	default:
 		utils.Logger.Info(message, fields...)
+	}
+}
+
+// connectProxyStatusLogMessage replaces route-selection summaries only when
+// the final result is an explicit upstream CONNECT response. The bounded class
+// and status fields retain machine-readable details; the message describes the
+// actual proxy response instead of incorrectly claiming that every route was
+// unavailable.
+func connectProxyStatusLogMessage(fallback string, statusErr *connectProxyStatusError) string {
+	if statusErr == nil {
+		return fallback
+	}
+	switch statusErr.statusCode {
+	case http.StatusForbidden:
+		return "目标连接被上游策略拒绝"
+	case http.StatusServiceUnavailable:
+		return "上游暂时无法处理目标连接"
+	default:
+		return fallback
 	}
 }
 

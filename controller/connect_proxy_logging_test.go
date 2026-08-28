@@ -4,6 +4,7 @@ import (
 	"errors"
 	"moto/config"
 	"moto/utils"
+	"net/http"
 	"testing"
 
 	"go.uber.org/zap"
@@ -75,6 +76,66 @@ func TestLogConnectProxyFailureInfersProtocolForGenericMultiTargetErrors(t *test
 			}
 			if got := entries[0].ContextMap()["protocol"]; got != test.want {
 				t.Fatalf("protocol field = %#v, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLogConnectProxyFailureUsesUpstreamCONNECTResponseMessage(t *testing.T) {
+	tests := []struct {
+		name        string
+		statusCode  int
+		wantMessage string
+		wantLevel   zapcore.Level
+	}{
+		{
+			name:        "forbidden",
+			statusCode:  http.StatusForbidden,
+			wantMessage: "目标连接被上游策略拒绝",
+			wantLevel:   zapcore.InfoLevel,
+		},
+		{
+			name:        "service unavailable",
+			statusCode:  http.StatusServiceUnavailable,
+			wantMessage: "上游暂时无法处理目标连接",
+			wantLevel:   zapcore.WarnLevel,
+		},
+	}
+
+	previousLogger := utils.Logger
+	previousLimiter := connectProxyFailureLogLimiter
+	t.Cleanup(func() {
+		utils.Logger = previousLogger
+		connectProxyFailureLogLimiter = previousLimiter
+	})
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core, observed := observer.New(zapcore.DebugLevel)
+			utils.Logger = zap.New(core)
+			connectProxyFailureLogLimiter = newConnectProxyErrorLogLimiter()
+			rule := &config.Rule{Name: "status-message", Protocol: config.ProtocolSOCKS5, Mode: config.ModeBoost}
+			statusErr := &connectProxyStatusError{
+				protocol:   config.ConnectProxyH2,
+				target:     "proxy.example:443",
+				statusCode: test.statusCode,
+				class:      classifyConnectProxyStatus(test.statusCode),
+			}
+
+			logConnectProxyFailure(rule, statusErr.target, statusErr, "缓存原生代理线路及备选均不可用")
+			entries := observed.AllUntimed()
+			if len(entries) != 1 {
+				t.Fatalf("log entries = %d, want 1", len(entries))
+			}
+			entry := entries[0]
+			if entry.Message != test.wantMessage {
+				t.Fatalf("message = %q, want %q", entry.Message, test.wantMessage)
+			}
+			if entry.Level != test.wantLevel {
+				t.Fatalf("level = %s, want %s", entry.Level, test.wantLevel)
+			}
+			if got := entry.ContextMap()["statusCode"]; got != int64(test.statusCode) {
+				t.Fatalf("statusCode field = %#v, want %d", got, test.statusCode)
 			}
 		})
 	}
