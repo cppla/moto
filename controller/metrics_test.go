@@ -51,6 +51,7 @@ func resetProcessMetricsForTest() {
 	processMetrics.connectProxySetupNanos = make(map[connectProxyMetricKey]uint64)
 	processMetrics.connectProxySetupCount = make(map[connectProxyMetricKey]uint64)
 	processMetrics.connectProxyFallbacks = make(map[connectProxyFallbackMetricKey]uint64)
+	processMetrics.connectProxyTunnels = make(map[connectProxyMetricKey]*connectProxyTunnelMetrics)
 	processMetrics.mu.Unlock()
 	setMetricsGaugeRenderer(nil)
 }
@@ -303,6 +304,14 @@ func TestConnectProxyMetricsCaptureSetupOutcomeAndFallback(t *testing.T) {
 	if snapshot.connectProxyFallbacks[fallback] != 1 {
 		t.Fatalf("CONNECT fallbacks = %#v, want one H3-to-H2 status_501 fallback", snapshot.connectProxyFallbacks)
 	}
+	if snapshot.connectProxyActive[h2Setup] != 0 || snapshot.connectProxyLastSuccess[h2Setup] <= 0 {
+		t.Fatalf("successful H2 tunnel metrics = active:%d lastSuccess:%d, want 0 after close and a positive timestamp",
+			snapshot.connectProxyActive[h2Setup], snapshot.connectProxyLastSuccess[h2Setup])
+	}
+	if snapshot.connectProxyActive[h3Setup] != 0 || snapshot.connectProxyLastSuccess[h3Setup] != 0 {
+		t.Fatalf("failed H3 attempt created successful tunnel metrics: active:%d lastSuccess:%d",
+			snapshot.connectProxyActive[h3Setup], snapshot.connectProxyLastSuccess[h3Setup])
+	}
 
 	beforeAttempts := len(snapshot.connectProxyAttempts)
 	beforeHandshakes := len(snapshot.connectProxyHandshakes)
@@ -397,6 +406,9 @@ func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
 	if _, exists := snapshot.connectProxySetupCount[connectProxyMetricKey{rule: "reload-rule", target: "old.example:443", protocol: config.ConnectProxyH3}]; exists {
 		t.Fatal("retired CONNECT setup labels were retained")
 	}
+	if _, exists := snapshot.connectProxyActive[connectProxyMetricKey{rule: "reload-rule", target: "old.example:443", protocol: config.ConnectProxyH3}]; exists {
+		t.Fatal("retired CONNECT tunnel labels were retained")
+	}
 	if snapshot.connectionsAccepted[connectionMetricKey{rule: "reload-rule", mode: config.ModeBoost}] != 1 ||
 		snapshot.dialAttempts[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 ||
 		snapshot.dialBulkheadWaitCount[dialMetricKey{rule: "reload-rule", target: "new.example:443"}] != 1 ||
@@ -419,7 +431,8 @@ func TestMetricRegistryReclaimsRetiredGenerationLabels(t *testing.T) {
 		len(snapshot.boostHedgeEvents) != 0 || len(snapshot.boostHedgeDelayCount) != 0 ||
 		len(snapshot.boostDecisionCount) != 0 || len(snapshot.connectProxyAttempts) != 0 ||
 		len(snapshot.connectProxyHandshakes) != 0 || len(snapshot.connectProxySetupCount) != 0 ||
-		len(snapshot.connectProxyFallbacks) != 0 {
+		len(snapshot.connectProxyFallbacks) != 0 || len(snapshot.connectProxyActive) != 0 ||
+		len(snapshot.connectProxyPayload) != 0 || len(snapshot.connectProxyLastSuccess) != 0 {
 		t.Fatalf("retired labels remain: connections=%d dials=%d bulkhead=%d relay=%d hedge=%d",
 			len(snapshot.connectionsAccepted), len(snapshot.dialAttempts),
 			len(snapshot.dialBulkheadWaitCount), len(snapshot.relayBytes), len(snapshot.boostHedgeEvents))
@@ -506,6 +519,15 @@ func TestMetricRegistryBulkConnectProxyLabelReclamation(t *testing.T) {
 	if got, want := len(snapshot.connectProxyFallbacks), retainedCount*len(reasons); got != want {
 		t.Fatalf("CONNECT fallback series after bulk reload = %d, want %d", got, want)
 	}
+	if got, want := len(snapshot.connectProxyActive), retainedCount*len(protocols); got != want {
+		t.Fatalf("CONNECT active tunnel series after bulk reload = %d, want %d", got, want)
+	}
+	if got, want := len(snapshot.connectProxyPayload), retainedCount*len(protocols)*2; got != want {
+		t.Fatalf("CONNECT payload series after bulk reload = %d, want %d", got, want)
+	}
+	if got, want := len(snapshot.connectProxyLastSuccess), retainedCount*len(protocols); got != want {
+		t.Fatalf("CONNECT last-success series after bulk reload = %d, want %d", got, want)
+	}
 	for index, address := range addresses {
 		attempt := connectProxyAttemptMetricKey{
 			rule: ruleName, target: address,
@@ -536,7 +558,9 @@ func TestMetricRegistryBulkConnectProxyLabelReclamation(t *testing.T) {
 	refCount = len(processMetrics.connectProxyRefs)
 	processMetrics.mu.RUnlock()
 	if refCount != 0 || len(snapshot.connectProxyAttempts) != 0 ||
-		len(snapshot.connectProxySetupCount) != 0 || len(snapshot.connectProxyFallbacks) != 0 {
+		len(snapshot.connectProxySetupCount) != 0 || len(snapshot.connectProxyFallbacks) != 0 ||
+		len(snapshot.connectProxyActive) != 0 || len(snapshot.connectProxyPayload) != 0 ||
+		len(snapshot.connectProxyLastSuccess) != 0 {
 		t.Fatalf("CONNECT labels remain after bulk retirement: refs=%d attempts=%d setup=%d fallbacks=%d",
 			refCount, len(snapshot.connectProxyAttempts), len(snapshot.connectProxySetupCount), len(snapshot.connectProxyFallbacks))
 	}

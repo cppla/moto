@@ -305,6 +305,14 @@ curl -fsS http://127.0.0.1:9090/metrics
 
 `healthz` 表示进程可响应，`readyz` 表示服务已准备接收流量。Prometheus 指标覆盖进程资源、连接、流量、路由健康和 CONNECT 运行状态，并限制标签范围，避免暴露客户端请求信息。
 
+Python3 可直接观察当前实际传输使用的 H2/H3 协议、上游线路、活动隧道和速率：
+
+```bash
+python3 test/moto-route-watch.py
+# 采样一次后退出
+python3 test/moto-route-watch.py --once
+```
+
 ## WebSocket
 
 Moto 在 TCP 层透明支持 `ws://` 和 `wss://`。HTTP Upgrade、TLS 握手和 WebSocket 帧不会被改写，已建立会话也不受规则 `timeout` 限制；通用四种模式均有 Upgrade、文本帧、Ping/Pong 和长连接端到端测试，`tls` 模式另有真实 ClientHello 分片与原字节重放测试。

@@ -280,7 +280,7 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 			if protocol == config.ConnectProxyH2 && pendingHTTP3RuleValidationToken != 0 {
 				ruleH2Reachable = true
 			}
-			return connection, nil
+			return observeConnectProxyTunnel(connection, rule, target.Address, protocol), nil
 		}
 		failures = append(failures, fmt.Errorf("%s CONNECT: %w", protocol, err))
 		var statusErr *connectProxyStatusError
