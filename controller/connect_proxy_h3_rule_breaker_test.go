@@ -848,7 +848,7 @@ func TestHTTP3RuleBreakerLateH2ValidationResponseIsStale(t *testing.T) {
 }
 
 func TestCachedBoostSerialH2FallbackCommitsRuleCooldown(t *testing.T) {
-	now := time.Date(2026, 8, 28, 17, 55, 0, 0, time.UTC)
+	now := time.Now()
 	runtime := newRoutingRuntime()
 	defer runtime.stopBackground()
 	runtime.connectProxy.now = func() time.Time { return now }
