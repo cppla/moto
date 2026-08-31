@@ -718,15 +718,16 @@ func (registry *routeHealthRegistry) selectTargetSelections(
 	// Once every route has been tried, reserve the second Top-2 slot for the
 	// stalest eligible route at a bounded interval. This lets a formerly slow
 	// path prove that it recovered without sacrificing the best-known route.
+	// Boost asks for the full ordered candidate list so it can refill slots
+	// around health exclusions. Keep that fallback list, but move the explorer
+	// into its actual second launch position instead of only considering routes
+	// omitted by a selector limit of two.
 	if len(unobserved) == 0 && len(selected) > 1 {
-		selectedAddresses := make(map[string]struct{}, len(selected))
-		for _, selection := range selected {
-			selectedAddresses[selection.target.Address] = struct{}{}
-		}
+		bestAddress := selected[0].target.Address
 		var explorer *routeCandidate
 		for i := range observed {
 			candidate := &observed[i]
-			if _, alreadySelected := selectedAddresses[candidate.target.Address]; alreadySelected {
+			if candidate.target.Address == bestAddress {
 				continue
 			}
 			if !candidate.lastAttempt.IsZero() && now.Sub(candidate.lastAttempt) < routeExplorationAfter {
@@ -738,7 +739,18 @@ func (registry *routeHealthRegistry) selectTargetSelections(
 			}
 		}
 		if explorer != nil {
-			selected[len(selected)-1] = routeTargetSelection{target: explorer.target}
+			explorerIndex := -1
+			for index := 1; index < len(selected); index++ {
+				if selected[index].target.Address == explorer.target.Address {
+					explorerIndex = index
+					break
+				}
+			}
+			if explorerIndex >= 0 {
+				selected[1], selected[explorerIndex] = selected[explorerIndex], selected[1]
+			} else {
+				selected[1] = routeTargetSelection{target: explorer.target}
+			}
 		}
 	}
 	return selected

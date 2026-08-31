@@ -857,6 +857,70 @@ func TestBoostSOCKS5BoundsDistinctTargetsToTwo(t *testing.T) {
 	}
 }
 
+func TestFreshBoostSOCKS5UsesStaleExplorerInTopTwo(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"fresh-stale-explorer",
+		"127.0.0.1:18117",
+		"best.example:443",
+		"second.example:443",
+		"recent.example:443",
+		"stale.example:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+
+	now := time.Now()
+	samples := []struct {
+		address string
+		latency time.Duration
+		at      time.Time
+	}{
+		{address: "best.example:443", latency: 10 * time.Millisecond, at: now},
+		{address: "second.example:443", latency: 20 * time.Millisecond, at: now},
+		{address: "recent.example:443", latency: 30 * time.Millisecond, at: now},
+		{
+			address: "stale.example:443",
+			latency: 40 * time.Millisecond,
+			at:      now.Add(-routeExplorationAfter - time.Second),
+		},
+	}
+	for _, sample := range samples {
+		attempt, err := runtime.routes.begin(rule, sample.address, sample.at)
+		if err != nil {
+			t.Fatalf("begin route %q: %v", sample.address, err)
+		}
+		routeObserve(attempt, sample.latency, nil, sample.at)
+	}
+
+	var callsMu sync.Mutex
+	calls := make(map[string]int)
+	_, err := runtime.raceBoostTargetsPreparedWithAdmission(
+		context.Background(),
+		rule,
+		func(_ context.Context, address string) (net.Conn, error) {
+			callsMu.Lock()
+			calls[address]++
+			callsMu.Unlock()
+			return nil, errors.New("fixture failure")
+		},
+		nil,
+		func(context.Context, *config.Rule, string, bool) (boostDialRelease, error) {
+			return func() {}, nil
+		},
+	)
+	if err == nil {
+		t.Fatal("all-failure Boost race unexpectedly succeeded")
+	}
+
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if len(calls) != connectProxyMaxTargetAttempts ||
+		calls["best.example:443"] != 1 || calls["stale.example:443"] != 1 {
+		t.Fatalf("dialed targets = %v, want best plus stale explorer", calls)
+	}
+}
+
 func TestCachedBoostSlowPrimaryLaunchesHedgeOnSignalAndCancelsLoser(t *testing.T) {
 	resetProcessMetricsForTest()
 	runtime := newRoutingRuntime()

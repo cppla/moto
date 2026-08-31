@@ -437,6 +437,36 @@ func TestSelectRouteTargetsExploresThenRanksTopTwo(t *testing.T) {
 	assertRouteAddresses(t, selected, "new-one:1", "new-two:1")
 }
 
+func TestSelectRouteTargetsFullCandidateListRotatesEveryNonBestRoute(t *testing.T) {
+	resetRouteHealthForTest()
+	rule := routeHealthTestRule("best:1", "second:1", "third:1", "fourth:1")
+	now := time.Date(2026, 8, 31, 14, 30, 0, 0, time.UTC)
+	latencies := map[string]time.Duration{
+		"best:1":   10 * time.Millisecond,
+		"second:1": 20 * time.Millisecond,
+		"third:1":  30 * time.Millisecond,
+		"fourth:1": 40 * time.Millisecond,
+	}
+	initialAttempt := now.Add(-routeExplorationAfter)
+	for _, target := range rule.Targets {
+		observeRoute(t, rule, target.Address, latencies[target.Address], nil, initialAttempt)
+	}
+
+	for step, expectedExplorer := range []string{"second:1", "third:1", "fourth:1", "second:1"} {
+		selectionTime := now.Add(time.Duration(step) * routeExplorationAfter)
+		selected := selectRouteTargets(rule, len(rule.Targets), selectionTime)
+		addresses := make([]string, 0, len(selected))
+		for _, target := range selected {
+			addresses = append(addresses, target.Address)
+		}
+		if len(selected) != len(rule.Targets) ||
+			selected[0].Address != "best:1" || selected[1].Address != expectedExplorer {
+			t.Fatalf("selection %d = %v, want best plus %s", step, addresses, expectedExplorer)
+		}
+		observeRoute(t, rule, expectedExplorer, latencies[expectedExplorer], nil, selectionTime)
+	}
+}
+
 func TestSelectRouteTargetsKeepsBestAndRotatesUnobserved(t *testing.T) {
 	resetRouteHealthForTest()
 	rule := routeHealthTestRule("best:1", "cancelled:1", "new-one:1", "new-two:1")
