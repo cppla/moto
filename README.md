@@ -305,12 +305,14 @@ curl -fsS http://127.0.0.1:9090/metrics
 
 `healthz` 表示进程可响应，`readyz` 表示服务已准备接收流量。Prometheus 指标覆盖进程资源、连接、流量、路由健康和 CONNECT 运行状态，并限制标签范围，避免暴露客户端请求信息。
 
-Python3 可直接观察当前实际传输使用的 H2/H3 协议、上游线路、活动隧道和速率：
+Python3 可直接观察当前实际传输使用的 H2/H3 协议、上游线路、活动隧道、瞬时/平均速率和流量占比；H3 线路还会显示 RTT、丢包、阻塞、轮换与恢复状态。脚本会过滤微量后台流量，并对主线路切换做连续采样确认：
 
 ```bash
 python3 test/moto-route-watch.py
 # 采样一次后退出
 python3 test/moto-route-watch.py --once
+# 供自动化处理
+python3 test/moto-route-watch.py --json
 ```
 
 ## WebSocket
