@@ -262,6 +262,104 @@ func TestReportRouteRelayDoesNotTreatErroredBytesAsRecovery(t *testing.T) {
 	}
 }
 
+func TestRelayInvalidatesBoostWinnerOnlyForActionableFailures(t *testing.T) {
+	clientReadReset := &net.OpError{Op: "writeto", Net: "tcp", Err: &net.OpError{
+		Op: "read", Net: "tcp", Err: syscall.ECONNRESET,
+	}}
+	upstreamWriteReset := &net.OpError{Op: "write", Net: "tcp", Err: syscall.ECONNRESET}
+	upstreamReadReset := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}
+	clientWriteBrokenPipe := &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}
+
+	tests := []struct {
+		name   string
+		result relayResult
+		want   bool
+	}{
+		{name: "clean relay", result: relayResult{}, want: false},
+		{
+			name: "client read reset",
+			result: relayResult{
+				ClientToTarget: relayDirectionResult{
+					Err: clientReadReset, Origin: relayErrorOriginPrimary,
+				},
+				TargetToClient: relayDirectionResult{
+					Err: net.ErrClosed, Origin: relayErrorOriginSecondary,
+				},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "upstream write reset",
+			result: relayResult{
+				ClientToTarget: relayDirectionResult{
+					Err: upstreamWriteReset, Origin: relayErrorOriginPrimary,
+				},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			want: true,
+		},
+		{
+			name: "upstream read reset",
+			result: relayResult{
+				TargetToClient: relayDirectionResult{
+					Err: upstreamReadReset, Origin: relayErrorOriginPrimary,
+				},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionTargetToClient,
+				},
+			},
+			want: true,
+		},
+		{
+			name: "write to closed client",
+			result: relayResult{
+				TargetToClient: relayDirectionResult{
+					Err: clientWriteBrokenPipe, Origin: relayErrorOriginPrimary,
+				},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionTargetToClient,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "context shutdown",
+			result: relayResult{
+				ClientToTarget: relayDirectionResult{
+					Err: errors.New("relay context closed"), Origin: relayErrorOriginUnknown,
+				},
+				StopCause: relayStopCause{Kind: relayStopContext},
+			},
+			want: false,
+		},
+		{
+			name: "ambiguous primary error",
+			result: relayResult{
+				ClientToTarget: relayDirectionResult{
+					Err: errors.New("ambiguous relay failure"), Origin: relayErrorOriginPrimary,
+				},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := relayInvalidatesBoostWinner(test.result); got != test.want {
+				t.Fatalf("invalidates winner = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRelayBidirectionalContextCancellationStopsIdleCopies(t *testing.T) {
 	client, proxyClient := newTCPPair(t)
 	proxyTarget, backend := newTCPPair(t)
@@ -331,6 +429,10 @@ func TestClassifyRelayError(t *testing.T) {
 	http2BodyClosed := errors.New("http2: response body closed")
 	expectedClose := &net.OpError{Op: "close", Net: "tcp", Err: syscall.ENOTCONN}
 	brokenPipe := &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}
+	clientReset := &net.OpError{Op: "writeto", Net: "tcp", Err: &net.OpError{
+		Op: "read", Net: "tcp", Err: syscall.ECONNRESET,
+	}}
+	upstreamWriteReset := &net.OpError{Op: "write", Net: "tcp", Err: syscall.ECONNRESET}
 
 	tests := []struct {
 		name      string
@@ -339,6 +441,32 @@ func TestClassifyRelayError(t *testing.T) {
 		err       error
 		want      relayLogDecision
 	}{
+		{
+			name: "client read reset is expected close",
+			result: relayResult{
+				ClientToTarget: relayDirectionResult{Origin: relayErrorOriginPrimary},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			direction: relayDirectionClientToTarget,
+			err:       clientReset,
+			want: relayLogDecision{
+				Level: zapcore.DebugLevel, Class: relayLogClassExpectedClose, Primary: true,
+			},
+		},
+		{
+			name: "upstream write reset remains warning",
+			result: relayResult{
+				ClientToTarget: relayDirectionResult{Origin: relayErrorOriginPrimary},
+				StopCause: relayStopCause{
+					Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+				},
+			},
+			direction: relayDirectionClientToTarget,
+			err:       upstreamWriteReset,
+			want:      relayLogDecision{Level: zapcore.WarnLevel, Class: relayLogClassPrimary, Primary: true},
+		},
 		{
 			name: "primary copy error stays warning",
 			result: relayResult{

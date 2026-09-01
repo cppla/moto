@@ -113,6 +113,74 @@ def h3_health_body(
     return "\n".join(lines) + "\n"
 
 
+def attempt_metrics_body(
+    *,
+    h3_attempts: int = 0,
+    h3_successes: int = 0,
+    h3_canceled: int = 0,
+    h3_failures: int = 0,
+    h3_last_attempt: int = 0,
+    h2_attempts: int = 0,
+    h2_successes: int = 0,
+    h2_canceled: int = 0,
+    h2_failures: int = 0,
+    h2_last_attempt: int = 0,
+    h2_circuit_open: int = 0,
+    h3_consecutive_failures: int = 0,
+    h2_consecutive_failures: int = 0,
+) -> str:
+    targets = {
+        "h3.example:443": {
+            "attempts": h3_attempts,
+            "successes": h3_successes,
+            "canceled": h3_canceled,
+            "failures": h3_failures,
+            "consecutive_failures": h3_consecutive_failures,
+            "last_attempt": h3_last_attempt,
+            "ewma": 0.12,
+            "circuit_open": 0,
+        },
+        "h2.example:443": {
+            "attempts": h2_attempts,
+            "successes": h2_successes,
+            "canceled": h2_canceled,
+            "failures": h2_failures,
+            "consecutive_failures": h2_consecutive_failures,
+            "last_attempt": h2_last_attempt,
+            "ewma": 0.18,
+            "circuit_open": h2_circuit_open,
+        },
+    }
+    lines = []
+    for metric in WATCH.ROUTE_ATTEMPT_METRICS:
+        lines.append(f"# TYPE {metric} gauge")
+    for metric in WATCH.DIAL_ATTEMPT_METRICS:
+        lines.append(f"# TYPE {metric} counter")
+    for target, values in targets.items():
+        labels = f'rule="mixed",mode="boost",target="{target}"'
+        lines.extend(
+            [
+                f'moto_route_latency_ewma_seconds{{{labels}}} {values["ewma"]}',
+                f'moto_route_observed{{{labels}}} 1',
+                f'moto_route_consecutive_failures{{{labels}}} {values["consecutive_failures"]}',
+                f'moto_route_circuit_open{{{labels}}} {values["circuit_open"]}',
+                f'moto_route_half_open{{{labels}}} 0',
+                f'moto_route_last_attempt_timestamp_seconds{{{labels}}} {values["last_attempt"]}',
+                f'moto_active_health_unhealthy{{{labels}}} 0',
+            ]
+        )
+        dial_labels = f'rule="mixed",target="{target}"'
+        lines.extend(
+            [
+                f'moto_dial_attempts_total{{{dial_labels}}} {values["attempts"]}',
+                f'moto_dial_success_total{{{dial_labels}}} {values["successes"]}',
+                f'moto_dial_canceled_total{{{dial_labels}}} {values["canceled"]}',
+                f'moto_dial_failures_total{{{dial_labels}}} {values["failures"]}',
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
 def route(
     key: WATCH.RouteKey,
     rate: float,
@@ -487,6 +555,143 @@ class RouteWatchTest(unittest.TestCase):
 
         self.assertTrue(all(item.h3_health is None for item in view.routes))
 
+    def test_recent_attempt_window_uses_existing_route_and_dial_metrics(self) -> None:
+        baseline = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body(
+                h3_attempts=10,
+                h3_successes=7,
+                h3_canceled=2,
+                h3_failures=1,
+                h3_last_attempt=100,
+                h2_attempts=5,
+                h2_successes=3,
+                h2_canceled=1,
+                h2_failures=1,
+                h2_last_attempt=90,
+            ),
+            10.0,
+            100.0,
+        )
+        current = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body(
+                h3_attempts=14,
+                h3_successes=10,
+                h3_canceled=3,
+                h3_failures=1,
+                h3_last_attempt=218,
+                h2_attempts=7,
+                h2_successes=4,
+                h2_canceled=1,
+                h2_failures=2,
+                h2_last_attempt=200,
+                h2_circuit_open=1,
+            ),
+            130.0,
+            220.0,
+        )
+
+        attempts = WATCH.build_attempt_window(current, baseline)
+        by_target = {target.target: target for target in attempts.targets}
+
+        self.assertTrue(attempts.supported)
+        self.assertEqual(attempts.window_seconds, 120.0)
+        self.assertEqual(attempts.attempted_targets, 2)
+        self.assertEqual(by_target["h3.example:443"].attempts, 4)
+        self.assertEqual(by_target["h3.example:443"].successes, 3)
+        self.assertEqual(by_target["h3.example:443"].canceled, 1)
+        self.assertEqual(by_target["h3.example:443"].failures, 0)
+        self.assertEqual(by_target["h3.example:443"].latency_ewma_seconds, 0.12)
+        self.assertEqual(by_target["h3.example:443"].status, "healthy")
+        self.assertEqual(by_target["h2.example:443"].status, "circuit_open")
+
+    def test_failed_target_is_kept_even_without_a_successful_tunnel_series(self) -> None:
+        def failed_target_body(attempts: int, failures: int, last_attempt: int) -> str:
+            route_labels = 'rule="mixed",mode="boost",target="failed.example:443"'
+            dial_labels = 'rule="mixed",target="failed.example:443"'
+            return "\n".join(
+                [
+                    f'moto_route_observed{{{route_labels}}} 1',
+                    f'moto_route_consecutive_failures{{{route_labels}}} {failures}',
+                    f'moto_route_circuit_open{{{route_labels}}} 0',
+                    f'moto_route_half_open{{{route_labels}}} 0',
+                    f'moto_route_last_attempt_timestamp_seconds{{{route_labels}}} {last_attempt}',
+                    f'moto_active_health_unhealthy{{{route_labels}}} 0',
+                    f'moto_dial_attempts_total{{{dial_labels}}} {attempts}',
+                    f'moto_dial_failures_total{{{dial_labels}}} {failures}',
+                ]
+            ) + "\n"
+
+        baseline = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body()
+            + failed_target_body(1, 1, 100),
+            10.0,
+            100.0,
+        )
+        current = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body()
+            + failed_target_body(2, 2, 110),
+            20.0,
+            110.0,
+        )
+
+        attempts = WATCH.build_attempt_window(current, baseline)
+        by_target = {target.target: target for target in attempts.targets}
+
+        self.assertIn("failed.example:443", by_target)
+        self.assertEqual(by_target["failed.example:443"].attempts, 1)
+        self.assertEqual(by_target["failed.example:443"].failures, 1)
+        self.assertEqual(by_target["failed.example:443"].status, "failing")
+
+    def test_recent_attempt_metrics_are_optional_for_older_moto(self) -> None:
+        sample = WATCH.parse_metrics(metrics_body(), 1.0, 100.0)
+        attempts = WATCH.build_attempt_window(sample, None)
+
+        self.assertFalse(attempts.supported)
+        self.assertEqual(attempts.targets, [])
+
+    def test_human_output_separates_active_routes_from_attempt_evidence(self) -> None:
+        baseline = WATCH.parse_metrics(
+            metrics_body() + attempt_metrics_body(h3_attempts=10, h3_successes=8),
+            1.0,
+            100.0,
+        )
+        current_sample = WATCH.parse_metrics(
+            metrics_body(h3_download=20000)
+            + attempt_metrics_body(
+                h3_attempts=12,
+                h3_successes=9,
+                h3_canceled=1,
+                h3_last_attempt=101,
+            ),
+            3.0,
+            102.0,
+        )
+        view = WATCH.build_view(current_sample, baseline, baseline, min_rate=0.0)
+        attempts = WATCH.build_attempt_window(current_sample, baseline)
+        assert view.raw_dominant is not None
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            WATCH.print_human(
+                "http://127.0.0.1:9090/metrics",
+                current_sample,
+                view,
+                WATCH.DominantSelection(view.raw_dominant, None, None, 0),
+                10.0,
+                3,
+                attempts=attempts,
+                attempt_window_target=120.0,
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("当前承载（活动隧道与 payload）", rendered)
+        self.assertIn("最近目标尝试（参竞证据）", rendered)
+        self.assertIn("成功”是目标尝试成功，不等于最终 Winner", rendered)
+        self.assertIn("取消”可能是竞速落败或父请求取消", rendered)
+
     def test_current_route_highlights_requested_values_in_green(self) -> None:
         current = route(
             ("SOCKS5 to H3/H2", "2.example.com:443", "h3"),
@@ -541,7 +746,51 @@ class RouteWatchTest(unittest.TestCase):
         self.assertEqual(decoded["schema_version"], 2)
         self.assertEqual(decoded["dominant"]["bytes_per_second"], 10000.0)
         self.assertEqual(decoded["dominant"]["average_bytes_per_second"], 10000.0)
+        self.assertFalse(decoded["recent_target_attempts"]["available"])
         self.assertNotIn("\033", encoded)
+
+    def test_json_v2_adds_recent_attempts_without_breaking_schema(self) -> None:
+        baseline = WATCH.parse_metrics(
+            metrics_body() + attempt_metrics_body(h3_attempts=10, h3_successes=8),
+            1.0,
+            100.0,
+        )
+        current_sample = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body(
+                h3_attempts=12,
+                h3_successes=9,
+                h3_canceled=1,
+                h3_last_attempt=101,
+            ),
+            3.0,
+            102.0,
+        )
+        view = WATCH.build_view(current_sample, baseline, baseline)
+        attempts = WATCH.build_attempt_window(current_sample, baseline)
+        assert view.raw_dominant is not None
+
+        snapshot = WATCH.snapshot_dict(
+            "http://127.0.0.1:9090/metrics",
+            current_sample,
+            view,
+            WATCH.DominantSelection(view.raw_dominant, None, None, 0),
+            4096.0,
+            10.0,
+            3,
+            attempts,
+            120.0,
+        )
+
+        self.assertEqual(snapshot["schema_version"], 2)
+        recent = snapshot["recent_target_attempts"]
+        self.assertTrue(recent["available"])
+        self.assertEqual(recent["attempted_targets"], 1)
+        targets = {target["target"]: target for target in recent["targets"]}
+        self.assertEqual(targets["h3.example:443"]["attempts"], 2)
+        self.assertEqual(targets["h3.example:443"]["successes"], 1)
+        self.assertEqual(targets["h3.example:443"]["canceled"], 1)
+        self.assertIn("does not prove", recent["semantics"]["success"])
 
     def test_json_error_uses_the_same_top_level_contract(self) -> None:
         args = WATCH.parse_args(["--json"])
@@ -556,6 +805,7 @@ class RouteWatchTest(unittest.TestCase):
         self.assertIsNone(decoded["observed_leader"])
         self.assertEqual(decoded["routes"], [])
         self.assertEqual(decoded["aggregate"]["active_tunnels"], 0)
+        self.assertFalse(decoded["recent_target_attempts"]["available"])
 
     def test_missing_required_metric_fails_clearly(self) -> None:
         body = metrics_body().replace(WATCH.LAST_SUCCESS_METRIC, "removed_metric")

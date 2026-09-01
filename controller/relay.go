@@ -232,6 +232,32 @@ func relayHasError(result relayResult) bool {
 	return result.ClientToTarget.Err != nil || result.TargetToClient.Err != nil
 }
 
+// relayInvalidatesBoostWinner reports whether a relay failure is actionable
+// evidence against the cached route. io.Copy errors are generally ambiguous,
+// so this only exempts shutdown signatures that identify a client-side close;
+// upstream and otherwise ambiguous failures still force the next connection to
+// re-evaluate the cached winner.
+func relayInvalidatesBoostWinner(result relayResult) bool {
+	return relayDirectionInvalidatesBoostWinner(result, relayDirectionClientToTarget) ||
+		relayDirectionInvalidatesBoostWinner(result, relayDirectionTargetToClient)
+}
+
+func relayDirectionInvalidatesBoostWinner(result relayResult, direction relayDirection) bool {
+	directionResult := relayDirectionResultFor(result, direction)
+	if directionResult.Err == nil || directionResult.Origin == relayErrorOriginSecondary {
+		return false
+	}
+	if result.StopCause.Kind == relayStopContext &&
+		directionResult.Origin != relayErrorOriginConcurrent {
+		return false
+	}
+	if isClientRelayDisconnectError(direction, directionResult.Err) ||
+		isExpectedRelayCloseError(direction, directionResult.Err) {
+		return false
+	}
+	return true
+}
+
 func logRelayResult(rule *config.Rule, client, target net.Conn, result relayResult) {
 	ruleName := ""
 	if rule != nil {
@@ -290,6 +316,13 @@ func classifyRelayError(result relayResult, direction relayDirection, err error)
 			Primary: origin != relayErrorOriginConcurrent,
 		}
 	}
+	if isClientRelayDisconnectError(direction, err) {
+		return relayLogDecision{
+			Level:   zapcore.DebugLevel,
+			Class:   relayLogClassExpectedClose,
+			Primary: origin != relayErrorOriginConcurrent,
+		}
+	}
 	if origin == relayErrorOriginConcurrent {
 		return relayLogDecision{Level: zapcore.WarnLevel, Class: relayLogClassConcurrent}
 	}
@@ -314,7 +347,29 @@ const (
 	windowsErrorBrokenPipe syscall.Errno = 109
 	windowsWSAENOTCONN     syscall.Errno = 10057
 	windowsWSAESHUTDOWN    syscall.Errno = 10058
+	windowsWSAECONNRESET   syscall.Errno = 10054
 )
+
+func isClientRelayDisconnectError(direction relayDirection, err error) bool {
+	return isClientRelayDisconnectErrorForOS(runtime.GOOS, direction, err)
+}
+
+// A reset is attributable to the client only when it happened while reading
+// the client-to-target source. The same errno while writing upstream, or while
+// reading target-to-client traffic, remains an actionable route failure.
+func isClientRelayDisconnectErrorForOS(goos string, direction relayDirection, err error) bool {
+	if direction != relayDirectionClientToTarget ||
+		(!errors.Is(err, syscall.ECONNRESET) &&
+			!(goos == "windows" && errors.Is(err, windowsWSAECONNRESET))) {
+		return false
+	}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		if opErr, ok := current.(*net.OpError); ok && opErr.Op == "read" {
+			return true
+		}
+	}
+	return false
+}
 
 func isExpectedRelayCloseErrorForOS(goos string, direction relayDirection, err error) bool {
 	if errors.Is(err, net.ErrClosed) ||

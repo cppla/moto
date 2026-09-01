@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -919,6 +920,199 @@ func TestFreshBoostSOCKS5UsesStaleExplorerInTopTwo(t *testing.T) {
 		calls["best.example:443"] != 1 || calls["stale.example:443"] != 1 {
 		t.Fatalf("dialed targets = %v, want best plus stale explorer", calls)
 	}
+}
+
+func TestConcurrentFreshBoostUsesOnePeriodicExplorerWithoutWaiting(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"single-periodic-explorer",
+		"127.0.0.1:18118",
+		"best.example:443",
+		"second.example:443",
+		"stale.example:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+
+	now := time.Now()
+	for _, sample := range []struct {
+		address string
+		latency time.Duration
+		at      time.Time
+	}{
+		{address: "best.example:443", latency: 10 * time.Millisecond, at: now},
+		{address: "second.example:443", latency: 20 * time.Millisecond, at: now},
+		{
+			address: "stale.example:443",
+			latency: 40 * time.Millisecond,
+			at:      now.Add(-routeExplorationAfter - time.Second),
+		},
+	} {
+		attempt, err := runtime.routes.begin(rule, sample.address, sample.at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routeObserve(attempt, sample.latency, nil, sample.at)
+	}
+
+	var staleAcquireOnce sync.Once
+	staleAcquireStarted := make(chan struct{})
+	releaseStaleAcquire := make(chan struct{})
+	var staleAcquires atomic.Int32
+	acquire := func(_ context.Context, _ *config.Rule, address string, _ bool) (boostDialRelease, error) {
+		if address == "stale.example:443" {
+			staleAcquires.Add(1)
+			staleAcquireOnce.Do(func() { close(staleAcquireStarted) })
+			<-releaseStaleAcquire
+		}
+		return func() {}, nil
+	}
+	var callsMu sync.Mutex
+	calls := make(map[string]int)
+	var firstBest atomic.Bool
+	firstBestStarted := make(chan struct{})
+	releaseFirstBest := make(chan struct{})
+	dial := func(_ context.Context, address string) (net.Conn, error) {
+		callsMu.Lock()
+		calls[address]++
+		callsMu.Unlock()
+		if address == "best.example:443" && firstBest.CompareAndSwap(false, true) {
+			close(firstBestStarted)
+			<-releaseFirstBest
+			return nil, errors.New("owner best failure")
+		}
+		if address != "stale.example:443" {
+			connection, peer := net.Pipe()
+			_ = peer.Close()
+			return connection, nil
+		}
+		return nil, errors.New("fixture failure")
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runtime.raceBoostTargetsPreparedWithAdmission(
+			context.Background(), rule, dial, nil, acquire,
+		)
+		firstDone <- err
+	}()
+	select {
+	case <-staleAcquireStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first periodic explorer did not reach admission")
+	}
+	select {
+	case <-firstBestStarted:
+	case <-time.After(time.Second):
+		close(releaseFirstBest)
+		close(releaseStaleAcquire)
+		t.Fatal("first best route did not start")
+	}
+
+	const siblings = 12
+	siblingDone := make(chan error, siblings)
+	for range siblings {
+		go func() {
+			winner, err := runtime.raceBoostTargetsPreparedWithAdmission(
+				context.Background(), rule, dial, nil, acquire,
+			)
+			if winner.conn != nil {
+				_ = winner.conn.Close()
+			}
+			siblingDone <- err
+		}()
+	}
+	progressed := true
+	received := 0
+	for received < siblings {
+		select {
+		case err := <-siblingDone:
+			received++
+			if err != nil {
+				t.Errorf("ordinary sibling route failed: %v", err)
+			}
+		case <-time.After(time.Second):
+			progressed = false
+		}
+		if !progressed {
+			break
+		}
+	}
+	close(releaseFirstBest)
+	close(releaseStaleAcquire)
+	for received < siblings {
+		<-siblingDone
+		received++
+	}
+	if err := <-firstDone; err == nil {
+		t.Error("all-failure owner unexpectedly succeeded")
+	}
+	if !progressed {
+		t.Fatal("sibling Boost request waited for another request's periodic explorer")
+	}
+	if got := staleAcquires.Load(); got != 1 {
+		t.Fatalf("stale explorer admissions = %d, want 1", got)
+	}
+	callsMu.Lock()
+	secondCalls := calls["second.example:443"]
+	callsMu.Unlock()
+	if secondCalls != siblings {
+		t.Fatalf("ordinary second-route calls = %d, want %d sibling fallbacks", secondCalls, siblings)
+	}
+}
+
+func TestFreshBoostReleasesPeriodicExplorerAfterAdmissionFailure(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"periodic-explorer-release",
+		"127.0.0.1:18119",
+		"best.example:443",
+		"second.example:443",
+		"stale.example:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+	now := time.Now()
+	for _, sample := range []struct {
+		address string
+		latency time.Duration
+		at      time.Time
+	}{
+		{address: "best.example:443", latency: 10 * time.Millisecond, at: now},
+		{address: "second.example:443", latency: 20 * time.Millisecond, at: now},
+		{address: "stale.example:443", latency: 40 * time.Millisecond, at: now.Add(-routeExplorationAfter - time.Second)},
+	} {
+		attempt, err := runtime.routes.begin(rule, sample.address, sample.at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routeObserve(attempt, sample.latency, nil, sample.at)
+	}
+
+	_, err := runtime.raceBoostTargetsPreparedWithAdmission(
+		context.Background(),
+		rule,
+		func(context.Context, string) (net.Conn, error) {
+			return nil, errors.New("fixture failure")
+		},
+		nil,
+		func(_ context.Context, _ *config.Rule, address string, _ bool) (boostDialRelease, error) {
+			if address == "stale.example:443" {
+				return nil, &dialBulkheadError{
+					target: address, saturated: true, scope: dialSaturationTarget,
+				}
+			}
+			return func() {}, nil
+		},
+	)
+	if err == nil {
+		t.Fatal("all-failure Boost race unexpectedly succeeded")
+	}
+	lease, claimed := runtime.routes.claimExploration(rule, rule.Targets[2], time.Now())
+	if !claimed {
+		t.Fatal("admission failure leaked periodic exploration lease")
+	}
+	runtime.routes.releaseExploration(lease)
 }
 
 func TestCachedBoostSlowPrimaryLaunchesHedgeOnSignalAndCancelsLoser(t *testing.T) {
@@ -1843,7 +2037,35 @@ func TestBoostCacheHitDoesNotExtendRevalidationDeadline(t *testing.T) {
 	}
 }
 
-func TestFinishBoostRelayDropsOnlyErroredCurrentWinner(t *testing.T) {
+func TestFinishBoostRelayKeepsWinnerForClientDisconnect(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule("relay-client-close", "127.0.0.1:18199", "one:1", "two:2")
+	key := boostRuleKey(rule)
+	token := runtime.storeBoostWinner(key, "one:1")
+
+	clientReset := &net.OpError{Op: "writeto", Net: "tcp", Err: &net.OpError{
+		Op: "read", Net: "tcp", Err: syscall.ECONNRESET,
+	}}
+	runtime.finishBoostRelay(token, routeAttempt{}, relayResult{
+		ClientToTarget: relayDirectionResult{
+			Err: clientReset, Origin: relayErrorOriginPrimary,
+		},
+		TargetToClient: relayDirectionResult{
+			Err: net.ErrClosed, Origin: relayErrorOriginSecondary,
+		},
+		StopCause: relayStopCause{
+			Kind: relayStopCopyError, Direction: relayDirectionClientToTarget,
+		},
+	})
+
+	entry, ok := runtime.loadBoostWinnerToken(key)
+	if !ok || entry.addr != token.addr || entry.generation != token.generation {
+		t.Fatalf("client disconnect removed cached winner: entry=%+v ok=%v", entry, ok)
+	}
+}
+
+func TestFinishBoostRelayDropsOnlyActionableCurrentWinner(t *testing.T) {
 	runtime := newRoutingRuntime()
 	defer runtime.stopBackground()
 	rule := boostTestRule("relay-cache", "127.0.0.1:18200", "one:1", "two:2")

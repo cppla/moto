@@ -467,6 +467,130 @@ func TestSelectRouteTargetsFullCandidateListRotatesEveryNonBestRoute(t *testing.
 	}
 }
 
+func TestRouteExplorationLeaseIsRuleWideTokenSafeAndExpires(t *testing.T) {
+	rule := routeHealthTestRule("best:1", "stale:1")
+	rule.Timeout = 1000
+	registry := newRouteHealthRegistry()
+	now := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	staleAt := now.Add(-routeExplorationAfter - time.Second)
+	attempt, err := registry.begin(rule, "stale:1", staleAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(attempt, 40*time.Millisecond, nil, staleAt)
+
+	const callers = 32
+	start := make(chan struct{})
+	leases := make(chan routeExplorationLease, callers)
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(callers)
+	done.Add(callers)
+	for range callers {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			if lease, claimed := registry.claimExploration(rule, rule.Targets[1], now); claimed {
+				leases <- lease
+			}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+	close(leases)
+	var first routeExplorationLease
+	claims := 0
+	for lease := range leases {
+		first = lease
+		claims++
+	}
+	if claims != 1 {
+		t.Fatalf("exploration claims = %d, want 1", claims)
+	}
+
+	expiredAt := now.Add(routeExplorationLeaseDuration(rule))
+	second, claimed := registry.claimExploration(rule, rule.Targets[1], expiredAt)
+	if !claimed || second.token == first.token {
+		t.Fatalf("expired lease replacement = %+v claimed=%t, first=%+v", second, claimed, first)
+	}
+	registry.releaseExploration(first)
+	registry.Lock()
+	retained := registry.exploration[boostRuleKey(rule)]
+	registry.Unlock()
+	if retained.token != second.token {
+		t.Fatalf("stale release removed replacement: retained=%+v second=%+v", retained, second)
+	}
+	registry.releaseExploration(second)
+	registry.Lock()
+	_, exists := registry.exploration[boostRuleKey(rule)]
+	registry.Unlock()
+	if exists {
+		t.Fatal("current release retained exploration claim")
+	}
+}
+
+func TestSelectRouteTargetsDisablesPeriodicExplorerForProtocolCanary(t *testing.T) {
+	rule := routeHealthTestRule("best:1", "second:1", "stale-canary:1")
+	now := time.Date(2026, 9, 1, 8, 5, 0, 0, time.UTC)
+	registry := newRouteHealthRegistry(func(_ *config.Rule, target *config.Target, _ time.Time) time.Duration {
+		if target.Address == "stale-canary:1" {
+			return time.Second
+		}
+		return 0
+	})
+	for index, target := range rule.Targets {
+		at := now
+		if target.Address == "stale-canary:1" {
+			at = now.Add(-routeExplorationAfter - time.Second)
+		}
+		attempt, err := registry.begin(rule, target.Address, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routeObserve(attempt, time.Duration(index+1)*10*time.Millisecond, nil, at)
+	}
+	registry.protocolProbeClaim = func(_ *config.Rule, target *config.Target, _ time.Time) (uint64, bool) {
+		if target.Address == "stale-canary:1" {
+			return 1, true
+		}
+		return 0, false
+	}
+
+	selections := registry.selectTargetSelections(rule, len(rule.Targets), now, nil, true)
+	if len(selections) == 0 || selections[0].protocolProbe.token == 0 {
+		t.Fatalf("protocol canary not selected first: %+v", selections)
+	}
+	for _, selection := range selections {
+		if selection.periodicExplorer {
+			t.Fatalf("protocol canary selection also marked periodic explorer: %+v", selections)
+		}
+	}
+}
+
+func TestRouteHealthClearRemovesExplorationLease(t *testing.T) {
+	rule := routeHealthTestRule("stale:1")
+	registry := newRouteHealthRegistry()
+	now := time.Date(2026, 9, 1, 8, 10, 0, 0, time.UTC)
+	staleAt := now.Add(-routeExplorationAfter - time.Second)
+	attempt, err := registry.begin(rule, "stale:1", staleAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(attempt, 10*time.Millisecond, nil, staleAt)
+	if _, claimed := registry.claimExploration(rule, rule.Targets[0], now); !claimed {
+		t.Fatal("failed to seed exploration claim")
+	}
+	registry.clear([]*config.Rule{rule})
+	registry.Lock()
+	_, exists := registry.exploration[boostRuleKey(rule)]
+	registry.Unlock()
+	if exists {
+		t.Fatal("clear retained exploration claim")
+	}
+}
+
 func TestSelectRouteTargetsKeepsBestAndRotatesUnobserved(t *testing.T) {
 	resetRouteHealthForTest()
 	rule := routeHealthTestRule("best:1", "cancelled:1", "new-one:1", "new-two:1")

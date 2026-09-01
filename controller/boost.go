@@ -240,14 +240,13 @@ func (runtime *routingRuntime) reconcileCachedBoostWinner(
 	return false, runtime.storeBoostWinner(key, outcome.winner.addr)
 }
 
-// finishBoostRelay never attributes an io.Copy error to either endpoint, so it
-// cannot open a route circuit. It does, however, discard the exact cached
-// winner that produced an abnormal stream. The next connection can then race
-// all candidates instead of repeatedly pinning traffic to a possibly broken
-// route. A generation token prevents an old stream from deleting a newer lazy
+// finishBoostRelay never feeds an ambiguous io.Copy error into route health.
+// It discards the exact cached winner only when the relay termination remains
+// actionable after excluding proven client disconnects and expected shutdown
+// errors. A generation token prevents an old stream from deleting a newer lazy
 // refresh or hedge winner.
 func (runtime *routingRuntime) finishBoostRelay(token boostWinnerToken, attempt routeAttempt, result relayResult) {
-	if relayHasError(result) {
+	if relayInvalidatesBoostWinner(result) {
 		runtime.deleteBoostWinnerIfCurrent(token)
 	}
 	reportRouteRelay(attempt, result)
@@ -410,7 +409,12 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 		})
 	}
 
-	launch := func(addr string, primary, delayed, tryOnly bool, probe routeProtocolProbeLease) {
+	launch := func(
+		addr string,
+		primary, delayed, tryOnly bool,
+		probe routeProtocolProbeLease,
+		exploration routeExplorationLease,
+	) {
 		active++
 		go func() {
 			dialCtx := withRouteProtocolProbeLease(raceCtx, probe)
@@ -437,6 +441,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 				}
 			}
 			runtime.routes.releaseProtocolProbe(rule, targetByAddress(rule, addr), probe)
+			runtime.routes.releaseExploration(exploration)
 			results <- dialResult{conn: connection, addr: addr, attempt: attempt, err: err, delayed: delayed}
 		}()
 	}
@@ -474,8 +479,18 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 					runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
 					continue
 				}
+				if candidate.periodicExplorer {
+					lease, claimed := runtime.routes.claimExploration(rule, target, time.Now())
+					if !claimed {
+						// Exploration is optional. A sibling already owns it, so keep
+						// this request moving through the ordinary candidate list.
+						runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
+						continue
+					}
+					candidate.explorationLease = lease
+				}
 				actualAttempts++
-				launch(addr, false, delayed, tryOnly, candidate.protocolProbe)
+				launch(addr, false, delayed, tryOnly, candidate.protocolProbe, candidate.explorationLease)
 				launched++
 				if candidate.protocolProbe.token != 0 {
 					break
@@ -510,7 +525,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 		}
 	}
 
-	launch(cachedAddr, true, false, false, cachedProtocolProbe)
+	launch(cachedAddr, true, false, false, cachedProtocolProbe, routeExplorationLease{})
 	for active > 0 {
 		select {
 		case result := <-results:
@@ -744,12 +759,23 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 					runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
 					continue
 				}
+				if candidate.periodicExplorer {
+					lease, claimed := runtime.routes.claimExploration(rule, target, time.Now())
+					if !claimed {
+						// Do not wait for another request's optional explorer and do not
+						// consume one of this request's actual target attempts.
+						runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
+						continue
+					}
+					candidate.explorationLease = lease
+				}
 				actualAttempts++
 				active++
 				launched++
 				go func() {
 					finish := func(result dialResult) {
 						runtime.routes.releaseProtocolProbe(rule, target, candidate.protocolProbe)
+						runtime.routes.releaseExploration(candidate.explorationLease)
 						results <- result
 					}
 					dialCtx := withRouteProtocolProbeLease(raceCtx, candidate.protocolProbe)

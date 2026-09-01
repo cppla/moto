@@ -10,11 +10,13 @@ import (
 )
 
 const (
-	routeFailureThreshold = 3
-	routeInitialCooldown  = 5 * time.Second
-	routeMaximumCooldown  = 60 * time.Second
-	routeFailurePenalty   = time.Second
-	routeExplorationAfter = 30 * time.Second
+	routeFailureThreshold        = 3
+	routeInitialCooldown         = 5 * time.Second
+	routeMaximumCooldown         = 60 * time.Second
+	routeFailurePenalty          = time.Second
+	routeExplorationAfter        = 30 * time.Second
+	routeExplorationLeaseMinimum = 5 * time.Second
+	routeExplorationLeaseGrace   = time.Second
 )
 
 // ErrCircuitOpen is returned when a route is cooling down or another caller
@@ -177,25 +179,107 @@ func routeProtocolProbeTokenFromContext(ctx context.Context) uint64 {
 }
 
 type routeTargetSelection struct {
-	target        *config.Target
-	protocolProbe routeProtocolProbeLease
+	target           *config.Target
+	protocolProbe    routeProtocolProbeLease
+	periodicExplorer bool
+	explorationLease routeExplorationLease
+}
+
+// routeExplorationLease authorizes one request to launch periodic exploration
+// for a rule. It never carries or shares an actual connection.
+type routeExplorationLease struct {
+	ruleKey string
+	address string
+	token   uint64
+}
+
+type routeExplorationClaim struct {
+	address string
+	token   uint64
+	expires time.Time
 }
 
 type routeHealthRegistry struct {
 	sync.Mutex
 	states                map[routeHealthKey]*routeHealthState
 	nextAttempt           uint64
+	exploration           map[string]routeExplorationClaim
+	nextExploration       uint64
 	protocolPenaltySource routeProtocolPenaltySource
 	protocolProbeClaim    routeProtocolProbeClaimSource
 	protocolProbeRelease  routeProtocolProbeReleaseSource
 }
 
 func newRouteHealthRegistry(sources ...routeProtocolPenaltySource) *routeHealthRegistry {
-	registry := &routeHealthRegistry{states: make(map[routeHealthKey]*routeHealthState)}
+	registry := &routeHealthRegistry{
+		states:      make(map[routeHealthKey]*routeHealthState),
+		exploration: make(map[string]routeExplorationClaim),
+	}
 	if len(sources) > 0 {
 		registry.protocolPenaltySource = sources[0]
 	}
 	return registry
+}
+
+func routeExplorationLeaseDuration(rule *config.Rule) time.Duration {
+	duration := boostDecisionTimeout(rule) + routeExplorationLeaseGrace
+	if duration < routeExplorationLeaseMinimum {
+		return routeExplorationLeaseMinimum
+	}
+	return duration
+}
+
+// claimExploration atomically reserves the one periodic explorer allowed for a
+// rule. Selection deliberately does not call this method: callers request a
+// full fallback list but may launch only one entry. Claiming immediately before
+// launch prevents an unstarted candidate from leaking ownership.
+func (registry *routeHealthRegistry) claimExploration(
+	rule *config.Rule,
+	target *config.Target,
+	now time.Time,
+) (routeExplorationLease, bool) {
+	if registry == nil || rule == nil || target == nil || target.Address == "" {
+		return routeExplorationLease{}, false
+	}
+	ruleID := boostRuleKey(rule)
+	key := routeHealthKey{rule: ruleID, addr: target.Address}
+
+	registry.Lock()
+	defer registry.Unlock()
+	if claim, exists := registry.exploration[ruleID]; exists {
+		if now.Before(claim.expires) {
+			return routeExplorationLease{}, false
+		}
+		delete(registry.exploration, ruleID)
+	}
+	state := registry.states[key]
+	if state == nil || !state.observed || state.circuitOpen || state.lastAttempt.IsZero() ||
+		now.Sub(state.lastAttempt) < routeExplorationAfter {
+		return routeExplorationLease{}, false
+	}
+	registry.nextExploration++
+	if registry.nextExploration == 0 {
+		registry.nextExploration++
+	}
+	lease := routeExplorationLease{ruleKey: ruleID, address: target.Address, token: registry.nextExploration}
+	registry.exploration[ruleID] = routeExplorationClaim{
+		address: target.Address,
+		token:   lease.token,
+		expires: now.Add(routeExplorationLeaseDuration(rule)),
+	}
+	return lease, true
+}
+
+func (registry *routeHealthRegistry) releaseExploration(lease routeExplorationLease) {
+	if registry == nil || lease.ruleKey == "" || lease.address == "" || lease.token == 0 {
+		return
+	}
+	registry.Lock()
+	claim, exists := registry.exploration[lease.ruleKey]
+	if exists && claim.address == lease.address && claim.token == lease.token {
+		delete(registry.exploration, lease.ruleKey)
+	}
+	registry.Unlock()
 }
 
 // protocolPenalty invokes the immutable protocol-health source without taking
@@ -483,6 +567,11 @@ func (registry *routeHealthRegistry) clear(rules []*config.Rule) {
 			delete(registry.states, key)
 		}
 	}
+	for key := range registry.exploration {
+		if _, ok := keys[key]; ok {
+			delete(registry.exploration, key)
+		}
+	}
 	registry.Unlock()
 }
 
@@ -493,6 +582,7 @@ type routeCandidate struct {
 	penalty     time.Duration
 	lastAttempt time.Time
 	hasEWMA     bool
+	circuitOpen bool
 }
 
 // selectRouteTargets returns at most limit currently admissible targets. Once
@@ -591,6 +681,7 @@ func (registry *routeHealthRegistry) selectTargetSelections(
 			penalty:     penalty,
 			lastAttempt: state.lastAttempt,
 			hasEWMA:     state.hasEWMA,
+			circuitOpen: state.circuitOpen,
 		})
 		if penalty == 0 {
 			hasUnpenalized = true
@@ -722,12 +813,17 @@ func (registry *routeHealthRegistry) selectTargetSelections(
 	// around health exclusions. Keep that fallback list, but move the explorer
 	// into its actual second launch position instead of only considering routes
 	// omitted by a selector limit of two.
-	if len(unobserved) == 0 && len(selected) > 1 {
+	if protocolProbe.target == nil && len(unobserved) == 0 && len(selected) > 1 {
 		bestAddress := selected[0].target.Address
 		var explorer *routeCandidate
 		for i := range observed {
 			candidate := &observed[i]
 			if candidate.target.Address == bestAddress {
+				continue
+			}
+			// Circuit recovery already has stronger atomic half-open ownership in
+			// routeBegin. Do not layer periodic exploration on the same attempt.
+			if candidate.circuitOpen {
 				continue
 			}
 			if !candidate.lastAttempt.IsZero() && now.Sub(candidate.lastAttempt) < routeExplorationAfter {
@@ -746,10 +842,13 @@ func (registry *routeHealthRegistry) selectTargetSelections(
 					break
 				}
 			}
-			if explorerIndex >= 0 {
+			if explorerIndex == 1 {
+				// Already the ordinary second-best route: no optional lease needed.
+			} else if explorerIndex > 1 {
 				selected[1], selected[explorerIndex] = selected[explorerIndex], selected[1]
+				selected[1].periodicExplorer = true
 			} else {
-				selected[1] = routeTargetSelection{target: explorer.target}
+				selected[1] = routeTargetSelection{target: explorer.target, periodicExplorer: true}
 			}
 		}
 	}

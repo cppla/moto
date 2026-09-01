@@ -24,6 +24,22 @@ PAYLOAD_METRIC = "moto_connect_proxy_payload_bytes_total"
 LAST_SUCCESS_METRIC = "moto_connect_proxy_last_success_timestamp_seconds"
 REQUIRED_METRICS = (ACTIVE_METRIC, PAYLOAD_METRIC, LAST_SUCCESS_METRIC)
 
+ROUTE_ATTEMPT_METRICS = {
+    "moto_route_latency_ewma_seconds": "latency_ewma_seconds",
+    "moto_route_observed": "observed",
+    "moto_route_consecutive_failures": "consecutive_failures",
+    "moto_route_circuit_open": "circuit_open",
+    "moto_route_half_open": "half_open",
+    "moto_route_last_attempt_timestamp_seconds": "last_attempt_timestamp_seconds",
+    "moto_active_health_unhealthy": "active_health_unhealthy",
+}
+DIAL_ATTEMPT_METRICS = {
+    "moto_dial_attempts_total": "attempts",
+    "moto_dial_success_total": "successes",
+    "moto_dial_failures_total": "failures",
+    "moto_dial_canceled_total": "canceled",
+}
+
 H3_TRANSPORT_METRICS = {
     "moto_connect_proxy_h3_transports": "transports",
     "moto_connect_proxy_h3_active_tunnels": "active_tunnels",
@@ -61,6 +77,8 @@ OPTIONAL_METRICS = tuple(
     list(H3_TRANSPORT_METRICS)
     + list(H3_TARGET_METRICS)
     + list(H3_RULE_METRICS)
+    + list(ROUTE_ATTEMPT_METRICS)
+    + list(DIAL_ATTEMPT_METRICS)
     + [H3_ROTATION_METRIC, H3_RULE_EVENT_METRIC]
 )
 WATCHED_METRICS = REQUIRED_METRICS + OPTIONAL_METRICS
@@ -69,6 +87,7 @@ DEFAULT_MIN_RATE = 4 * 1024.0
 DEFAULT_SWITCH_SAMPLES = 3
 DEFAULT_SWITCH_RATIO = 1.5
 DEFAULT_SWITCH_COOLDOWN = 10.0
+DEFAULT_ATTEMPT_WINDOW = 120.0
 MAX_METRICS_BYTES = 16 * 1024 * 1024
 
 RouteKey = Tuple[str, str, str]
@@ -77,6 +96,8 @@ RouteTransition = Tuple[RouteKey, RouteKey]
 H3TransportKey = Tuple[str, str, str]
 H3RotationKey = Tuple[str, str, str]
 H3RuleEventKey = Tuple[str, str]
+AttemptKey = Tuple[str, str]
+RouteAttemptKey = Tuple[str, str, str]
 
 
 class WatchError(RuntimeError):
@@ -95,6 +116,8 @@ class Sample:
     h3_rule: Dict[str, Dict[str, float]] = field(default_factory=dict)
     h3_rotations: Dict[H3RotationKey, float] = field(default_factory=dict)
     h3_rule_events: Dict[H3RuleEventKey, float] = field(default_factory=dict)
+    route_attempts: Dict[RouteAttemptKey, Dict[str, float]] = field(default_factory=dict)
+    dial_attempts: Dict[AttemptKey, Dict[str, float]] = field(default_factory=dict)
     available_metrics: Set[str] = field(default_factory=set)
 
 
@@ -167,6 +190,33 @@ class WatchView:
     instant_seconds: float
     h3_target_events: Dict[str, Dict[str, int]] = field(default_factory=dict)
     h3_rule_events: Dict[str, Dict[str, int]] = field(default_factory=dict)
+
+
+@dataclass
+class TargetAttemptView:
+    rule: str
+    mode: str
+    target: str
+    attempts: Optional[int]
+    successes: Optional[int]
+    canceled: Optional[int]
+    failures: Optional[int]
+    last_attempt_timestamp_seconds: float
+    latency_ewma_seconds: float
+    observed: Optional[bool]
+    consecutive_failures: Optional[int]
+    circuit_open: Optional[bool]
+    half_open: Optional[bool]
+    active_health_unhealthy: Optional[bool]
+    status: str
+
+
+@dataclass
+class AttemptWindowView:
+    supported: bool
+    window_seconds: float
+    targets: List[TargetAttemptView]
+    attempted_targets: int
 
 
 @dataclass
@@ -287,6 +337,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="minimum seconds between confirmed route switches (default: %(default)s)",
     )
     parser.add_argument(
+        "--attempt-window",
+        type=positive_float,
+        default=DEFAULT_ATTEMPT_WINDOW,
+        help=(
+            "rolling seconds used for recent target-attempt evidence "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="take two scrapes, print one measured snapshot, and exit",
@@ -383,6 +442,20 @@ def route_key(labels: Mapping[str, str], metric: str) -> RouteKey:
     return labels["rule"], labels["target"], labels["protocol"].lower()
 
 
+def attempt_key(labels: Mapping[str, str], metric: str) -> AttemptKey:
+    missing = [name for name in ("rule", "target") if not labels.get(name)]
+    if missing:
+        raise WatchError(f"{metric} sample is missing labels: {', '.join(missing)}")
+    return labels["rule"], labels["target"]
+
+
+def route_attempt_key(labels: Mapping[str, str], metric: str) -> RouteAttemptKey:
+    missing = [name for name in ("rule", "mode", "target") if not labels.get(name)]
+    if missing:
+        raise WatchError(f"{metric} sample is missing labels: {', '.join(missing)}")
+    return labels["rule"], labels["mode"], labels["target"]
+
+
 def required_label(labels: Mapping[str, str], metric: str, name: str) -> str:
     value = labels.get(name, "")
     if not value:
@@ -463,6 +536,14 @@ def parse_metrics(body: str, monotonic_time: float, wall_time: float) -> Sample:
                 required_label(labels, metric, "outcome"),
             )
             sample.h3_rule_events[event_key] = value
+        elif metric in ROUTE_ATTEMPT_METRICS:
+            key = route_attempt_key(labels, metric)
+            values = sample.route_attempts.setdefault(key, {})
+            values[ROUTE_ATTEMPT_METRICS[metric]] = value
+        elif metric in DIAL_ATTEMPT_METRICS:
+            key = attempt_key(labels, metric)
+            values = sample.dial_attempts.setdefault(key, {})
+            values[DIAL_ATTEMPT_METRICS[metric]] = value
 
     available = declared | parsed_names
     missing_metrics = [name for name in REQUIRED_METRICS if name not in available]
@@ -520,6 +601,213 @@ def counter_delta(current: float, previous: float) -> float:
     if current >= previous:
         return current - previous
     return current
+
+
+def optional_boolean(
+    sample: Sample,
+    values: Mapping[str, float],
+    metric: str,
+    field_name: str,
+) -> Optional[bool]:
+    if metric not in sample.available_metrics:
+        return None
+    return values.get(field_name, 0.0) >= 0.5
+
+
+def optional_integer(
+    sample: Sample,
+    values: Mapping[str, float],
+    metric: str,
+    field_name: str,
+) -> Optional[int]:
+    if metric not in sample.available_metrics:
+        return None
+    return max(0, int(round(values.get(field_name, 0.0))))
+
+
+def target_attempt_status(
+    observed: Optional[bool],
+    consecutive_failures: Optional[int],
+    circuit_open: Optional[bool],
+    half_open: Optional[bool],
+    active_health_unhealthy: Optional[bool],
+) -> str:
+    if active_health_unhealthy:
+        return "active_health_unhealthy"
+    if half_open:
+        return "half_open"
+    if circuit_open:
+        return "circuit_open"
+    if consecutive_failures:
+        return "failing"
+    if observed is False:
+        return "unobserved"
+    if observed is True:
+        return "healthy"
+    return "unknown"
+
+
+def build_attempt_window(
+    current: Sample,
+    baseline: Optional[Sample],
+) -> AttemptWindowView:
+    supported = any(
+        metric in current.available_metrics
+        for metric in tuple(ROUTE_ATTEMPT_METRICS) + tuple(DIAL_ATTEMPT_METRICS)
+    )
+    if not supported:
+        return AttemptWindowView(False, 0.0, [], 0)
+
+    window_seconds = 0.0
+    if baseline is not None:
+        window_seconds = max(0.0, current.monotonic_time - baseline.monotonic_time)
+
+    # This watcher is intentionally scoped to CONNECT proxy routes. The Moto
+    # endpoint also exposes raw TCP rule dials; mixing those into this table
+    # would make an H2/H3 route comparison misleading.
+    connect_rules: Set[str] = {
+        rule
+        for rule, _target, _protocol in (
+            set(current.active)
+            | {route for route, _direction in current.payload}
+            | set(current.last_success)
+        )
+    }
+    route_keys: Dict[AttemptKey, RouteAttemptKey] = {}
+    for key in current.route_attempts:
+        rule, _mode, target = key
+        pair = rule, target
+        if rule not in connect_rules:
+            continue
+        existing = route_keys.get(pair)
+        if existing is None or (existing[1] != "boost" and key[1] == "boost"):
+            route_keys[pair] = key
+
+    pairs = set(route_keys) | {
+        pair
+        for pair in current.dial_attempts
+        if pair[0] in connect_rules
+    }
+    targets: List[TargetAttemptView] = []
+    counter_metrics = {
+        "attempts": "moto_dial_attempts_total",
+        "successes": "moto_dial_success_total",
+        "failures": "moto_dial_failures_total",
+        "canceled": "moto_dial_canceled_total",
+    }
+    gauge_metrics = {
+        "observed": "moto_route_observed",
+        "consecutive_failures": "moto_route_consecutive_failures",
+        "circuit_open": "moto_route_circuit_open",
+        "half_open": "moto_route_half_open",
+        "active_health_unhealthy": "moto_active_health_unhealthy",
+    }
+    for pair in sorted(pairs):
+        rule, target = pair
+        route_key_value = route_keys.get(pair)
+        mode = route_key_value[1] if route_key_value is not None else ""
+        route_values = (
+            current.route_attempts.get(route_key_value, {})
+            if route_key_value is not None
+            else {}
+        )
+        current_counters = current.dial_attempts.get(pair, {})
+        baseline_counters = baseline.dial_attempts.get(pair, {}) if baseline else {}
+
+        deltas: Dict[str, Optional[int]] = {}
+        for field_name, metric in counter_metrics.items():
+            if metric not in current.available_metrics:
+                deltas[field_name] = None
+                continue
+            if baseline is None or metric not in baseline.available_metrics:
+                deltas[field_name] = 0
+                continue
+            deltas[field_name] = max(
+                0,
+                int(
+                    round(
+                        counter_delta(
+                            current_counters.get(field_name, 0.0),
+                            baseline_counters.get(field_name, 0.0),
+                        )
+                    )
+                ),
+            )
+
+        observed = optional_boolean(
+            current,
+            route_values,
+            gauge_metrics["observed"],
+            "observed",
+        )
+        consecutive_failures = optional_integer(
+            current,
+            route_values,
+            gauge_metrics["consecutive_failures"],
+            "consecutive_failures",
+        )
+        circuit_open = optional_boolean(
+            current,
+            route_values,
+            gauge_metrics["circuit_open"],
+            "circuit_open",
+        )
+        half_open = optional_boolean(
+            current,
+            route_values,
+            gauge_metrics["half_open"],
+            "half_open",
+        )
+        active_health_unhealthy = optional_boolean(
+            current,
+            route_values,
+            gauge_metrics["active_health_unhealthy"],
+            "active_health_unhealthy",
+        )
+        targets.append(
+            TargetAttemptView(
+                rule=rule,
+                mode=mode,
+                target=target,
+                attempts=deltas["attempts"],
+                successes=deltas["successes"],
+                canceled=deltas["canceled"],
+                failures=deltas["failures"],
+                last_attempt_timestamp_seconds=route_values.get(
+                    "last_attempt_timestamp_seconds",
+                    0.0,
+                ),
+                latency_ewma_seconds=route_values.get("latency_ewma_seconds", 0.0),
+                observed=observed,
+                consecutive_failures=consecutive_failures,
+                circuit_open=circuit_open,
+                half_open=half_open,
+                active_health_unhealthy=active_health_unhealthy,
+                status=target_attempt_status(
+                    observed,
+                    consecutive_failures,
+                    circuit_open,
+                    half_open,
+                    active_health_unhealthy,
+                ),
+            )
+        )
+
+    attempted_targets = sum(
+        1
+        for target in targets
+        if (target.attempts or 0) > 0
+        or (
+            window_seconds > 0
+            and target.last_attempt_timestamp_seconds > 0
+            and max(
+                0.0,
+                current.wall_time - target.last_attempt_timestamp_seconds,
+            )
+            <= window_seconds
+        )
+    )
+    return AttemptWindowView(supported, window_seconds, targets, attempted_targets)
 
 
 def payload_rates(current: Sample, baseline: Optional[Sample]) -> Tuple[Dict[PayloadKey, float], float]:
@@ -1098,6 +1386,62 @@ def transition_to_dict(transition: Optional[RouteTransition]) -> Optional[Dict[s
     return {"from": route_key_to_dict(previous), "to": route_key_to_dict(current)}
 
 
+def target_attempt_to_dict(
+    target: TargetAttemptView,
+    wall_time: float,
+) -> Dict[str, object]:
+    last_attempt_age = None
+    if target.last_attempt_timestamp_seconds > 0:
+        last_attempt_age = max(
+            0.0,
+            wall_time - target.last_attempt_timestamp_seconds,
+        )
+    return {
+        "rule": target.rule,
+        "mode": target.mode or None,
+        "target": target.target,
+        "attempts": target.attempts,
+        "successes": target.successes,
+        "canceled": target.canceled,
+        "failures": target.failures,
+        "last_attempt_timestamp_seconds": target.last_attempt_timestamp_seconds,
+        "last_attempt": format_timestamp(target.last_attempt_timestamp_seconds),
+        "last_attempt_age_seconds": (
+            round(last_attempt_age, 3) if last_attempt_age is not None else None
+        ),
+        "latency_ewma_seconds": round(target.latency_ewma_seconds, 6),
+        "observed": target.observed,
+        "consecutive_failures": target.consecutive_failures,
+        "circuit_open": target.circuit_open,
+        "half_open": target.half_open,
+        "active_health_unhealthy": target.active_health_unhealthy,
+        "status": target.status,
+    }
+
+
+def attempt_window_to_dict(
+    attempts: AttemptWindowView,
+    wall_time: float,
+    target_window_seconds: float,
+) -> Dict[str, object]:
+    return {
+        "available": attempts.supported,
+        "window_seconds": round(attempts.window_seconds, 3),
+        "window_target_seconds": target_window_seconds,
+        "window_ready": attempts.window_seconds >= target_window_seconds * 0.9,
+        "attempted_targets": attempts.attempted_targets,
+        "total_targets": len(attempts.targets),
+        "targets": [
+            target_attempt_to_dict(target, wall_time)
+            for target in attempts.targets
+        ],
+        "semantics": {
+            "success": "target attempt succeeded; this does not prove it was the final Boost winner",
+            "canceled": "the attempt was canceled; it may be a race loser or a parent-request cancellation",
+        },
+    }
+
+
 def reset_candidate(tracker: DominantTracker) -> None:
     tracker.candidate = None
     tracker.candidate_samples = 0
@@ -1197,6 +1541,8 @@ def snapshot_dict(
     min_rate: float,
     average_window_target: float,
     switch_samples: int,
+    attempts: Optional[AttemptWindowView] = None,
+    attempt_window_target: float = DEFAULT_ATTEMPT_WINDOW,
 ) -> Dict[str, object]:
     routes = list(view.routes)
     dominant_key = selection.dominant.key if selection.dominant else None
@@ -1222,6 +1568,8 @@ def snapshot_dict(
         }
         for rule, details in sorted(view.h3_rule_events.items())
     }
+    if attempts is None:
+        attempts = AttemptWindowView(False, 0.0, [], 0)
     return {
         "schema_version": 2,
         "timestamp": format_timestamp(sample.wall_time),
@@ -1261,6 +1609,11 @@ def snapshot_dict(
             "targets": target_events,
             "rules": rule_events,
         },
+        "recent_target_attempts": attempt_window_to_dict(
+            attempts,
+            sample.wall_time,
+            attempt_window_target,
+        ),
         "routes": [
             route_to_dict(route, dominant_key, selection.pending)
             for route in routes
@@ -1288,6 +1641,69 @@ def format_seconds(value: float) -> str:
         seconds = int(value) % 60
         return f"{minutes}m{seconds:02d}s"
     return f"{value:.0f}s"
+
+
+def format_optional_count(value: Optional[int]) -> str:
+    return "-" if value is None else str(value)
+
+
+def format_attempt_age(timestamp: float, wall_time: float) -> str:
+    if timestamp <= 0:
+        return "-"
+    return f"{format_seconds(max(0.0, wall_time - timestamp))}前"
+
+
+def target_attempt_status_text(target: TargetAttemptView, color: bool) -> str:
+    if target.status == "active_health_unhealthy":
+        return red("健康检查排除", color)
+    if target.status == "circuit_open":
+        return red("熔断", color)
+    if target.status == "half_open":
+        return cyan("半开探测", color)
+    if target.status == "failing":
+        failures = target.consecutive_failures or 0
+        return yellow(f"连续失败 {failures}", color)
+    if target.status == "unobserved":
+        return yellow("未完成观测", color)
+    if target.status == "healthy":
+        return green("健康", color)
+    return "未知"
+
+
+def print_attempt_window(
+    attempts: AttemptWindowView,
+    sample: Sample,
+    target_window_seconds: float,
+    color: bool,
+) -> None:
+    if not attempts.supported:
+        return
+    print()
+    print(
+        "最近目标尝试（参竞证据）  "
+        f"窗口 {attempts.window_seconds:.1f}s/{format_seconds(target_window_seconds)}  "
+        f"覆盖 {attempts.attempted_targets}/{len(attempts.targets)}"
+    )
+    if not attempts.targets:
+        print("当前没有可关联到 H2/H3 规则的目标尝试指标。")
+        return
+    print("目标                         | 最近尝试 | 尝试 | 成功 | 取消 | 失败 |   EWMA | 状态             | 规则")
+    print("-" * 126)
+    for target in attempts.targets:
+        ewma = "-"
+        if target.latency_ewma_seconds > 0:
+            ewma = f"{target.latency_ewma_seconds * 1000:.0f}ms"
+        print(
+            f"{target.target:<28} | "
+            f"{format_attempt_age(target.last_attempt_timestamp_seconds, sample.wall_time):>8} | "
+            f"{format_optional_count(target.attempts):>4} | "
+            f"{format_optional_count(target.successes):>4} | "
+            f"{format_optional_count(target.canceled):>4} | "
+            f"{format_optional_count(target.failures):>4} | "
+            f"{ewma:>6} | "
+            f"{target_attempt_status_text(target, color):<16} | {target.rule}"
+        )
+    print("说明: “成功”是目标尝试成功，不等于最终 Winner；“取消”可能是竞速落败或父请求取消。")
 
 
 def h3_status_text(status: str, color: bool) -> str:
@@ -1390,6 +1806,8 @@ def print_human(
     average_window_target: float,
     switch_samples: int,
     color: bool = False,
+    attempts: Optional[AttemptWindowView] = None,
+    attempt_window_target: float = DEFAULT_ATTEMPT_WINDOW,
 ) -> None:
     labels = {
         "collecting": "采样中",
@@ -1450,21 +1868,28 @@ def print_human(
     elif view.state == "idle":
         print("活动隧道仍存在，但观测窗口内 payload 字节没有增长。")
 
-    if not view.routes:
-        return
-    print()
-    print(
-        "协议 | 活动 |       瞬时 |     平均速率 | 窗口占比 | 状态            | 目标 / 规则"
-    )
-    print("-" * 116)
-    for route in view.routes:
-        rule, target, protocol = route.key
+    if view.routes:
+        print()
+        print("当前承载（活动隧道与 payload）")
         print(
-            f"{protocol.upper():<4} | {route.active_tunnels:>4} | "
-            f"{format_rate(route.instant_bytes_per_second):>10} | "
-            f"{format_rate(route.bytes_per_second):>12} | "
-            f"{format_share(route.traffic_share_percent):>6} | "
-            f"{route.status:<15} | {target} / {rule}"
+            "协议 | 活动 |       瞬时 |     平均速率 | 窗口占比 | 状态            | 目标 / 规则"
+        )
+        print("-" * 116)
+        for route in view.routes:
+            rule, target, protocol = route.key
+            print(
+                f"{protocol.upper():<4} | {route.active_tunnels:>4} | "
+                f"{format_rate(route.instant_bytes_per_second):>10} | "
+                f"{format_rate(route.bytes_per_second):>12} | "
+                f"{format_share(route.traffic_share_percent):>6} | "
+                f"{route.status:<15} | {target} / {rule}"
+            )
+    if attempts is not None:
+        print_attempt_window(
+            attempts,
+            sample,
+            attempt_window_target,
+            color,
         )
 
 
@@ -1475,6 +1900,7 @@ def emit_snapshot(
     instant_baseline: Optional[Sample],
     tracker: DominantTracker,
     allow_clear: bool,
+    attempt_baseline: Optional[Sample] = None,
 ) -> None:
     view = build_view(
         sample,
@@ -1490,6 +1916,7 @@ def emit_snapshot(
         args.switch_ratio,
         args.switch_cooldown,
     )
+    attempts = build_attempt_window(sample, attempt_baseline)
     if args.json:
         print(
             json.dumps(
@@ -1501,6 +1928,8 @@ def emit_snapshot(
                     args.min_rate,
                     args.window,
                     args.switch_samples,
+                    attempts,
+                    args.attempt_window,
                 ),
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -1518,6 +1947,8 @@ def emit_snapshot(
             args.window,
             args.switch_samples,
             color=terminal_color_enabled(),
+            attempts=attempts,
+            attempt_window_target=args.attempt_window,
         )
         print(flush=True)
 
@@ -1551,6 +1982,11 @@ def emit_error(args: argparse.Namespace, error: Exception, allow_clear: bool) ->
                         "targets": {},
                         "rules": {},
                     },
+                    "recent_target_attempts": attempt_window_to_dict(
+                        AttemptWindowView(False, 0.0, [], 0),
+                        time.time(),
+                        args.attempt_window,
+                    ),
                     "routes": [],
                 },
                 ensure_ascii=False,
@@ -1579,25 +2015,35 @@ def run_once(args: argparse.Namespace) -> int:
         instant_baseline=baseline,
         tracker=DominantTracker(),
         allow_clear=False,
+        attempt_baseline=baseline,
     )
     return 0
 
 
 def run_watch(args: argparse.Namespace) -> int:
     history: collections.deque[Sample] = collections.deque()
+    attempt_history: collections.deque[Sample] = collections.deque()
     tracker = DominantTracker()
     while True:
         cycle_started = time.monotonic()
         try:
             current = fetch_sample(args.url, args.timeout)
             history.append(current)
+            attempt_history.append(current)
             while (
                 len(history) > 1
                 and current.monotonic_time - history[0].monotonic_time > args.window
             ):
                 history.popleft()
+            while (
+                len(attempt_history) > 1
+                and current.monotonic_time - attempt_history[0].monotonic_time
+                > args.attempt_window
+            ):
+                attempt_history.popleft()
             baseline = history[0] if len(history) > 1 else None
             instant_baseline = history[-2] if len(history) > 1 else None
+            attempt_baseline = attempt_history[0] if len(attempt_history) > 1 else None
             emit_snapshot(
                 args,
                 current,
@@ -1605,11 +2051,13 @@ def run_watch(args: argparse.Namespace) -> int:
                 instant_baseline,
                 tracker,
                 allow_clear=True,
+                attempt_baseline=attempt_baseline,
             )
         except WatchError as exc:
             emit_error(args, exc, allow_clear=True)
             # Do not calculate a byte-rate across an observability outage.
             history.clear()
+            attempt_history.clear()
             tracker = DominantTracker()
         remaining = args.interval - (time.monotonic() - cycle_started)
         if remaining > 0:
