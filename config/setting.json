@@ -156,8 +156,8 @@
             "protocols": ["h3", "h2"],
             "serverName": "proxy-a.example.com",
             "basicAuth": {
-              "username": "a",
-              "password": "a"
+              "username": "CHANGE_ME_USERNAME",
+              "password": "CHANGE_ME_PASSWORD"
             }
           }
         },
@@ -167,8 +167,8 @@
             "protocols": ["h3", "h2"],
             "serverName": "proxy-b.example.com",
             "basicAuth": {
-              "username": "b",
-              "password": "b"
+              "username": "CHANGE_ME_USERNAME",
+              "password": "CHANGE_ME_PASSWORD"
             }
           }
         }
