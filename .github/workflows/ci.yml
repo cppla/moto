@@ -40,6 +40,8 @@ jobs:
         run: make vuln
       - name: Validate sample config
         run: make config-check
+      - name: Check container context and final image
+        run: make container-image-check
       - name: Check benchmark script syntax
         run: make bench-check
       - name: Run loopback-only benchmark smoke

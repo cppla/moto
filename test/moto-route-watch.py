@@ -30,6 +30,9 @@ ROUTE_ATTEMPT_METRICS = {
     "moto_route_consecutive_failures": "consecutive_failures",
     "moto_route_circuit_open": "circuit_open",
     "moto_route_half_open": "half_open",
+    "moto_route_circuit_cooldown_remaining_seconds": "circuit_cooldown_remaining_seconds",
+    "moto_route_probe_due": "probe_due",
+    "moto_route_last_recovery_timestamp_seconds": "last_recovery_timestamp_seconds",
     "moto_route_last_attempt_timestamp_seconds": "last_attempt_timestamp_seconds",
     "moto_active_health_unhealthy": "active_health_unhealthy",
 }
@@ -88,6 +91,7 @@ DEFAULT_SWITCH_SAMPLES = 3
 DEFAULT_SWITCH_RATIO = 1.5
 DEFAULT_SWITCH_COOLDOWN = 10.0
 DEFAULT_ATTEMPT_WINDOW = 120.0
+ROUTE_RECENT_RECOVERY_SECONDS = 120.0
 MAX_METRICS_BYTES = 16 * 1024 * 1024
 
 RouteKey = Tuple[str, str, str]
@@ -207,6 +211,9 @@ class TargetAttemptView:
     consecutive_failures: Optional[int]
     circuit_open: Optional[bool]
     half_open: Optional[bool]
+    circuit_cooldown_remaining_seconds: Optional[float]
+    probe_due: Optional[bool]
+    last_recovery_timestamp_seconds: Optional[float]
     active_health_unhealthy: Optional[bool]
     status: str
 
@@ -630,19 +637,36 @@ def target_attempt_status(
     consecutive_failures: Optional[int],
     circuit_open: Optional[bool],
     half_open: Optional[bool],
+    circuit_cooldown_remaining_seconds: Optional[float],
+    probe_due: Optional[bool],
+    last_recovery_timestamp_seconds: Optional[float],
     active_health_unhealthy: Optional[bool],
+    wall_time: float,
 ) -> str:
     if active_health_unhealthy:
         return "active_health_unhealthy"
     if half_open:
         return "half_open"
     if circuit_open:
+        if circuit_cooldown_remaining_seconds is not None:
+            if circuit_cooldown_remaining_seconds > 0:
+                return "cooling_down"
+            if probe_due:
+                return "probe_due"
         return "circuit_open"
     if consecutive_failures:
         return "failing"
     if observed is False:
         return "unobserved"
     if observed is True:
+        if (
+            last_recovery_timestamp_seconds is not None
+            and last_recovery_timestamp_seconds > 0
+            and 0
+            <= wall_time - last_recovery_timestamp_seconds
+            <= ROUTE_RECENT_RECOVERY_SECONDS
+        ):
+            return "recently_recovered"
         return "healthy"
     return "unknown"
 
@@ -758,6 +782,32 @@ def build_attempt_window(
             gauge_metrics["half_open"],
             "half_open",
         )
+        circuit_cooldown_remaining_seconds = None
+        cooldown_metric = "moto_route_circuit_cooldown_remaining_seconds"
+        if cooldown_metric in current.available_metrics:
+            circuit_cooldown_remaining_seconds = max(
+                0.0,
+                route_values.get(
+                    ROUTE_ATTEMPT_METRICS[cooldown_metric],
+                    0.0,
+                ),
+            )
+        probe_due = optional_boolean(
+            current,
+            route_values,
+            "moto_route_probe_due",
+            "probe_due",
+        )
+        last_recovery_timestamp_seconds = None
+        recovery_metric = "moto_route_last_recovery_timestamp_seconds"
+        if recovery_metric in current.available_metrics:
+            last_recovery_timestamp_seconds = max(
+                0.0,
+                route_values.get(
+                    ROUTE_ATTEMPT_METRICS[recovery_metric],
+                    0.0,
+                ),
+            )
         active_health_unhealthy = optional_boolean(
             current,
             route_values,
@@ -782,13 +832,20 @@ def build_attempt_window(
                 consecutive_failures=consecutive_failures,
                 circuit_open=circuit_open,
                 half_open=half_open,
+                circuit_cooldown_remaining_seconds=circuit_cooldown_remaining_seconds,
+                probe_due=probe_due,
+                last_recovery_timestamp_seconds=last_recovery_timestamp_seconds,
                 active_health_unhealthy=active_health_unhealthy,
                 status=target_attempt_status(
                     observed,
                     consecutive_failures,
                     circuit_open,
                     half_open,
+                    circuit_cooldown_remaining_seconds,
+                    probe_due,
+                    last_recovery_timestamp_seconds,
                     active_health_unhealthy,
+                    current.wall_time,
                 ),
             )
         )
@@ -1396,6 +1453,15 @@ def target_attempt_to_dict(
             0.0,
             wall_time - target.last_attempt_timestamp_seconds,
         )
+    last_recovery_age = None
+    if (
+        target.last_recovery_timestamp_seconds is not None
+        and target.last_recovery_timestamp_seconds > 0
+    ):
+        last_recovery_age = max(
+            0.0,
+            wall_time - target.last_recovery_timestamp_seconds,
+        )
     return {
         "rule": target.rule,
         "mode": target.mode or None,
@@ -1414,6 +1480,17 @@ def target_attempt_to_dict(
         "consecutive_failures": target.consecutive_failures,
         "circuit_open": target.circuit_open,
         "half_open": target.half_open,
+        "circuit_cooldown_remaining_seconds": target.circuit_cooldown_remaining_seconds,
+        "probe_due": target.probe_due,
+        "last_recovery_timestamp_seconds": target.last_recovery_timestamp_seconds,
+        "last_recovery": format_timestamp(
+            target.last_recovery_timestamp_seconds or 0.0
+        ),
+        "last_recovery_age_seconds": (
+            round(last_recovery_age, 3)
+            if last_recovery_age is not None
+            else None
+        ),
         "active_health_unhealthy": target.active_health_unhealthy,
         "status": target.status,
     }
@@ -1658,8 +1735,13 @@ def target_attempt_status_text(target: TargetAttemptView, color: bool) -> str:
         return red("健康检查排除", color)
     if target.status == "circuit_open":
         return red("熔断", color)
+    if target.status == "cooling_down":
+        remaining = target.circuit_cooldown_remaining_seconds or 0.0
+        return red(f"冷却中 {format_seconds(remaining)}", color)
+    if target.status == "probe_due":
+        return yellow("等待半开", color)
     if target.status == "half_open":
-        return cyan("半开探测", color)
+        return cyan("半开探测中", color)
     if target.status == "failing":
         failures = target.consecutive_failures or 0
         return yellow(f"连续失败 {failures}", color)
@@ -1667,6 +1749,8 @@ def target_attempt_status_text(target: TargetAttemptView, color: bool) -> str:
         return yellow("未完成观测", color)
     if target.status == "healthy":
         return green("健康", color)
+    if target.status == "recently_recovered":
+        return green("已恢复", color)
     return "未知"
 
 

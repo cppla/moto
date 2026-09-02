@@ -24,8 +24,13 @@ const (
 	http3DegradationLowThroughput  = 0.20
 	http3DegradationWireEfficiency = 0.20
 
-	http3DegradationSingleWriteBlock = 8 * time.Second
-	http3DegradationMultiWriteBlock  = 4 * time.Second
+	http3DegradationSingleWriteBlock    = 8 * time.Second
+	http3DegradationMultiWriteBlock     = 4 * time.Second
+	http3UDPBlackholeStallTimeout       = 8 * time.Second
+	http3UDPBlackholeConfirmations      = 2
+	http3UDPBlackholeMaxSampleGap       = 3 * http3DegradationSampleInterval
+	http3UDPBlackholeRecentReadWindow   = http3DegradationWindow
+	http3UDPBlackholeRecentReadMinBytes = uint64(64 << 10)
 
 	http3DegradationRequiredSignals = 2
 	http3DegradationRequiredWindows = 3
@@ -38,6 +43,7 @@ const (
 	http3DegradationReasonConnectionError    http3DegradationReason = "connection_error"
 	http3DegradationReasonSevereLossAndWrite http3DegradationReason = "severe_loss_and_blocked_write"
 	http3DegradationReasonSustainedSignals   http3DegradationReason = "sustained_signals"
+	http3DegradationReasonUDPBlackhole       http3DegradationReason = "udp_blackhole"
 )
 
 // http3DegradationSample is one caller-driven observation of a physical QUIC
@@ -52,11 +58,15 @@ type http3DegradationSample struct {
 	At                    time.Time
 	Stats                 quic.ConnectionStats
 	PayloadBytes          uint64
+	PayloadReadBytes      uint64
 	BlockedWrites         int
 	PeakBlockedWrites     int
 	LongBlockedWrites     int
 	OldestBlockedFor      time.Duration
 	LastPayloadProgressAt time.Time
+	BlockedReads          int
+	OldestReadBlockedFor  time.Duration
+	RecentReadDemand      bool
 	HistoricalBaselineRTT time.Duration
 	ConnectionErr         error
 }
@@ -77,21 +87,28 @@ type http3DegradationSignals struct {
 	SevereLoss bool
 
 	PayloadDemand   bool
+	ReadDemand      bool
 	PayloadStalled  bool
 	BlockedWrite    bool
 	ClearWriteBlock bool
 	ThroughputLow   bool
 	WireWaste       bool
+	UDPBlackhole    bool
+	SentNoReceive   bool
 
 	BlockedWrites         int
+	BlockedReads          int
 	PeakBlockedWrites     int
 	OldestBlockedFor      time.Duration
+	OldestReadBlockedFor  time.Duration
 	LastProgressFor       time.Duration
 	PayloadBytesPerSecond float64
 	HealthyBytesPerSecond float64
 
 	BadSignalCount     int
 	ConsecutiveWindows int
+	BlackholeWindows   int
+	NoReceiveFor       time.Duration
 }
 
 type http3DegradationDecision struct {
@@ -110,6 +127,7 @@ type http3DegradationWindowDelta struct {
 	bytesLost       uint64
 	packetsLost     uint64
 	payloadBytes    uint64
+	payloadRead     uint64
 }
 
 // http3DegradationDetector is scoped to exactly one physical *quic.Conn. A new
@@ -120,15 +138,30 @@ type http3DegradationDetector struct {
 	establishedAt time.Time
 	baselineRTT   time.Duration
 
-	initialized bool
-	lastAt      time.Time
-	lastStats   quic.ConnectionStats
-	lastPayload uint64
+	initialized     bool
+	lastAt          time.Time
+	lastStats       quic.ConnectionStats
+	lastPayload     uint64
+	lastPayloadRead uint64
 
 	window                []http3DegradationWindowDelta
 	consecutiveBadWindows int
 	healthyPayloadRate    float64
 	latched               http3DegradationDecision
+
+	// QUIC loss counters intentionally aren't used for a complete UDP blackhole:
+	// when no ACK can return, quic-go may not classify the outstanding packets as
+	// lost soon enough to beat MaxIdleTimeout. Track the stronger wire-level
+	// signature instead: established bidirectional traffic followed by outbound
+	// probes with no inbound packet and either a blocked Write or a recently
+	// active downstream Read.
+	wasBidirectional        bool
+	blackholeNoReceiveSince time.Time
+	blackholeSentBytes      uint64
+	blackholeSentPackets    uint64
+	blackholeSendSamples    int
+	blackholeWindows        int
+	blackholeReadDemand     bool
 }
 
 func newHTTP3DegradationDetector(establishedAt time.Time) *http3DegradationDetector {
@@ -162,10 +195,14 @@ func (detector *http3DegradationDetector) observe(sample http3DegradationSample)
 	if !sample.At.After(detector.lastAt) || sample.At.Sub(detector.lastAt) < http3DegradationSampleInterval {
 		return detector.liveDecision(detector.baseSignals(sample, false))
 	}
+	sampleGap := sample.At.Sub(detector.lastAt)
+	if sampleGap > http3UDPBlackholeMaxSampleGap {
+		detector.resetUDPBlackhole()
+	}
 
 	detector.updateBaseline(sample.Stats, sample.HistoricalBaselineRTT)
 	signals := detector.baseSignals(sample, true)
-	if countersMovedBackward(sample, detector.lastStats, detector.lastPayload) {
+	if countersMovedBackward(sample, detector.lastStats, detector.lastPayload, detector.lastPayloadRead) {
 		lossReset := sample.Stats.BytesLost < detector.lastStats.BytesLost ||
 			sample.Stats.PacketsLost < detector.lastStats.PacketsLost
 		detector.resetWindow(sample)
@@ -183,20 +220,30 @@ func (detector *http3DegradationDetector) observe(sample http3DegradationSample)
 		bytesLost:       sample.Stats.BytesLost - detector.lastStats.BytesLost,
 		packetsLost:     sample.Stats.PacketsLost - detector.lastStats.PacketsLost,
 		payloadBytes:    sample.PayloadBytes - detector.lastPayload,
+		payloadRead:     sample.PayloadReadBytes - detector.lastPayloadRead,
 	}
 	detector.lastAt = sample.At
 	detector.lastStats = sample.Stats
 	detector.lastPayload = sample.PayloadBytes
+	detector.lastPayloadRead = sample.PayloadReadBytes
 	detector.window = append(detector.window, delta)
 	detector.trimWindow(sample.At)
+	if sample.Stats.PacketsSent > 0 && sample.Stats.PacketsReceived > 0 {
+		detector.wasBidirectional = true
+	}
 
 	window := sumHTTP3DegradationWindow(detector.window)
+	if sample.BlockedReads > 0 && window.payloadRead >= http3UDPBlackholeRecentReadMinBytes {
+		sample.RecentReadDemand = true
+	}
 	wireBytes := saturatingAdd(window.bytesSent, window.bytesReceived)
 	signals.EnoughTraffic = window.packetsSent >= http3DegradationMinPackets || window.bytesSent >= http3DegradationMinBytes
 	signals.BlockedWrite = sample.BlockedWrites > 0
 	signals.BlockedWrites = sample.BlockedWrites
+	signals.BlockedReads = sample.BlockedReads
 	signals.PeakBlockedWrites = max(sample.BlockedWrites, sample.PeakBlockedWrites)
 	signals.OldestBlockedFor = sample.OldestBlockedFor
+	signals.OldestReadBlockedFor = sample.OldestReadBlockedFor
 	if !sample.LastPayloadProgressAt.IsZero() && !sample.LastPayloadProgressAt.After(sample.At) {
 		signals.LastProgressFor = sample.At.Sub(sample.LastPayloadProgressAt)
 	}
@@ -223,6 +270,7 @@ func (detector *http3DegradationDetector) observe(sample http3DegradationSample)
 		signals.BlockedWrites >= 1 && signals.LastProgressFor >= http3DegradationSingleWriteBlock
 	signals.ClearWriteBlock = explicitBlock || progressStalled
 	signals.PayloadStalled = signals.PayloadDemand && (signals.ClearWriteBlock || signals.ThroughputLow || signals.WireWaste)
+	detector.observeUDPBlackhole(sample, delta, sampleGap, &signals)
 
 	// Learn an application-throughput baseline only from busy, unblocked and
 	// otherwise healthy intervals. An idle connection therefore never teaches a
@@ -250,6 +298,15 @@ func (detector *http3DegradationDetector) observe(sample http3DegradationSample)
 		detector.consecutiveBadWindows = 0
 		signals.ConsecutiveWindows = 0
 		return detector.liveDecision(signals)
+	}
+
+	if signals.UDPBlackhole {
+		detector.latched = http3DegradationDecision{
+			Rotate:  true,
+			Reason:  http3DegradationReasonUDPBlackhole,
+			Signals: signals,
+		}
+		return detector.latched
 	}
 
 	if detector.latched.Rotate {
@@ -295,10 +352,12 @@ func (detector *http3DegradationDetector) initialize(sample http3DegradationSamp
 	detector.lastAt = sample.At
 	detector.lastStats = sample.Stats
 	detector.lastPayload = sample.PayloadBytes
+	detector.lastPayloadRead = sample.PayloadReadBytes
 	if detector.establishedAt.IsZero() {
 		detector.establishedAt = sample.At
 	}
 	detector.updateBaseline(sample.Stats, sample.HistoricalBaselineRTT)
+	detector.wasBidirectional = sample.Stats.PacketsSent > 0 && sample.Stats.PacketsReceived > 0
 }
 
 func (detector *http3DegradationDetector) resetWindow(sample http3DegradationSample) {
@@ -307,7 +366,101 @@ func (detector *http3DegradationDetector) resetWindow(sample http3DegradationSam
 	detector.lastAt = sample.At
 	detector.lastStats = sample.Stats
 	detector.lastPayload = sample.PayloadBytes
+	detector.lastPayloadRead = sample.PayloadReadBytes
 	detector.updateBaseline(sample.Stats, sample.HistoricalBaselineRTT)
+	detector.resetUDPBlackhole()
+}
+
+func (detector *http3DegradationDetector) observeUDPBlackhole(
+	sample http3DegradationSample,
+	delta http3DegradationWindowDelta,
+	sampleGap time.Duration,
+	signals *http3DegradationSignals,
+) {
+	if detector == nil || signals == nil {
+		return
+	}
+	reset := func() {
+		detector.resetUDPBlackhole()
+		signals.BlackholeWindows = 0
+		signals.NoReceiveFor = 0
+	}
+
+	// Any ACK/QUIC packet, successful tunnel payload, counter discontinuity, or
+	// a scheduler/sleep gap disproves a continuous blackhole window. In
+	// particular, an origin that is merely slow
+	// still returns QUIC ACKs and therefore cannot satisfy this detector.
+	if sampleGap > http3UDPBlackholeMaxSampleGap || delta.bytesReceived > 0 || delta.packetsReceived > 0 ||
+		delta.payloadBytes > 0 {
+		reset()
+		return
+	}
+	if !detector.wasBidirectional {
+		reset()
+		return
+	}
+	// A blocked Read is normal for an idle tunnel and is never sufficient on its
+	// own. Only a tunnel that was receiving meaningful downstream payload just
+	// before it stalled may latch read-side demand. Keep that latch while the
+	// same Read remains blocked so the QUIC keepalive / PTO evidence can arrive
+	// after the recent-read window itself has elapsed.
+	if sample.BlockedReads <= 0 {
+		detector.blackholeReadDemand = false
+	} else if sample.RecentReadDemand {
+		detector.blackholeReadDemand = true
+	}
+	signals.ReadDemand = detector.blackholeReadDemand
+	if !signals.PayloadDemand && !signals.ReadDemand {
+		reset()
+		return
+	}
+	if detector.blackholeNoReceiveSince.IsZero() {
+		// Start the no-receive clock when proven application demand first stalls,
+		// not only when the later keepalive/PTO packet happens to be sampled.
+		detector.blackholeNoReceiveSince = sample.At.Add(-sampleGap)
+	}
+	if delta.bytesSent > 0 || delta.packetsSent > 0 {
+		detector.blackholeSentBytes = saturatingAdd(detector.blackholeSentBytes, delta.bytesSent)
+		detector.blackholeSentPackets = saturatingAdd(detector.blackholeSentPackets, delta.packetsSent)
+		detector.blackholeSendSamples++
+	}
+	if detector.blackholeNoReceiveSince.IsZero() {
+		reset()
+		return
+	}
+
+	// Require counters to advance in at least two distinct sampler intervals.
+	// One isolated packet followed by local scheduler silence isn't evidence that
+	// QUIC is still attempting PTO/retransmission recovery.
+	signals.SentNoReceive = detector.blackholeSendSamples >= 2 &&
+		(detector.blackholeSentBytes > 0 || detector.blackholeSentPackets > 0)
+	signals.NoReceiveFor = sample.At.Sub(detector.blackholeNoReceiveSince)
+	writeStalled := signals.PayloadDemand && signals.OldestBlockedFor >= http3UDPBlackholeStallTimeout
+	readStalled := signals.ReadDemand && signals.BlockedReads > 0 &&
+		signals.NoReceiveFor >= http3UDPBlackholeStallTimeout
+	eligible := !signals.Warmup && signals.SentNoReceive && (writeStalled || readStalled) &&
+		signals.LastProgressFor >= http3UDPBlackholeStallTimeout &&
+		signals.NoReceiveFor >= http3UDPBlackholeStallTimeout
+	if !eligible {
+		detector.blackholeWindows = 0
+		signals.BlackholeWindows = 0
+		return
+	}
+	detector.blackholeWindows++
+	signals.BlackholeWindows = detector.blackholeWindows
+	signals.UDPBlackhole = detector.blackholeWindows >= http3UDPBlackholeConfirmations
+}
+
+func (detector *http3DegradationDetector) resetUDPBlackhole() {
+	if detector == nil {
+		return
+	}
+	detector.blackholeNoReceiveSince = time.Time{}
+	detector.blackholeSentBytes = 0
+	detector.blackholeSentPackets = 0
+	detector.blackholeSendSamples = 0
+	detector.blackholeWindows = 0
+	detector.blackholeReadDemand = false
 }
 
 func (detector *http3DegradationDetector) baseSignals(sample http3DegradationSample, sampled bool) http3DegradationSignals {
@@ -358,6 +511,7 @@ func sumHTTP3DegradationWindow(window []http3DegradationWindowDelta) http3Degrad
 		sum.bytesLost = saturatingAdd(sum.bytesLost, delta.bytesLost)
 		sum.packetsLost = saturatingAdd(sum.packetsLost, delta.packetsLost)
 		sum.payloadBytes = saturatingAdd(sum.payloadBytes, delta.payloadBytes)
+		sum.payloadRead = saturatingAdd(sum.payloadRead, delta.payloadRead)
 	}
 	return sum
 }
@@ -398,14 +552,20 @@ func http3DegradationRTTThreshold(baseline time.Duration) time.Duration {
 	return max(factor, baseline+http3DegradationRTTAdditive, http3DegradationRTTFloor)
 }
 
-func countersMovedBackward(sample http3DegradationSample, previous quic.ConnectionStats, previousPayload uint64) bool {
+func countersMovedBackward(
+	sample http3DegradationSample,
+	previous quic.ConnectionStats,
+	previousPayload uint64,
+	previousPayloadRead uint64,
+) bool {
 	return sample.Stats.BytesSent < previous.BytesSent ||
 		sample.Stats.PacketsSent < previous.PacketsSent ||
 		sample.Stats.BytesReceived < previous.BytesReceived ||
 		sample.Stats.PacketsReceived < previous.PacketsReceived ||
 		sample.Stats.BytesLost < previous.BytesLost ||
 		sample.Stats.PacketsLost < previous.PacketsLost ||
-		sample.PayloadBytes < previousPayload
+		sample.PayloadBytes < previousPayload ||
+		sample.PayloadReadBytes < previousPayloadRead
 }
 
 func saturatingAdd(left, right uint64) uint64 {

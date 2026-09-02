@@ -52,6 +52,23 @@ func tripRoute(t *testing.T, rule *config.Rule, addr string, now time.Time) {
 	}
 }
 
+func tripRouteInRegistry(
+	t *testing.T,
+	registry *routeHealthRegistry,
+	rule *config.Rule,
+	addr string,
+	now time.Time,
+) {
+	t.Helper()
+	for i := 0; i < routeFailureThreshold; i++ {
+		attempt, err := registry.begin(rule, addr, now)
+		if err != nil {
+			t.Fatalf("registry.begin() before failure %d: %v", i+1, err)
+		}
+		routeObserve(attempt, time.Duration(i+1)*time.Millisecond, errors.New("dial failed"), now)
+	}
+}
+
 func TestRouteHealthTripsAfterThreeConsecutiveFailures(t *testing.T) {
 	resetRouteHealthForTest()
 	rule := routeHealthTestRule("one:1")
@@ -176,6 +193,47 @@ func TestRouteHealthProbeBackoffAndRecovery(t *testing.T) {
 	}
 	if _, err := routeBegin(rule, "one:1", secondProbe); err != nil {
 		t.Fatalf("routeBegin() after recovery = %v", err)
+	}
+}
+
+func TestRouteHealthRecordsOnlySuccessfulHalfOpenRecovery(t *testing.T) {
+	registry := newRouteHealthRegistry()
+	rule := routeHealthTestRule("one:1")
+	now := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+
+	ordinary, err := registry.begin(rule, "one:1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(ordinary, 20*time.Millisecond, nil, now)
+	if snapshot := registry.snapshot(rule, "one:1", now); !snapshot.LastRecovery.IsZero() {
+		t.Fatalf("ordinary success recorded recovery time %s", snapshot.LastRecovery)
+	}
+
+	tripAt := now.Add(time.Second)
+	tripRouteInRegistry(t, registry, rule, "one:1", tripAt)
+	recoveredAt := tripAt.Add(routeInitialCooldown)
+	probe, err := registry.begin(rule, "one:1", recoveredAt)
+	if err != nil {
+		t.Fatalf("begin half-open recovery: %v", err)
+	}
+	routeObserve(probe, 30*time.Millisecond, nil, recoveredAt)
+	snapshot := registry.snapshot(rule, "one:1", recoveredAt)
+	if snapshot.CircuitOpen || snapshot.HalfOpen || snapshot.ConsecutiveFailures != 0 {
+		t.Fatalf("successful half-open did not recover route: %+v", snapshot)
+	}
+	if !snapshot.LastRecovery.Equal(recoveredAt) {
+		t.Fatalf("last recovery = %s, want %s", snapshot.LastRecovery, recoveredAt)
+	}
+
+	regularAt := recoveredAt.Add(time.Second)
+	regular, err := registry.begin(rule, "one:1", regularAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(regular, 15*time.Millisecond, nil, regularAt)
+	if snapshot = registry.snapshot(rule, "one:1", regularAt); !snapshot.LastRecovery.Equal(recoveredAt) {
+		t.Fatalf("ordinary success overwrote recovery time: got %s want %s", snapshot.LastRecovery, recoveredAt)
 	}
 }
 
@@ -528,6 +586,218 @@ func TestRouteExplorationLeaseIsRuleWideTokenSafeAndExpires(t *testing.T) {
 	registry.Unlock()
 	if exists {
 		t.Fatal("current release retained exploration claim")
+	}
+}
+
+func TestRouteRecoveryProbeRequiresExpiredCircuitCooldown(t *testing.T) {
+	registry := newRouteHealthRegistry()
+	rule := routeHealthTestRule("recovering:1")
+	rule.Timeout = 1000
+	tripAt := time.Date(2026, 9, 1, 8, 1, 0, 0, time.UTC)
+	tripRouteInRegistry(t, registry, rule, "recovering:1", tripAt)
+
+	if lease, claimed := registry.claimRecoveryProbe(
+		rule,
+		tripAt.Add(routeInitialCooldown-time.Nanosecond),
+		nil,
+	); claimed {
+		t.Fatalf("claimed recovery before cooldown expiry: %+v", lease)
+	}
+	probeAt := tripAt.Add(routeInitialCooldown)
+	if lease, claimed := registry.claimRecoveryProbe(
+		rule,
+		probeAt,
+		map[string]struct{}{"recovering:1": {}},
+	); claimed {
+		t.Fatalf("claimed excluded recovery target: %+v", lease)
+	}
+	lease, claimed := registry.claimRecoveryProbe(rule, probeAt, nil)
+	if !claimed {
+		t.Fatal("did not claim recovery at cooldown expiry")
+	}
+	if lease.ruleKey != boostRuleKey(rule) || lease.address != "recovering:1" || lease.token == 0 {
+		t.Fatalf("recovery lease = %+v", lease)
+	}
+	registry.releaseRecoveryProbe(lease)
+}
+
+func TestRouteRecoveryProbeIsRuleWideAndRateLimited(t *testing.T) {
+	registry := newRouteHealthRegistry()
+	rule := routeHealthTestRule("recovering:1")
+	rule.Timeout = 1000
+	tripAt := time.Date(2026, 9, 1, 8, 2, 0, 0, time.UTC)
+	tripRouteInRegistry(t, registry, rule, "recovering:1", tripAt)
+	probeAt := tripAt.Add(routeInitialCooldown)
+
+	const callers = 32
+	start := make(chan struct{})
+	claims := make(chan routeRecoveryLease, callers)
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(callers)
+	done.Add(callers)
+	for range callers {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			if lease, claimed := registry.claimRecoveryProbe(rule, probeAt, nil); claimed {
+				claims <- lease
+			}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+	close(claims)
+
+	var first routeRecoveryLease
+	claimCount := 0
+	for lease := range claims {
+		first = lease
+		claimCount++
+	}
+	if claimCount != 1 {
+		t.Fatalf("concurrent recovery claims = %d, want 1", claimCount)
+	}
+	registry.releaseRecoveryProbe(first)
+	if lease, claimed := registry.claimRecoveryProbe(
+		rule,
+		probeAt.Add(routeRecoveryProbeInterval-time.Nanosecond),
+		nil,
+	); claimed {
+		t.Fatalf("claimed recovery before rule interval elapsed: %+v", lease)
+	}
+	second, claimed := registry.claimRecoveryProbe(rule, probeAt.Add(routeRecoveryProbeInterval), nil)
+	if !claimed {
+		t.Fatal("did not claim recovery when rule interval elapsed")
+	}
+	if second.token == first.token {
+		t.Fatalf("reused recovery token %d", second.token)
+	}
+	registry.releaseRecoveryProbe(second)
+}
+
+func TestRouteRecoveryProbeLeaseExpiryAndTokenSafeRelease(t *testing.T) {
+	registry := newRouteHealthRegistry()
+	rule := routeHealthTestRule("recovering:1")
+	rule.Timeout = 1000
+	tripAt := time.Date(2026, 9, 1, 8, 3, 0, 0, time.UTC)
+	tripRouteInRegistry(t, registry, rule, "recovering:1", tripAt)
+	probeAt := tripAt.Add(routeInitialCooldown)
+
+	first, claimed := registry.claimRecoveryProbe(rule, probeAt, nil)
+	if !claimed {
+		t.Fatal("failed to claim initial recovery lease")
+	}
+	secondAt := probeAt.Add(routeExplorationLeaseDuration(rule))
+	second, claimed := registry.claimRecoveryProbe(rule, secondAt, nil)
+	if !claimed {
+		t.Fatal("expired recovery lease was not replaced")
+	}
+	if second.token == first.token {
+		t.Fatalf("replacement reused token %d", second.token)
+	}
+
+	registry.releaseRecoveryProbe(first)
+	registry.Lock()
+	retained, exists := registry.recovery[boostRuleKey(rule)]
+	registry.Unlock()
+	if !exists || retained.token != second.token || retained.address != second.address {
+		t.Fatalf("stale release removed replacement: retained=%+v exists=%t second=%+v", retained, exists, second)
+	}
+	registry.releaseRecoveryProbe(second)
+	registry.Lock()
+	_, exists = registry.recovery[boostRuleKey(rule)]
+	registry.Unlock()
+	if exists {
+		t.Fatal("current release retained recovery claim")
+	}
+}
+
+func TestRouteRecoveryProbeChoosesOldestDueCircuit(t *testing.T) {
+	t.Run("earliest open until", func(t *testing.T) {
+		registry := newRouteHealthRegistry()
+		rule := routeHealthTestRule("earliest:1", "later:1")
+		rule.Timeout = 1000
+		base := time.Date(2026, 9, 1, 8, 4, 0, 0, time.UTC)
+		tripRouteInRegistry(t, registry, rule, "earliest:1", base)
+		tripRouteInRegistry(t, registry, rule, "later:1", base.Add(time.Second))
+
+		lease, claimed := registry.claimRecoveryProbe(
+			rule,
+			base.Add(time.Second).Add(routeInitialCooldown),
+			nil,
+		)
+		if !claimed || lease.address != "earliest:1" {
+			t.Fatalf("recovery lease = %+v claimed=%t, want earliest circuit", lease, claimed)
+		}
+	})
+
+	t.Run("oldest last attempt breaks tie", func(t *testing.T) {
+		registry := newRouteHealthRegistry()
+		rule := routeHealthTestRule("newer-attempt:1", "older-attempt:1")
+		rule.Timeout = 1000
+		tripAt := time.Date(2026, 9, 1, 8, 5, 0, 0, time.UTC)
+		tripRouteInRegistry(t, registry, rule, "newer-attempt:1", tripAt)
+		tripRouteInRegistry(t, registry, rule, "older-attempt:1", tripAt)
+		probeAt := tripAt.Add(routeInitialCooldown)
+
+		probe, err := registry.begin(rule, "newer-attempt:1", probeAt)
+		if err != nil {
+			t.Fatalf("begin cancelled half-open attempt: %v", err)
+		}
+		routeObserve(probe, time.Millisecond, context.Canceled, probeAt)
+		lease, claimed := registry.claimRecoveryProbe(rule, probeAt, nil)
+		if !claimed || lease.address != "older-attempt:1" {
+			t.Fatalf("recovery lease = %+v claimed=%t, want oldest last attempt", lease, claimed)
+		}
+	})
+}
+
+func TestRouteHealthClearRemovesRecoveryState(t *testing.T) {
+	registry := newRouteHealthRegistry()
+	tripAt := time.Date(2026, 9, 1, 8, 6, 0, 0, time.UTC)
+
+	releasedRule := routeHealthTestRule("released:1")
+	releasedRule.Name = "released-recovery"
+	releasedRule.Listen = "127.0.0.1:10001"
+	releasedRule.Timeout = 1000
+	tripRouteInRegistry(t, registry, releasedRule, "released:1", tripAt)
+	released, claimed := registry.claimRecoveryProbe(
+		releasedRule,
+		tripAt.Add(routeInitialCooldown),
+		nil,
+	)
+	if !claimed {
+		t.Fatal("failed to seed released recovery state")
+	}
+	registry.releaseRecoveryProbe(released)
+
+	activeRule := routeHealthTestRule("active:1")
+	activeRule.Name = "active-recovery"
+	activeRule.Listen = "127.0.0.1:10002"
+	activeRule.Timeout = 1000
+	tripRouteInRegistry(t, registry, activeRule, "active:1", tripAt)
+	if _, claimed := registry.claimRecoveryProbe(
+		activeRule,
+		tripAt.Add(routeInitialCooldown),
+		nil,
+	); !claimed {
+		t.Fatal("failed to seed active recovery state")
+	}
+
+	registry.clear([]*config.Rule{releasedRule, activeRule})
+	registry.Lock()
+	defer registry.Unlock()
+	for _, rule := range []*config.Rule{releasedRule, activeRule} {
+		key := boostRuleKey(rule)
+		if _, exists := registry.recovery[key]; exists {
+			t.Fatalf("clear retained recovery claim for %s", rule.Name)
+		}
+		if _, exists := registry.recoveryNext[key]; exists {
+			t.Fatalf("clear retained recovery interval for %s", rule.Name)
+		}
 	}
 }
 

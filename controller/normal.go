@@ -105,10 +105,12 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 		return
 	}
 
-	utils.Logger.Debug("建立连接",
-		zap.String("ruleName", rule.Name),
-		zap.String("remoteAddr", connAddr(conn)),
-		zap.String("targetAddr", connAddr(target)))
+	if entry := utils.Logger.Check(zap.DebugLevel, "建立连接"); entry != nil {
+		entry.Write(
+			zap.String("ruleName", rule.Name),
+			zap.String("remoteAddr", connAddr(conn)),
+			zap.String("targetAddr", connAddr(target)))
+	}
 
 	result := relayBidirectional(ctx, conn, target)
 	logRelayResult(rule, conn, target, result)

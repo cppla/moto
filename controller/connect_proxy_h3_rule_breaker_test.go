@@ -74,6 +74,65 @@ func TestHTTP3RuleBreakerDifferentIPsRequireDataPlaneProbation(t *testing.T) {
 	}
 }
 
+func TestHTTP3RuleBreakerProbationIgnoresEarlyUnsampledTicks(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 30, 0, 0, time.UTC)
+	breaker := newHTTP3RuleBreaker(func() time.Time { return now })
+	key := http3ConnectTransportKey{address: "proxy.example:443"}
+	breaker.register("mixed", key)
+	breaker.noteDegradation(http3RuleDegradationEvent{
+		key: key, remoteIP: "192.0.2.25", generationID: 1, at: now,
+	})
+	breaker.noteDegradation(http3RuleDegradationEvent{
+		key: key, remoteIP: "192.0.2.25", generationID: 2, at: now.Add(time.Second),
+	})
+	validateHTTP3RuleFallbackForTest(t, breaker, "mixed", key, true)
+	now = breaker.rules["mixed"].retryAt
+	token, probation, allowed := breaker.begin("mixed", key)
+	if token == 0 || !probation || !allowed {
+		t.Fatalf("probation admission = token:%d probation:%t allowed:%t", token, probation, allowed)
+	}
+	binding := http3RuleProbationBinding{
+		generationID: 3,
+		remoteIP:     "192.0.2.25",
+		stats:        quic.ConnectionStats{PacketsSent: 100},
+		payloadBytes: 1000,
+	}
+	if !breaker.establish("mixed", token, key, binding) {
+		t.Fatal("probation binding was rejected")
+	}
+	established := now
+	for index, sample := range []struct {
+		elapsed time.Duration
+		sampled bool
+	}{
+		{elapsed: 26 * time.Second, sampled: true},
+		{elapsed: 27 * time.Second, sampled: false},
+		{elapsed: 28 * time.Second, sampled: true},
+		{elapsed: 29 * time.Second, sampled: false},
+		{elapsed: 30 * time.Second, sampled: true},
+	} {
+		breaker.noteSample(http3RuleSampleEvent{
+			key:          key,
+			remoteIP:     binding.remoteIP,
+			generationID: binding.generationID,
+			at:           established.Add(sample.elapsed),
+			stats:        quic.ConnectionStats{PacketsSent: 400},
+			payloadBytes: binding.payloadBytes + http3RuleProbationMinPayload,
+			decision: http3DegradationDecision{Signals: http3DegradationSignals{
+				Sampled: sample.sampled,
+			}},
+		})
+		state := breaker.rules["mixed"]
+		if index < 4 && state.phase != http3RuleBreakerProbation {
+			t.Fatalf("probation recovered before final sampled tick %d: %+v", index, state)
+		}
+	}
+	state := breaker.rules["mixed"]
+	if state.phase != http3RuleBreakerClosed || state.events["recovered"] != 1 {
+		t.Fatalf("rule state after jitter-tolerant recovery = %+v", state)
+	}
+}
+
 func TestHTTP3RuleBreakerSameRemoteIPAcrossTargetsCountsIndependentGenerations(t *testing.T) {
 	now := time.Date(2026, 8, 28, 13, 0, 0, 0, time.UTC)
 	breaker := newHTTP3RuleBreaker(func() time.Time { return now })
@@ -1001,6 +1060,155 @@ func TestHTTP3RuleCooldownKeepsH3OnlyFailOpenWithoutSafeCandidate(t *testing.T) 
 	if len(selections) != 1 || selections[0].target != h3Only {
 		t.Fatalf("H3-only last resort did not fail open: %+v", selections)
 	}
+}
+
+func TestTargetCircuitRecoveryRespectsHTTP3RuleCooldown(t *testing.T) {
+	now := time.Now()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	runtime.connectProxy.now = func() time.Time { return now }
+	h3Only := &config.Target{Address: "recovering-h3-only.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3},
+	}}
+	mixed := &config.Target{Address: "healthy-mixed.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2},
+	}}
+	rule := &config.Rule{Name: "target-recovery-cooldown", Mode: config.ModeBoost, Protocol: config.ProtocolSOCKS5,
+		Targets: []*config.Target{h3Only, mixed}}
+	_ = openHTTP3RuleCooldownForTest(t, runtime.connectProxy, rule.Name, mixed)
+	tripRouteInRegistry(t, runtime.routes, rule, h3Only.Address, now.Add(-routeInitialCooldown-time.Second))
+
+	if recovery := runtime.claimBoostRecoveryProbe(rule, now); recovery.token != 0 {
+		runtime.releaseBoostRecoveryProbe(rule, recovery)
+		t.Fatalf("H3-only target recovery bypassed an available H2-capable route: %+v", recovery)
+	}
+	selections := runtime.routes.selectTargetSelections(rule, len(rule.Targets), now, nil, true)
+	if len(selections) != 1 || selections[0].target != mixed {
+		t.Fatalf("ordinary cooldown selection = %+v, want only mixed target", selections)
+	}
+}
+
+func TestTargetCircuitRecoveryRespectsActiveHTTP3RuleProbation(t *testing.T) {
+	now := time.Now()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	runtime.connectProxy.now = func() time.Time { return now }
+	h3Only := &config.Target{Address: "probation-h3-only.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3},
+	}}
+	mixed := &config.Target{Address: "probation-mixed.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2},
+	}}
+	rule := &config.Rule{Name: "target-recovery-probation", Mode: config.ModeBoost, Protocol: config.ProtocolSOCKS5,
+		Targets: []*config.Target{h3Only, mixed}}
+	_ = openHTTP3RuleCooldownForTest(t, runtime.connectProxy, rule.Name, mixed)
+	runtime.connectProxy.h3RuleBreaker.mu.Lock()
+	runtime.connectProxy.h3RuleBreaker.rules[rule.Name].retryAt = now.Add(-time.Second)
+	runtime.connectProxy.h3RuleBreaker.mu.Unlock()
+	routeProbe, claimed := runtime.routes.claimProtocolProbe(rule, mixed, now)
+	if !claimed || routeProbe.token&http3RuleRouteProbeTokenMask == 0 {
+		t.Fatalf("rule probation route lease = %+v claimed=%t", routeProbe, claimed)
+	}
+	probeCtx := withRouteProtocolProbeLease(context.Background(), routeProbe)
+	if token, probation, allowed := runtime.connectProxy.beginHTTP3RuleAttempt(probeCtx, rule.Name, mixed); token == 0 || !probation || !allowed {
+		t.Fatalf("rule probation admission = token:%d probation:%t allowed:%t", token, probation, allowed)
+	}
+	runtime.routes.releaseProtocolProbe(rule, mixed, routeProbe)
+	tripRouteInRegistry(t, runtime.routes, rule, h3Only.Address, now.Add(-routeInitialCooldown-time.Second))
+
+	if recovery := runtime.claimBoostRecoveryProbe(rule, now); recovery.token != 0 {
+		runtime.releaseBoostRecoveryProbe(rule, recovery)
+		t.Fatalf("H3-only target recovery bypassed active rule probation: %+v", recovery)
+	}
+}
+
+func TestTargetCircuitRecoveryCarriesDueHTTP3RuleProbeLease(t *testing.T) {
+	now := time.Now()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	runtime.connectProxy.now = func() time.Time { return now }
+	h2Only := &config.Target{Address: "healthy-h2-only.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH2},
+	}}
+	mixed := &config.Target{Address: "recovering-mixed.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2},
+	}}
+	rule := &config.Rule{Name: "combined-target-protocol-recovery", Mode: config.ModeBoost, Protocol: config.ProtocolSOCKS5,
+		Targets: []*config.Target{h2Only, mixed}}
+	_ = openHTTP3RuleCooldownForTest(t, runtime.connectProxy, rule.Name, mixed)
+	runtime.connectProxy.h3RuleBreaker.mu.Lock()
+	runtime.connectProxy.h3RuleBreaker.rules[rule.Name].retryAt = now.Add(-time.Second)
+	runtime.connectProxy.h3RuleBreaker.mu.Unlock()
+	tripRouteInRegistry(t, runtime.routes, rule, mixed.Address, now.Add(-routeInitialCooldown-time.Second))
+
+	recovery := runtime.claimBoostRecoveryProbe(rule, now)
+	if recovery.token == 0 || recovery.address != mixed.Address ||
+		recovery.protocolProbe.token&http3RuleRouteProbeTokenMask == 0 {
+		runtime.releaseBoostRecoveryProbe(rule, recovery)
+		t.Fatalf("combined target/protocol recovery lease = %+v", recovery)
+	}
+	peers := make(chan net.Conn, 1)
+	winner, err := func() (dialResult, error) {
+		defer runtime.releaseBoostRecoveryProbe(rule, recovery)
+		return runtime.raceBoostTargetsPreparedWithRecovery(
+			context.Background(), rule,
+			func(ctx context.Context, address string) (net.Conn, error) {
+				if address != mixed.Address {
+					return nil, fmt.Errorf("unexpected recovery target %q", address)
+				}
+				token, probation, allowed := runtime.connectProxy.beginHTTP3RuleAttempt(ctx, rule.Name, mixed)
+				if token == 0 || !probation || !allowed {
+					return nil, fmt.Errorf("missing combined protocol lease: token=%d probation=%t allowed=%t", token, probation, allowed)
+				}
+				connection, peer := net.Pipe()
+				peers <- peer
+				return connection, nil
+			}, nil, recovery,
+		)
+	}()
+	if err != nil {
+		t.Fatalf("combined target/protocol recovery: %v", err)
+	}
+	defer winner.conn.Close()
+	defer (<-peers).Close()
+	if winner.addr != mixed.Address {
+		t.Fatalf("combined recovery winner = %q, want %q", winner.addr, mixed.Address)
+	}
+	state := runtime.connectProxy.h3RuleBreaker.rules[rule.Name]
+	if state == nil || state.phase != http3RuleBreakerProbation {
+		t.Fatalf("combined recovery did not enter rule probation: %+v", state)
+	}
+}
+
+func TestDueHTTP3RuleProbeTakesPriorityOverH3OnlyTargetCircuitRecovery(t *testing.T) {
+	now := time.Now()
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	runtime.connectProxy.now = func() time.Time { return now }
+	h3Only := &config.Target{Address: "due-h3-only.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3},
+	}}
+	mixed := &config.Target{Address: "due-mixed-canary.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2},
+	}}
+	rule := &config.Rule{Name: "protocol-recovery-priority", Mode: config.ModeBoost, Protocol: config.ProtocolSOCKS5,
+		Targets: []*config.Target{h3Only, mixed}}
+	_ = openHTTP3RuleCooldownForTest(t, runtime.connectProxy, rule.Name, mixed)
+	runtime.connectProxy.h3RuleBreaker.mu.Lock()
+	runtime.connectProxy.h3RuleBreaker.rules[rule.Name].retryAt = now.Add(-time.Second)
+	runtime.connectProxy.h3RuleBreaker.mu.Unlock()
+	tripRouteInRegistry(t, runtime.routes, rule, h3Only.Address, now.Add(-routeInitialCooldown-time.Second))
+
+	if recovery := runtime.claimBoostRecoveryProbe(rule, now); recovery.token != 0 {
+		runtime.releaseBoostRecoveryProbe(rule, recovery)
+		t.Fatalf("H3-only target circuit stole due rule probation: %+v", recovery)
+	}
+	selections := runtime.routes.selectTargetSelections(rule, len(rule.Targets), now, nil, true)
+	if len(selections) == 0 || selections[0].target != mixed ||
+		selections[0].protocolProbe.token&http3RuleRouteProbeTokenMask == 0 {
+		t.Fatalf("due rule probation did not retain mixed canary priority: %+v", selections)
+	}
+	runtime.routes.releaseProtocolProbe(rule, mixed, selections[0].protocolProbe)
 }
 
 func TestHTTP3RuleProbeLeaseLetsCachedH2ServeSiblings(t *testing.T) {

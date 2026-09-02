@@ -151,11 +151,13 @@ func (runtime *routingRuntime) handleRoundrobin(ctx context.Context, conn net.Co
 		_ = target.Close()
 		return
 	}
-	utils.Logger.Debug("建立连接",
-		zap.String("ruleName", rule.Name),
-		zap.String("remoteAddr", connAddr(conn)),
-		zap.String("targetAddr", connAddr(target)),
-		zap.Int64("roundrobinTime(ms)", time.Since(roundrobinBegin).Milliseconds()))
+	if entry := utils.Logger.Check(zap.DebugLevel, "建立连接"); entry != nil {
+		entry.Write(
+			zap.String("ruleName", rule.Name),
+			zap.String("remoteAddr", connAddr(conn)),
+			zap.String("targetAddr", connAddr(target)),
+			zap.Int64("roundrobinTime(ms)", time.Since(roundrobinBegin).Milliseconds()))
+	}
 
 	defer target.Close()
 	result := relayBidirectional(ctx, conn, target)

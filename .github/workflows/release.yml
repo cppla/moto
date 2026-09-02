@@ -22,7 +22,9 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
       - name: Run the complete release gate
-        run: make check
+        run: |
+          make check
+          make container-image-check
 
   build:
     needs: verify

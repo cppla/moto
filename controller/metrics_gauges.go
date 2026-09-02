@@ -8,15 +8,18 @@ import (
 )
 
 type routeGauge struct {
-	rule                string
-	mode                string
-	target              string
-	ewma                time.Duration
-	observed            bool
-	consecutiveFailures int
-	circuitOpen         bool
-	halfOpen            bool
-	lastAttempt         time.Time
+	rule                     string
+	mode                     string
+	target                   string
+	ewma                     time.Duration
+	observed                 bool
+	consecutiveFailures      int
+	circuitOpen              bool
+	halfOpen                 bool
+	circuitCooldownRemaining time.Duration
+	probeDue                 bool
+	lastRecovery             time.Time
+	lastAttempt              time.Time
 }
 
 type prewarmGauge struct {
@@ -115,6 +118,25 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 	writeMetricHeader(output, "moto_route_half_open", "Whether one recovery probe currently owns the route circuit.", "gauge")
 	for _, route := range routes {
 		writeMetricSample(output, "moto_route_half_open", routeGaugeLabels(route), boolMetric(route.halfOpen))
+	}
+
+	writeMetricHeader(output, "moto_route_circuit_cooldown_remaining_seconds", "Seconds remaining before an open route circuit may run one recovery probe.", "gauge")
+	for _, route := range routes {
+		writeMetricSample(output, "moto_route_circuit_cooldown_remaining_seconds", routeGaugeLabels(route), strconv.FormatFloat(float64(route.circuitCooldownRemaining)/float64(time.Second), 'g', -1, 64))
+	}
+
+	writeMetricHeader(output, "moto_route_probe_due", "Whether an open route circuit is waiting for its single half-open recovery probe.", "gauge")
+	for _, route := range routes {
+		writeMetricSample(output, "moto_route_probe_due", routeGaugeLabels(route), boolMetric(route.probeDue))
+	}
+
+	writeMetricHeader(output, "moto_route_last_recovery_timestamp_seconds", "Unix timestamp of the latest successful half-open route recovery.", "gauge")
+	for _, route := range routes {
+		value := int64(0)
+		if !route.lastRecovery.IsZero() {
+			value = route.lastRecovery.Unix()
+		}
+		writeMetricSample(output, "moto_route_last_recovery_timestamp_seconds", routeGaugeLabels(route), strconv.FormatInt(value, 10))
 	}
 
 	writeMetricHeader(output, "moto_route_last_attempt_timestamp_seconds", "Unix timestamp of the latest admitted dial attempt.", "gauge")
@@ -469,18 +491,26 @@ func boolMetric(value bool) string {
 
 func (registry *routeHealthRegistry) snapshotGauges() []routeGauge {
 	registry.Lock()
+	now := time.Now()
 	routes := make([]routeGauge, 0, len(registry.states))
 	for key, state := range registry.states {
+		cooldownRemaining := time.Duration(0)
+		if state.circuitOpen && now.Before(state.openUntil) {
+			cooldownRemaining = state.openUntil.Sub(now)
+		}
 		routes = append(routes, routeGauge{
-			rule:                state.ruleName,
-			mode:                state.mode,
-			target:              key.addr,
-			ewma:                state.ewma,
-			observed:            state.observed,
-			consecutiveFailures: max(state.consecutiveFailures, state.relayFailures),
-			circuitOpen:         state.circuitOpen,
-			halfOpen:            state.halfOpen,
-			lastAttempt:         state.lastAttempt,
+			rule:                     state.ruleName,
+			mode:                     state.mode,
+			target:                   key.addr,
+			ewma:                     state.ewma,
+			observed:                 state.observed,
+			consecutiveFailures:      max(state.consecutiveFailures, state.relayFailures),
+			circuitOpen:              state.circuitOpen,
+			halfOpen:                 state.halfOpen,
+			circuitCooldownRemaining: cooldownRemaining,
+			probeDue:                 state.circuitOpen && !state.halfOpen && cooldownRemaining == 0,
+			lastRecovery:             state.lastRecovery,
+			lastAttempt:              state.lastAttempt,
 		})
 	}
 	registry.Unlock()

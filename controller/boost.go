@@ -133,9 +133,10 @@ func (runtime *routingRuntime) loadBoostWinnerToken(key string) (boostWinnerEntr
 	return entry, true
 }
 
-// loadUsableBoostWinnerToken rejects a cached winner whose currently selected
-// protocol is degraded. Eviction uses the generation token loaded with the
-// entry, so a concurrent refresh cannot be deleted by this stale observation.
+// loadUsableBoostWinnerToken rejects a cached winner whose target circuit is
+// open or whose currently selected protocol is degraded. Eviction uses the
+// generation token loaded with the entry, so a concurrent refresh cannot be
+// deleted by this stale observation.
 func (runtime *routingRuntime) loadUsableBoostWinnerToken(key string, rule *config.Rule, now time.Time) (boostWinnerEntry, bool) {
 	if runtime == nil {
 		return boostWinnerEntry{}, false
@@ -153,7 +154,11 @@ func (runtime *routingRuntime) loadUsableBoostWinnerToken(key string, rule *conf
 			}
 		}
 	}
-	if target == nil || runtime.routes.protocolPenalty(rule, target, now) == 0 {
+	if target == nil {
+		return entry, true
+	}
+	snapshot := runtime.routes.snapshot(rule, target.Address, now)
+	if !snapshot.CircuitOpen && runtime.routes.protocolPenalty(rule, target, now) == 0 {
 		return entry, true
 	}
 	runtime.deleteBoostWinnerIfCurrent(boostWinnerToken{
@@ -689,7 +694,9 @@ func (runtime *routingRuntime) raceBoostTargetsPrepared(
 	dial boostDialFunc,
 	prepare boostPrepareFunc,
 ) (dialResult, error) {
-	return runtime.raceBoostTargetsPreparedWithAdmission(ctx, rule, dial, prepare, runtime.acquireBoostTrafficDial)
+	return runtime.raceBoostTargetsPreparedWithAdmissionAndRecovery(
+		ctx, rule, dial, prepare, runtime.acquireBoostTrafficDial, routeRecoveryLease{},
+	)
 }
 
 func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
@@ -698,6 +705,31 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 	dial boostDialFunc,
 	prepare boostPrepareFunc,
 	acquire boostDialAcquireFunc,
+) (dialResult, error) {
+	return runtime.raceBoostTargetsPreparedWithAdmissionAndRecovery(
+		ctx, rule, dial, prepare, acquire, routeRecoveryLease{},
+	)
+}
+
+func (runtime *routingRuntime) raceBoostTargetsPreparedWithRecovery(
+	ctx context.Context,
+	rule *config.Rule,
+	dial boostDialFunc,
+	prepare boostPrepareFunc,
+	recovery routeRecoveryLease,
+) (dialResult, error) {
+	return runtime.raceBoostTargetsPreparedWithAdmissionAndRecovery(
+		ctx, rule, dial, prepare, runtime.acquireBoostTrafficDial, recovery,
+	)
+}
+
+func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmissionAndRecovery(
+	ctx context.Context,
+	rule *config.Rule,
+	dial boostDialFunc,
+	prepare boostPrepareFunc,
+	acquire boostDialAcquireFunc,
+	recovery routeRecoveryLease,
 ) (dialResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -736,13 +768,27 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 		}
 		launched := 0
 		for launched == 0 && actualAttempts < targetAttemptLimit && len(attempted) < len(rule.Targets) {
-			candidates := runtime.routes.selectTargetSelections(
-				rule,
-				len(rule.Targets),
-				time.Now(),
-				attempted,
-				active == 0 && actualAttempts == 0,
-			)
+			var candidates []routeTargetSelection
+			if recovery.token != 0 {
+				if _, alreadyAttempted := attempted[recovery.address]; !alreadyAttempted {
+					if target := targetByAddress(rule, recovery.address); target != nil {
+						candidates = []routeTargetSelection{{
+							target:        target,
+							protocolProbe: recovery.protocolProbe,
+							recoveryProbe: true,
+						}}
+					}
+				}
+			}
+			if len(candidates) == 0 {
+				candidates = runtime.routes.selectTargetSelections(
+					rule,
+					len(rule.Targets),
+					time.Now(),
+					attempted,
+					recovery.token == 0 && active == 0 && actualAttempts == 0,
+				)
+			}
 			if len(candidates) == 0 {
 				break
 			}
@@ -817,10 +863,10 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmission(
 					metricDial(rule.Name, addr, latency, err)
 					finish(dialResult{conn: conn, addr: addr, attempt: attempt, err: err})
 				}()
-				if candidate.protocolProbe.token != 0 {
-					// Do not race a recovery canary against a healthy route. The
-					// canary must receive one legal response (or fail) to promote the
-					// lazy H3 replacement; ordinary alternatives refill on failure.
+				if candidate.protocolProbe.token != 0 || candidate.recoveryProbe {
+					// Do not race a recovery canary against a healthy route. It must
+					// receive one complete setup result; ordinary alternatives refill
+					// the remaining target-attempt slot only after a real failure.
 					break
 				}
 			}
@@ -1022,6 +1068,106 @@ func boostDecisionTimeout(rule *config.Rule) time.Duration {
 	return time.Duration(rule.Timeout) * time.Millisecond
 }
 
+// boostRecoveryPolicy snapshots the routes that could make progress in this
+// decision. A target whose circuit is cooling, whose half-open attempt is
+// already owned, or whose active health is down cannot make a penalized H3
+// recovery route unsafe: it is not an available H2-capable alternative.
+func (runtime *routingRuntime) boostRecoveryPolicy(
+	rule *config.Rule,
+	now time.Time,
+) (map[string]struct{}, map[string]time.Duration, bool) {
+	excluded := make(map[string]struct{}, len(rule.Targets))
+	penalties := make(map[string]time.Duration, len(rule.Targets))
+	seen := make(map[string]struct{}, len(rule.Targets))
+	hasUnpenalized := false
+	for _, target := range rule.Targets {
+		if target == nil || target.Address == "" {
+			continue
+		}
+		if _, duplicate := seen[target.Address]; duplicate {
+			continue
+		}
+		seen[target.Address] = struct{}{}
+		if runtime.health != nil && runtime.health.unhealthy(rule, target.Address) {
+			excluded[target.Address] = struct{}{}
+			continue
+		}
+		snapshot := runtime.routes.snapshot(rule, target.Address, now)
+		if snapshot.CircuitOpen && !snapshot.ProbeRequired {
+			continue
+		}
+		penalty := runtime.routes.protocolPenalty(rule, target, now)
+		penalties[target.Address] = penalty
+		if penalty == 0 {
+			hasUnpenalized = true
+		}
+	}
+	return excluded, penalties, hasUnpenalized
+}
+
+// claimBoostRecoveryProbe composes target-circuit recovery with protocol-level
+// H3 routing state. A penalized route cannot bypass an available unpenalized
+// H2-capable sibling, and a recovery that is also the due H3 probation carries
+// the protocol lease into the actual dial. If every available route is
+// penalized, retain the selector's deliberate fail-open behavior.
+func (runtime *routingRuntime) claimBoostRecoveryProbe(rule *config.Rule, now time.Time) routeRecoveryLease {
+	if runtime == nil || runtime.routes == nil || rule == nil || len(rule.Targets) == 0 ||
+		!runtime.routes.recoveryProbeDue(rule, now) {
+		return routeRecoveryLease{}
+	}
+	excluded, penalties, hasUnpenalized := runtime.boostRecoveryPolicy(rule, now)
+	protocolRecoveryDue := runtime.connectProxy != nil && runtime.connectProxy.h3RuleBreaker != nil &&
+		runtime.connectProxy.h3RuleBreaker.recoveryProbeDue(rule.Name, now)
+	if protocolRecoveryDue {
+		// Rule-level recovery owns this request's H3 opportunity. A due target
+		// circuit that cannot participate in mixed H3/H2 probation must not take
+		// the serial recovery slot before the ordinary selector reserves the
+		// eligible mixed canary.
+		for _, target := range rule.Targets {
+			if target != nil && !targetUsesMixedHTTP3First(target) {
+				excluded[target.Address] = struct{}{}
+			}
+		}
+	}
+	if hasUnpenalized {
+		for address, penalty := range penalties {
+			if penalty > 0 {
+				excluded[address] = struct{}{}
+			}
+		}
+	}
+	recovery, claimed := runtime.routes.claimRecoveryProbe(rule, now, excluded)
+	if !claimed {
+		return routeRecoveryLease{}
+	}
+	target := targetByAddress(rule, recovery.address)
+	if target == nil || penalties[recovery.address] <= 0 {
+		return recovery
+	}
+	if probe, probeClaimed := runtime.routes.claimProtocolProbe(rule, target, now); probeClaimed {
+		recovery.protocolProbe = probe
+		return recovery
+	}
+
+	// Another request may have claimed protocol probation after the first
+	// snapshot. Refresh before using the fail-open path: once an ordinary route
+	// becomes unpenalized, this recovery must no longer bypass it.
+	_, _, hasUnpenalized = runtime.boostRecoveryPolicy(rule, now)
+	if hasUnpenalized {
+		runtime.routes.releaseRecoveryProbe(recovery)
+		return routeRecoveryLease{}
+	}
+	return recovery
+}
+
+func (runtime *routingRuntime) releaseBoostRecoveryProbe(rule *config.Rule, recovery routeRecoveryLease) {
+	if runtime == nil || runtime.routes == nil {
+		return
+	}
+	runtime.routes.releaseProtocolProbe(rule, targetByAddress(rule, recovery.address), recovery.protocolProbe)
+	runtime.routes.releaseRecoveryProbe(recovery)
+}
+
 // HandleBoost races fresh dials, picks the first successful route, and relays
 // until either side finishes or ctx is cancelled.
 func HandleBoost(ctx context.Context, conn net.Conn, rule *config.Rule) {
@@ -1061,80 +1207,96 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		}
 	}
 
-	if cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
-		cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
-		triggerLazy := rule.Protocol != config.ProtocolSOCKS5 && time.Until(cached.expires) < boostRevalidateAfter
-		outcome, err := runtime.raceCachedBoostTarget(decisionCtx, rule, cached.addr, prepare)
-		if err == nil {
-			cacheHit, winnerToken := runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, true)
-			if cacheHit {
-				metricBoostCache(rule.Name, true)
-			} else {
-				metricBoostCache(rule.Name, false)
-			}
-			defer outcome.winner.conn.Close()
-			if err := markSOCKS5Connected(conn); err != nil {
+	// Reserve at most one due target-circuit recovery per rule. Only its owner
+	// bypasses the cached winner; concurrent requests keep using the healthy
+	// cached path instead of queueing behind the half-open probe. The combined
+	// helper also applies protocol health and carries an exclusive H3 recovery
+	// lease when target-circuit recovery and protocol probation are both due.
+	recovery := runtime.claimBoostRecoveryProbe(rule, time.Now())
+
+	if recovery.token == 0 {
+		if cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
+			cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
+			triggerLazy := rule.Protocol != config.ProtocolSOCKS5 && time.Until(cached.expires) < boostRevalidateAfter
+			outcome, err := runtime.raceCachedBoostTarget(decisionCtx, rule, cached.addr, prepare)
+			if err == nil {
+				cacheHit, winnerToken := runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, true)
+				if cacheHit {
+					metricBoostCache(rule.Name, true)
+				} else {
+					metricBoostCache(rule.Name, false)
+				}
+				defer outcome.winner.conn.Close()
+				if err := markSOCKS5Connected(conn); err != nil {
+					return
+				}
+				// A true cache hit deliberately does not extend expires. Otherwise
+				// steady traffic would postpone lazy revalidation forever. A fallback or
+				// hedge win is fresh route evidence and replaces the cached winner, except
+				// when a destination-specific CONNECT response preserved the old winner.
+				if cacheHit && triggerLazy {
+					runtime.startLazyRevalidate(ctx, rule)
+				}
+				if entry := utils.Logger.Check(zap.DebugLevel, "建立连接"); entry != nil {
+					fields := []zap.Field{
+						zap.String("ruleName", rule.Name),
+						zap.String("remoteAddr", connAddr(conn)),
+						zap.String("targetAddr", connAddr(outcome.winner.conn)),
+						zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
+						zap.Bool("boostCacheHit", cacheHit),
+						zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
+						zap.Bool("boostHedged", outcome.hedged),
+						zap.Bool("boostWinnerPreserved", outcome.cachedFailureNeutral),
+					}
+					if cacheHit && triggerLazy {
+						fields = append(fields, zap.Bool("boostLazyRefresh", true))
+					}
+					entry.Write(fields...)
+				}
+				cancelDecision()
+				finishDecision()
+				result := relayBidirectional(ctx, conn, outcome.winner.conn)
+				logRelayResult(rule, conn, outcome.winner.conn, result)
+				runtime.finishBoostRelay(winnerToken, outcome.winner.attempt, result)
 				return
 			}
-			// A true cache hit deliberately does not extend expires. Otherwise
-			// steady traffic would postpone lazy revalidation forever. A fallback or
-			// hedge win is fresh route evidence and replaces the cached winner, except
-			// when a destination-specific CONNECT response preserved the old winner.
-			fields := []zap.Field{
-				zap.String("ruleName", rule.Name),
-				zap.String("remoteAddr", connAddr(conn)),
-				zap.String("targetAddr", connAddr(outcome.winner.conn)),
-				zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
-				zap.Bool("boostCacheHit", cacheHit),
-				zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
-				zap.Bool("boostHedged", outcome.hedged),
-				zap.Bool("boostWinnerPreserved", outcome.cachedFailureNeutral),
+			runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, false)
+			if isDialBulkheadError(err) && !outcome.cachedFailed {
+				// Local dial pressure says nothing about the cached route's health. Keep
+				// the winner so a later connection can reuse it after capacity drains.
+				utils.Logger.Debug("前台拨号容量暂时不可用，保留 Boost winner 并结束当前连接",
+					zap.String("ruleName", rule.Name),
+					zap.String("targetAddr", cached.addr),
+					zap.Error(err))
+				return
 			}
-			if cacheHit && triggerLazy {
-				fields = append(fields, zap.Bool("boostLazyRefresh", true))
-				runtime.startLazyRevalidate(ctx, rule)
+			metricBoostCache(rule.Name, false)
+			if ctx.Err() != nil {
+				return
 			}
-			utils.Logger.Debug("建立连接", fields...)
-			cancelDecision()
-			finishDecision()
-			result := relayBidirectional(ctx, conn, outcome.winner.conn)
-			logRelayResult(rule, conn, outcome.winner.conn, result)
-			runtime.finishBoostRelay(winnerToken, outcome.winner.attempt, result)
+			if rule.Protocol == config.ProtocolSOCKS5 {
+				setPendingSOCKS5Failure(conn, err)
+				logConnectProxyFailure(rule, cached.addr, err, "缓存原生代理线路及备选均不可用")
+			} else {
+				utils.Logger.Error("缓存线路及备选均不可用",
+					zap.String("ruleName", rule.Name),
+					zap.String("targetAddr", cached.addr),
+					zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
+					zap.Bool("boostHedged", outcome.hedged),
+					zap.Error(err))
+			}
 			return
 		}
-		runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, false)
-		if isDialBulkheadError(err) && !outcome.cachedFailed {
-			// Local dial pressure says nothing about the cached route's health. Keep
-			// the winner so a later connection can reuse it after capacity drains.
-			utils.Logger.Debug("前台拨号容量暂时不可用，保留 Boost winner 并结束当前连接",
-				zap.String("ruleName", rule.Name),
-				zap.String("targetAddr", cached.addr),
-				zap.Error(err))
-			return
-		}
-		metricBoostCache(rule.Name, false)
-		if ctx.Err() != nil {
-			return
-		}
-		if rule.Protocol == config.ProtocolSOCKS5 {
-			setPendingSOCKS5Failure(conn, err)
-			logConnectProxyFailure(rule, cached.addr, err, "缓存原生代理线路及备选均不可用")
-		} else {
-			utils.Logger.Error("缓存线路及备选均不可用",
-				zap.String("ruleName", rule.Name),
-				zap.String("targetAddr", cached.addr),
-				zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
-				zap.Bool("boostHedged", outcome.hedged),
-				zap.Error(err))
-		}
-		return
 	}
 	metricBoostCache(rule.Name, false)
 
 	dial := boostDialFunc(func(dialCtx context.Context, addr string) (net.Conn, error) {
 		return runtime.dialRouteTarget(dialCtx, rule, addr)
 	})
-	winner, err := runtime.raceBoostTargetsPrepared(decisionCtx, rule, dial, prepare)
+	winner, err := func() (dialResult, error) {
+		defer runtime.releaseBoostRecoveryProbe(rule, recovery)
+		return runtime.raceBoostTargetsPreparedWithRecovery(decisionCtx, rule, dial, prepare, recovery)
+	}()
 	if err != nil {
 		if isDialBulkheadError(err) {
 			utils.Logger.Debug("前台拨号容量暂时不可用，结束当前 Boost 连接",
@@ -1155,12 +1317,14 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		return
 	}
 	winnerToken := runtime.storeBoostWinner(key, winner.addr)
-	utils.Logger.Debug("建立连接",
-		zap.String("ruleName", rule.Name),
-		zap.String("remoteAddr", connAddr(conn)),
-		zap.String("targetAddr", connAddr(winner.conn)),
-		zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
-		zap.Bool("boostCacheHit", false))
+	if entry := utils.Logger.Check(zap.DebugLevel, "建立连接"); entry != nil {
+		entry.Write(
+			zap.String("ruleName", rule.Name),
+			zap.String("remoteAddr", connAddr(conn)),
+			zap.String("targetAddr", connAddr(winner.conn)),
+			zap.Int64("decisionTime(ms)", time.Since(decisionBegin).Milliseconds()),
+			zap.Bool("boostCacheHit", false))
+	}
 	cancelDecision()
 	finishDecision()
 	result := relayBidirectional(ctx, conn, winner.conn)

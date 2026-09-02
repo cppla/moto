@@ -5,6 +5,7 @@ import (
 	"errors"
 	"moto/config"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -72,6 +73,9 @@ func TestOperationalGaugesExposeRouteAndPrewarmState(t *testing.T) {
 		`moto_route_latency_ewma_seconds{rule="gauges",mode="boost",target="upstream:443"} 0.025`,
 		`moto_route_consecutive_failures{rule="gauges",mode="boost",target="upstream:443"} 1`,
 		`moto_route_circuit_open{rule="gauges",mode="boost",target="upstream:443"} 0`,
+		`moto_route_circuit_cooldown_remaining_seconds{rule="gauges",mode="boost",target="upstream:443"} 0`,
+		`moto_route_probe_due{rule="gauges",mode="boost",target="upstream:443"} 0`,
+		`moto_route_last_recovery_timestamp_seconds{rule="gauges",mode="boost",target="upstream:443"} 0`,
 		`moto_prewarm_desired_connections{target="upstream:443"} 3`,
 		`moto_prewarm_warming_connections{target="upstream:443"} 1`,
 		`moto_prewarm_consecutive_failures{target="upstream:443"} 2`,
@@ -85,6 +89,76 @@ func TestOperationalGaugesExposeRouteAndPrewarmState(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics output missing %q\noutput:\n%s", want, body)
 		}
+	}
+}
+
+func TestOperationalGaugesExposeRouteCircuitRecoveryPhases(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	now := time.Now()
+	recoveredAt := time.Unix(1788256000, 0)
+	runtime.routes.Lock()
+	runtime.routes.states[routeHealthKey{rule: "phase-rule", addr: "cooling:443"}] = &routeHealthState{
+		ruleName:    "phase-rule",
+		mode:        config.ModeBoost,
+		observed:    true,
+		circuitOpen: true,
+		openUntil:   now.Add(30 * time.Second),
+	}
+	runtime.routes.states[routeHealthKey{rule: "phase-rule", addr: "due:443"}] = &routeHealthState{
+		ruleName:    "phase-rule",
+		mode:        config.ModeBoost,
+		observed:    true,
+		circuitOpen: true,
+		openUntil:   now.Add(-time.Second),
+	}
+	runtime.routes.states[routeHealthKey{rule: "phase-rule", addr: "probing:443"}] = &routeHealthState{
+		ruleName:    "phase-rule",
+		mode:        config.ModeBoost,
+		observed:    true,
+		circuitOpen: true,
+		halfOpen:    true,
+		openUntil:   now.Add(-time.Second),
+	}
+	runtime.routes.states[routeHealthKey{rule: "phase-rule", addr: "recovered:443"}] = &routeHealthState{
+		ruleName:     "phase-rule",
+		mode:         config.ModeBoost,
+		observed:     true,
+		lastRecovery: recoveredAt,
+	}
+	runtime.routes.Unlock()
+
+	var output strings.Builder
+	runtime.renderOperationalGauges(&output)
+	body := output.String()
+	wants := []string{
+		`moto_route_probe_due{rule="phase-rule",mode="boost",target="cooling:443"} 0`,
+		`moto_route_probe_due{rule="phase-rule",mode="boost",target="due:443"} 1`,
+		`moto_route_probe_due{rule="phase-rule",mode="boost",target="probing:443"} 0`,
+		`moto_route_half_open{rule="phase-rule",mode="boost",target="probing:443"} 1`,
+		`moto_route_last_recovery_timestamp_seconds{rule="phase-rule",mode="boost",target="recovered:443"} 1788256000`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q\noutput:\n%s", want, body)
+		}
+	}
+
+	prefix := `moto_route_circuit_cooldown_remaining_seconds{rule="phase-rule",mode="boost",target="cooling:443"} `
+	remaining := -1.0
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		value, err := strconv.ParseFloat(strings.TrimPrefix(line, prefix), 64)
+		if err != nil {
+			t.Fatalf("parse cooldown metric %q: %v", line, err)
+		}
+		remaining = value
+		break
+	}
+	if remaining <= 0 || remaining > 30 {
+		t.Fatalf("cooldown remaining = %v, want (0, 30]", remaining)
 	}
 }
 

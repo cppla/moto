@@ -126,6 +126,10 @@ def attempt_metrics_body(
     h2_failures: int = 0,
     h2_last_attempt: int = 0,
     h2_circuit_open: int = 0,
+    h2_half_open: int = 0,
+    h2_cooldown_remaining: float = 0,
+    h2_probe_due: int = 0,
+    h2_last_recovery: int = 0,
     h3_consecutive_failures: int = 0,
     h2_consecutive_failures: int = 0,
 ) -> str:
@@ -139,6 +143,10 @@ def attempt_metrics_body(
             "last_attempt": h3_last_attempt,
             "ewma": 0.12,
             "circuit_open": 0,
+            "half_open": 0,
+            "cooldown_remaining": 0,
+            "probe_due": 0,
+            "last_recovery": 0,
         },
         "h2.example:443": {
             "attempts": h2_attempts,
@@ -149,6 +157,10 @@ def attempt_metrics_body(
             "last_attempt": h2_last_attempt,
             "ewma": 0.18,
             "circuit_open": h2_circuit_open,
+            "half_open": h2_half_open,
+            "cooldown_remaining": h2_cooldown_remaining,
+            "probe_due": h2_probe_due,
+            "last_recovery": h2_last_recovery,
         },
     }
     lines = []
@@ -164,7 +176,10 @@ def attempt_metrics_body(
                 f'moto_route_observed{{{labels}}} 1',
                 f'moto_route_consecutive_failures{{{labels}}} {values["consecutive_failures"]}',
                 f'moto_route_circuit_open{{{labels}}} {values["circuit_open"]}',
-                f'moto_route_half_open{{{labels}}} 0',
+                f'moto_route_half_open{{{labels}}} {values["half_open"]}',
+                f'moto_route_circuit_cooldown_remaining_seconds{{{labels}}} {values["cooldown_remaining"]}',
+                f'moto_route_probe_due{{{labels}}} {values["probe_due"]}',
+                f'moto_route_last_recovery_timestamp_seconds{{{labels}}} {values["last_recovery"]}',
                 f'moto_route_last_attempt_timestamp_seconds{{{labels}}} {values["last_attempt"]}',
                 f'moto_active_health_unhealthy{{{labels}}} 0',
             ]
@@ -605,6 +620,78 @@ class RouteWatchTest(unittest.TestCase):
         self.assertEqual(by_target["h3.example:443"].latency_ewma_seconds, 0.12)
         self.assertEqual(by_target["h3.example:443"].status, "healthy")
         self.assertEqual(by_target["h2.example:443"].status, "circuit_open")
+
+    def test_target_circuit_recovery_phases_are_distinct(self) -> None:
+        cases = [
+            (
+                "cooling_down",
+                {"h2_circuit_open": 1, "h2_cooldown_remaining": 17.5},
+                "冷却中 18s",
+            ),
+            (
+                "probe_due",
+                {"h2_circuit_open": 1, "h2_probe_due": 1},
+                "等待半开",
+            ),
+            (
+                "half_open",
+                {"h2_circuit_open": 1, "h2_half_open": 1},
+                "半开探测中",
+            ),
+            (
+                "recently_recovered",
+                {"h2_last_recovery": 190},
+                "已恢复",
+            ),
+            (
+                "healthy",
+                {"h2_last_recovery": 50},
+                "健康",
+            ),
+        ]
+        for expected_status, arguments, expected_text in cases:
+            with self.subTest(status=expected_status):
+                sample = WATCH.parse_metrics(
+                    metrics_body() + attempt_metrics_body(**arguments),
+                    220.0,
+                    220.0,
+                )
+                attempts = WATCH.build_attempt_window(sample, None)
+                target = next(
+                    item
+                    for item in attempts.targets
+                    if item.target == "h2.example:443"
+                )
+
+                self.assertEqual(target.status, expected_status)
+                self.assertEqual(
+                    WATCH.target_attempt_status_text(target, color=False),
+                    expected_text,
+                )
+
+    def test_target_attempt_json_exposes_recovery_observability(self) -> None:
+        sample = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body(
+                h2_circuit_open=1,
+                h2_cooldown_remaining=12.25,
+                h2_probe_due=0,
+                h2_last_recovery=180,
+            ),
+            200.0,
+            200.0,
+        )
+        attempts = WATCH.build_attempt_window(sample, None)
+        target = next(
+            item for item in attempts.targets if item.target == "h2.example:443"
+        )
+        payload = WATCH.target_attempt_to_dict(target, sample.wall_time)
+
+        self.assertEqual(payload["circuit_cooldown_remaining_seconds"], 12.25)
+        self.assertFalse(payload["probe_due"])
+        self.assertEqual(payload["last_recovery_timestamp_seconds"], 180.0)
+        self.assertEqual(payload["last_recovery_age_seconds"], 20.0)
+        self.assertEqual(payload["status"], "cooling_down")
 
     def test_failed_target_is_kept_even_without_a_successful_tunnel_series(self) -> None:
         def failed_target_body(attempts: int, failures: int, last_attempt: int) -> str:

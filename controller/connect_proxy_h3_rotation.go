@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"moto/config"
 	"moto/utils"
 	"sync/atomic"
 	"time"
@@ -46,10 +47,38 @@ type http3RotationMetricKey struct {
 }
 
 type http3TunnelStats struct {
+	slot                *http3ConnectTransportSlot
+	ruleName            string
+	target              *config.Target
+	destination         string
+	userAgent           string
+	probation           http3RuleProbationBinding
+	pending             atomic.Int64
+	writeStarted        atomic.Int64
+	pendingReads        atomic.Int64
+	readStarted         atomic.Int64
+	payloadRead         atomic.Uint64
+	payloadWritten      atomic.Uint64
+	lastReadProgress    atomic.Int64
+	lastPayloadProgress atomic.Int64
+	fastFailSelected    atomic.Bool
+	closed              atomic.Bool
+	fastFail            func() bool
+}
+
+type http3UDPBlackholeProbe struct {
+	ruleName    string
+	target      *config.Target
+	destination string
+	userAgent   string
+}
+
+type http3UDPBlackholeEvent struct {
+	key          http3ConnectTransportKey
 	slot         *http3ConnectTransportSlot
-	probation    http3RuleProbationBinding
-	pending      atomic.Int64
-	writeStarted atomic.Int64
+	connectionID uint64
+	generationID uint64
+	probes       []http3UDPBlackholeProbe
 }
 
 type http3DegradationSnapshot struct {
@@ -58,6 +87,7 @@ type http3DegradationSnapshot struct {
 	connection   http3StatsConnection
 	connectionID uint64
 	payloadBytes uint64
+	payloadRead  uint64
 	blocked      int
 	peakBlocked  int
 	tunnels      []*http3TunnelStats
@@ -216,8 +246,11 @@ func (manager *http3ConnectManager) startHTTP3SamplerLocked() {
 		defer ticker.Stop()
 		for {
 			select {
-			case sampledAt := <-ticker.C:
-				manager.sampleHTTP3DegradationAt(sampledAt)
+			case <-ticker.C:
+				// Ticker values are scheduled timestamps and may be stale after the
+				// process is descheduled or the host resumes from sleep. Sampling at
+				// processing time lets the detector reset on the real long gap.
+				manager.sampleHTTP3DegradationAt(manager.timeNow())
 			case <-ctx.Done():
 				return
 			}
@@ -270,6 +303,7 @@ func (manager *http3ConnectManager) sampleHTTP3DegradationAt(now time.Time) {
 				tunnels = append(tunnels, tunnel)
 			}
 			payloadBytes := saturatingAdd(slot.payloadRead.Load(), slot.payloadWritten.Load())
+			payloadRead := slot.payloadRead.Load()
 			if payloadBytes > slot.lastSampledPayload {
 				slot.lastPayloadProgress.Store(now.UnixNano())
 			}
@@ -280,6 +314,7 @@ func (manager *http3ConnectManager) sampleHTTP3DegradationAt(now time.Time) {
 				connection:   slot.connection,
 				connectionID: slot.connectionID,
 				payloadBytes: payloadBytes,
+				payloadRead:  payloadRead,
 				blocked:      pending,
 				peakBlocked:  peakBlocked,
 				tunnels:      tunnels,
@@ -294,11 +329,14 @@ func (manager *http3ConnectManager) sampleHTTP3DegradationAt(now time.Time) {
 			At:                    now,
 			Stats:                 snapshot.connection.ConnectionStats(),
 			PayloadBytes:          snapshot.payloadBytes,
+			PayloadReadBytes:      snapshot.payloadRead,
 			BlockedWrites:         snapshot.blocked,
 			PeakBlockedWrites:     snapshot.peakBlocked,
 			HistoricalBaselineRTT: snapshot.historical,
 		}
 		sample.OldestBlockedFor, sample.LongBlockedWrites = http3BlockedWriteDurations(now, snapshot.tunnels)
+		sample.BlockedReads, sample.OldestReadBlockedFor, sample.RecentReadDemand =
+			http3BlockedReadDemand(now, snapshot.tunnels)
 		lastProgress := snapshot.slot.lastPayloadProgress.Load()
 		if demandStarted := snapshot.slot.demandStarted.Load(); demandStarted > lastProgress {
 			lastProgress = demandStarted
@@ -325,6 +363,8 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 	var degraded func(http3ConnectTransportKey, http3DegradationReason)
 	var connectionDegraded func(http3RuleDegradationEvent)
 	var connectionEvent http3RuleDegradationEvent
+	var udpBlackhole func(http3UDPBlackholeEvent)
+	var udpBlackholeEvent http3UDPBlackholeEvent
 	manager.mu.Lock()
 	slot := snapshot.slot
 	if manager.retired || !manager.containsSlotLocked(snapshot.key, slot) ||
@@ -354,21 +394,51 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 		manager.mu.Unlock()
 		return
 	}
-	if slot.health != http3TransportDegraded {
+	firstDegradation := slot.health != http3TransportDegraded
+	blackholeUpgrade := !firstDegradation && decision.Reason == http3DegradationReasonUDPBlackhole &&
+		slot.rotationReason != http3DegradationReasonUDPBlackhole
+	if firstDegradation || blackholeUpgrade {
 		slot.health = http3TransportDegraded
 		slot.rotationReason = decision.Reason
 		manager.recordHTTP3RotationEventLocked(snapshot.key, string(decision.Reason), "detected")
 		transition = &http3DegradationLogEvent{key: snapshot.key, decision: decision}
-		if !manager.hasHealthyHTTP3ServingSlotLocked(snapshot.key) {
-			degraded = manager.onDegraded
+		if firstDegradation {
+			if !manager.hasHealthyHTTP3ServingSlotLocked(snapshot.key) {
+				degraded = manager.onDegraded
+			}
+			connectionDegraded = manager.onConnectionDegraded
+			connectionEvent = http3RuleDegradationEvent{
+				key:          snapshot.key,
+				remoteIP:     slot.remoteIP,
+				generationID: slot.generationID,
+				at:           sample.At,
+				reason:       decision.Reason,
+			}
 		}
-		connectionDegraded = manager.onConnectionDegraded
-		connectionEvent = http3RuleDegradationEvent{
-			key:          snapshot.key,
-			remoteIP:     slot.remoteIP,
-			generationID: slot.generationID,
-			at:           sample.At,
-			reason:       decision.Reason,
+		if decision.Reason == http3DegradationReasonUDPBlackhole {
+			udpBlackhole = manager.onUDPBlackhole
+			udpBlackholeEvent = http3UDPBlackholeEvent{
+				key:          snapshot.key,
+				slot:         slot,
+				connectionID: slot.connectionID,
+				generationID: slot.generationID,
+				probes:       make([]http3UDPBlackholeProbe, 0, len(slot.tunnels)),
+			}
+			for tunnel := range slot.tunnels {
+				if tunnel == nil || tunnel.closed.Load() {
+					continue
+				}
+				// A complete UDP blackhole is physical-connection scoped. Include
+				// every active rule on this QUIC generation, even if this stream is
+				// idle or only just blocked. The drain monitor still applies the full
+				// per-stream stall timeout and confirmations before cancellation.
+				udpBlackholeEvent.probes = append(udpBlackholeEvent.probes, http3UDPBlackholeProbe{
+					ruleName:    tunnel.ruleName,
+					target:      tunnel.target,
+					destination: tunnel.destination,
+					userAgent:   tunnel.userAgent,
+				})
+			}
 		}
 	}
 	candidate, err := manager.ensureHTTP3RotationCandidateLocked(snapshot.key, slot, sample.At)
@@ -398,6 +468,9 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 	}
 	if connectionDegraded != nil {
 		connectionDegraded(connectionEvent)
+	}
+	if udpBlackhole != nil && len(udpBlackholeEvent.probes) > 0 {
+		udpBlackhole(udpBlackholeEvent)
 	}
 }
 
@@ -432,6 +505,58 @@ func http3BlockedWriteDurations(now time.Time, tunnels []*http3TunnelStats) (tim
 	return oldest, longBlocked
 }
 
+// http3BlockedReadDemand distinguishes an actively interrupted downstream flow
+// from an ordinary idle CONNECT. Every idle tunnel can have a Read blocked in
+// relayBidirectional, so a pending Read alone is never demand. The stream must
+// also have transferred a meaningful amount of downstream payload recently.
+func http3BlockedReadDemand(
+	now time.Time,
+	tunnels []*http3TunnelStats,
+) (blocked int, oldest time.Duration, recent bool) {
+	for _, tunnel := range tunnels {
+		blockedFor, ok := http3TunnelReadBlockedFor(tunnel, now)
+		if !ok {
+			continue
+		}
+		blocked++
+		if blockedFor > oldest {
+			oldest = blockedFor
+		}
+		if http3TunnelHasRecentReadDemand(tunnel, now) {
+			recent = true
+		}
+	}
+	return blocked, oldest, recent
+}
+
+func http3TunnelReadBlockedFor(tunnel *http3TunnelStats, now time.Time) (time.Duration, bool) {
+	if tunnel == nil || tunnel.pendingReads.Load() <= 0 {
+		return 0, false
+	}
+	startedUnix := tunnel.readStarted.Load()
+	if startedUnix <= 0 {
+		return 0, false
+	}
+	started := time.Unix(0, startedUnix)
+	if started.After(now) {
+		return 0, false
+	}
+	return now.Sub(started), true
+}
+
+func http3TunnelHasRecentReadDemand(tunnel *http3TunnelStats, now time.Time) bool {
+	if _, blocked := http3TunnelReadBlockedFor(tunnel, now); !blocked ||
+		tunnel.payloadRead.Load() < http3UDPBlackholeRecentReadMinBytes {
+		return false
+	}
+	progressUnix := tunnel.lastReadProgress.Load()
+	if progressUnix <= 0 {
+		return false
+	}
+	progressAt := time.Unix(0, progressUnix)
+	return !progressAt.After(now) && now.Sub(progressAt) <= http3UDPBlackholeRecentReadWindow
+}
+
 func (manager *http3ConnectManager) learnHealthyHTTP3RTTLocked(key http3ConnectTransportKey, observed time.Duration) {
 	if observed <= 0 {
 		return
@@ -453,10 +578,14 @@ func (manager *http3ConnectManager) ensureHTTP3RotationCandidateLocked(
 		return nil, nil
 	}
 	if source.replacement != nil && source.replacement.lifecycle == http3TransportWarming {
+		source.replacement.rotationReason = source.rotationReason
 		return source.replacement, nil
 	}
 	for _, slot := range manager.transports[key] {
 		if slot != nil && slot.lifecycle == http3TransportWarming {
+			if slot.replaces == source {
+				slot.rotationReason = source.rotationReason
+			}
 			return slot, nil
 		}
 	}
@@ -505,33 +634,41 @@ func (manager *http3ConnectManager) markHTTP3CandidateFailed(
 	key http3ConnectTransportKey,
 	candidate *http3ConnectTransportSlot,
 	cause error,
-) bool {
+) (*http3ConnectTransportSlot, bool) {
 	if manager == nil || candidate == nil {
-		return false
+		return nil, false
 	}
 	manager.mu.Lock()
 	if candidate.lifecycle != http3TransportWarming || !manager.containsSlotLocked(key, candidate) {
 		manager.mu.Unlock()
-		return false
+		return nil, false
 	}
 	candidate.lifecycle = http3TransportFailed
 	source := candidate.replaces
+	var retrySource *http3ConnectTransportSlot
 	if source != nil && source.replacement == candidate {
 		source.replacement = nil
-		if source.lifecycle == http3TransportServing {
+		if source.lifecycle == http3TransportServing && manager.containsSlotLocked(key, source) && source.transport != nil {
 			source.rotationFailures++
 			source.retryAt = manager.timeNow().Add(http3RotationBackoff(source.rotationFailures))
+			retrySource = source
 		}
 	}
 	candidate.replaces = nil
 	manager.recordHTTP3RotationEventLocked(key, string(candidate.rotationReason), "candidate_failed")
 	retryAfter := http3RotationBackoff(max(1, sourceRotationFailures(source)))
 	manager.mu.Unlock()
-	utils.Logger.Warn("HTTP/3 轮换候选建立失败，继续使用旧连接",
-		zap.String("targetAddr", key.address),
-		zap.Duration("retryAfter", retryAfter),
-		zap.Error(cause))
-	return true
+	if retrySource != nil {
+		utils.Logger.Warn("HTTP/3 轮换候选建立失败，继续使用旧连接",
+			zap.String("targetAddr", key.address),
+			zap.Duration("retryAfter", retryAfter),
+			zap.Error(cause))
+	} else {
+		utils.Logger.Warn("HTTP/3 轮换候选建立失败，旧连接已不可复用",
+			zap.String("targetAddr", key.address),
+			zap.Error(cause))
+	}
+	return retrySource, true
 }
 
 func sourceRotationFailures(source *http3ConnectTransportSlot) int {
@@ -577,7 +714,7 @@ func (manager *http3ConnectManager) promoteHTTP3Candidate(
 			manager.removeSlotLocked(key, source)
 			closeSource = source
 		} else {
-			forcedDrain = manager.prepareHTTP3ForcedDrainLocked(key, source, manager.timeNow())
+			forcedDrain = manager.prepareHTTP3ForcedDrainLocked(key, source, manager.timeNow(), nil)
 		}
 	}
 	manager.recordHTTP3RotationEventLocked(key, string(candidate.rotationReason), "promoted")
@@ -605,10 +742,14 @@ func (manager *http3ConnectManager) promoteHTTP3Candidate(
 		zap.String("oldState", string(http3TransportDraining)))
 }
 
-func (manager *http3ConnectManager) registerHTTP3Tunnel(slot *http3ConnectTransportSlot) *http3TunnelStats {
-	if manager == nil || slot == nil {
+func (manager *http3ConnectManager) registerHTTP3Tunnel(
+	stats *http3TunnelStats,
+) *http3TunnelStats {
+	if manager == nil || stats == nil || stats.slot == nil {
 		return nil
 	}
+	slot := stats.slot
+	now := manager.timeNow()
 	manager.mu.Lock()
 	binding := http3RuleProbationBinding{}
 	if slot.connection != nil && slot.generationID != 0 {
@@ -619,7 +760,8 @@ func (manager *http3ConnectManager) registerHTTP3Tunnel(slot *http3ConnectTransp
 			payloadBytes: saturatingAdd(slot.payloadRead.Load(), slot.payloadWritten.Load()),
 		}
 	}
-	stats := &http3TunnelStats{slot: slot, probation: binding}
+	stats.probation = binding
+	stats.lastPayloadProgress.Store(now.UnixNano())
 	if slot.tunnels == nil {
 		slot.tunnels = make(map[*http3TunnelStats]struct{})
 	}
@@ -632,6 +774,7 @@ func (manager *http3ConnectManager) unregisterHTTP3Tunnel(slot *http3ConnectTran
 	if manager == nil || slot == nil || stats == nil {
 		return
 	}
+	stats.closed.Store(true)
 	manager.mu.Lock()
 	delete(slot.tunnels, stats)
 	manager.mu.Unlock()
@@ -641,7 +784,32 @@ func (stats *http3TunnelStats) recordRead(bytes int) {
 	if stats == nil || stats.slot == nil || bytes <= 0 {
 		return
 	}
+	stats.payloadRead.Add(uint64(bytes))
 	stats.slot.payloadRead.Add(uint64(bytes))
+	now := time.Now().UnixNano()
+	stats.lastReadProgress.Store(now)
+	stats.lastPayloadProgress.Store(now)
+}
+
+func (stats *http3TunnelStats) beginRead() {
+	if stats == nil || stats.slot == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	if stats.pendingReads.Add(1) == 1 {
+		stats.readStarted.Store(now)
+	}
+}
+
+func (stats *http3TunnelStats) finishRead(bytes int) {
+	if stats == nil || stats.slot == nil {
+		return
+	}
+	stats.recordRead(bytes)
+	started := stats.readStarted.Load()
+	if stats.pendingReads.Add(-1) == 0 {
+		stats.readStarted.CompareAndSwap(started, 0)
+	}
 }
 
 func (stats *http3TunnelStats) beginWrite() {
@@ -669,7 +837,9 @@ func (stats *http3TunnelStats) finishWrite(bytes int) {
 		return
 	}
 	if bytes > 0 {
+		stats.payloadWritten.Add(uint64(bytes))
 		stats.slot.payloadWritten.Add(uint64(bytes))
+		stats.lastPayloadProgress.Store(time.Now().UnixNano())
 	}
 	started := stats.writeStarted.Load()
 	if stats.pending.Add(-1) == 0 {
@@ -680,6 +850,25 @@ func (stats *http3TunnelStats) finishWrite(bytes int) {
 	// after this Add returned zero. demandStarted is overwritten whenever the
 	// next 0->1 transition begins, so it needs no racy clearing operation.
 	stats.slot.pendingWrites.Add(-1)
+}
+
+func (stats *http3TunnelStats) payloadBytes() uint64 {
+	if stats == nil {
+		return 0
+	}
+	return saturatingAdd(stats.payloadRead.Load(), stats.payloadWritten.Load())
+}
+
+// selectFastFail reserves the one stream-scoped cancellation. The hook is
+// intentionally invoked by the drain monitor only after manager.mu is
+// released; context cancellation and response-body closing may synchronously
+// enter quic-go and must never run while the transport registry is locked.
+func (stats *http3TunnelStats) selectFastFail() (func() bool, bool) {
+	if stats == nil || stats.fastFail == nil || stats.closed.Load() ||
+		!stats.fastFailSelected.CompareAndSwap(false, true) {
+		return nil, false
+	}
+	return stats.fastFail, true
 }
 
 func (manager *http3ConnectManager) containsSlotLocked(key http3ConnectTransportKey, slot *http3ConnectTransportSlot) bool {
@@ -734,8 +923,14 @@ func logHTTP3DegradationTransition(event http3DegradationLogEvent) {
 		zap.Duration("smoothedRTT", signals.SmoothedRTT),
 		zap.Float64("lossRate", signals.LossRate),
 		zap.Int("blockedWrites", signals.BlockedWrites),
+		zap.Int("blockedReads", signals.BlockedReads),
 		zap.Duration("oldestBlockedFor", signals.OldestBlockedFor),
+		zap.Bool("recentReadDemand", signals.ReadDemand),
+		zap.Duration("oldestReadBlockedFor", signals.OldestReadBlockedFor),
 		zap.Float64("payloadBytesPerSecond", signals.PayloadBytesPerSecond),
+		zap.Bool("sentWithoutReceive", signals.SentNoReceive),
+		zap.Duration("noReceiveFor", signals.NoReceiveFor),
+		zap.Int("blackholeWindows", signals.BlackholeWindows),
 	}
 	if event.err != nil {
 		fields = append(fields, zap.Error(event.err))

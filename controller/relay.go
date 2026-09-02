@@ -115,25 +115,23 @@ func relayBidirectional(ctx context.Context, client, target net.Conn) relayResul
 
 	started := time.Now()
 	results := make(chan namedRelayResult, 2)
-	finished := make(chan struct{})
-	watcherDone := make(chan struct{})
 	interrupt := func() {
 		_ = client.Close()
 		_ = target.Close()
 	}
 	stop := relayStopArbiter{interrupt: interrupt}
 
+	var stopContextWatch func() bool
+	var contextWatchDone chan struct{}
 	if ctx.Done() != nil {
-		go func() {
-			defer close(watcherDone)
-			select {
-			case <-ctx.Done():
-				stop.claim(relayStopCause{Kind: relayStopContext})
-			case <-finished:
-			}
-		}()
-	} else {
-		close(watcherDone)
+		// context.AfterFunc does not keep one watcher goroutine alive for every
+		// established tunnel. Its callback runs only when cancellation wins; the
+		// returned stop function lets a normally completed relay unregister it.
+		contextWatchDone = make(chan struct{})
+		stopContextWatch = context.AfterFunc(ctx, func() {
+			stop.claim(relayStopCause{Kind: relayStopContext})
+			close(contextWatchDone)
+		})
 	}
 
 	copyDirection := func(dst, src net.Conn, direction relayDirection) {
@@ -162,8 +160,11 @@ func relayBidirectional(ctx context.Context, client, target net.Conn) relayResul
 		}
 	}
 
-	go copyDirection(target, client, relayDirectionClientToTarget)
+	// The connection handler already owns a goroutine. Use it for one direction
+	// and spawn only the peer direction, instead of parking the handler while two
+	// additional copy goroutines do all relay work.
 	go copyDirection(client, target, relayDirectionTargetToClient)
+	copyDirection(target, client, relayDirectionClientToTarget)
 
 	var relay relayResult
 	for i := 0; i < 2; i++ {
@@ -174,8 +175,14 @@ func relayBidirectional(ctx context.Context, client, target net.Conn) relayResul
 			relay.TargetToClient = completed.result
 		}
 	}
-	close(finished)
-	<-watcherDone
+	if stopContextWatch != nil {
+		if stopContextWatch() {
+			// A true return guarantees that the callback will not run, so this
+			// goroutine owns completion notification. Otherwise the callback owns it.
+			close(contextWatchDone)
+		}
+		<-contextWatchDone
+	}
 	relay.StopCause = stop.cause
 	relay.Duration = time.Since(started)
 	return relay
@@ -266,6 +273,10 @@ func logRelayResult(rule *config.Rule, client, target net.Conn, result relayResu
 	metricRelay(ruleName, "client_to_target", result.ClientToTarget.Bytes, result.ClientToTarget.Err)
 	metricRelay(ruleName, "target_to_client", result.TargetToClient.Bytes, result.TargetToClient.Err)
 	metricRelayDuration(ruleName, result.Duration)
+	debugEntry := utils.Logger.Check(zap.DebugLevel, "连接转发结束")
+	if !relayHasError(result) && debugEntry == nil {
+		return
+	}
 	fields := []zap.Field{
 		zap.String("ruleName", ruleName),
 		zap.String("remoteAddr", connAddr(client)),
@@ -283,7 +294,9 @@ func logRelayResult(rule *config.Rule, client, target net.Conn, result relayResu
 		logRelayDirection(utils.Logger, "目标到客户端的转发异常", fields, result,
 			relayDirectionTargetToClient, result.TargetToClient.Err)
 	}
-	utils.Logger.Debug("连接转发结束", fields...)
+	if debugEntry != nil {
+		debugEntry.Write(fields...)
+	}
 }
 
 const (

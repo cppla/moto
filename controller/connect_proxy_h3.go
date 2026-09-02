@@ -26,13 +26,18 @@ const (
 	// rule/attempt deadline remains authoritative whenever it is shorter.
 	http3ConnectMaxHandshakeTimeout = 30 * time.Second
 	http3ConnectIdleTimeout         = 90 * time.Second
-	http3ConnectKeepAlivePeriod     = 30 * time.Second
+	http3ConnectKeepAlivePeriod     = 10 * time.Second
 	http3ConnectMaxResponseHeaders  = 16 << 10
 	// Stay below common peer-controlled bidirectional stream ceilings and
 	// open another pooled QUIC connection before a long CONNECT can consume all
 	// stream credit. The pool remains bounded at the default rule connection cap.
 	http3ConnectStreamsPerTransport = 64
 	http3ConnectMaxTransportsPerKey = 64
+)
+
+var (
+	errHTTP3TunnelFastFailed                = fmt.Errorf("HTTP/3 tunnel canceled after sustained stalled I/O once a replacement path was validated: %w", net.ErrClosed)
+	errHTTP3CandidateRetrySourceUnavailable = errors.New("HTTP/3 rotation source is no longer serving")
 )
 
 type http3ConnectTransportKey struct {
@@ -67,6 +72,7 @@ type http3ConnectTransportSlot struct {
 	retryAt            time.Time
 	forcedDrainArmed   bool
 	forcedDrainConnID  uint64
+	forcedDrainMonitor *http3ForcedDrainMonitor
 	tunnels            map[*http3TunnelStats]struct{}
 	lastSampledPayload uint64
 
@@ -166,6 +172,7 @@ type http3ConnectManager struct {
 	onRecovered          func(http3ConnectTransportKey)
 	onConnectionDegraded func(http3RuleDegradationEvent)
 	onConnectionSample   func(http3RuleSampleEvent)
+	onUDPBlackhole       func(http3UDPBlackholeEvent)
 	nextGenerationID     uint64
 }
 
@@ -483,6 +490,43 @@ func (manager *http3ConnectManager) acquireTransport(
 	return selected.transport, selected, release, nil
 }
 
+// acquireHTTP3CandidateRetrySource reserves exactly the verified serving slot
+// that a failed warming candidate was intended to replace. It must never fall
+// through to the general pool allocator: the rule breaker may have moved that
+// source to draining while the candidate handshake was in flight, and creating
+// a fresh H3 slot here would bypass a newly committed H2 cooldown.
+func (manager *http3ConnectManager) acquireHTTP3CandidateRetrySource(
+	key http3ConnectTransportKey,
+	source *http3ConnectTransportSlot,
+) (*http3.Transport, *http3ConnectTransportSlot, func(), error) {
+	if manager == nil || source == nil {
+		return nil, nil, nil, errHTTP3CandidateRetrySourceUnavailable
+	}
+	manager.mu.Lock()
+	limit := source.limit
+	if limit <= 0 {
+		limit = manager.streamsPerTransport
+		if limit <= 0 {
+			limit = http3ConnectStreamsPerTransport
+		}
+	}
+	if manager.retired || !manager.containsSlotLocked(key, source) || source.transport == nil ||
+		source.lifecycle != http3TransportServing || source.active >= limit {
+		manager.mu.Unlock()
+		return nil, nil, nil, errHTTP3CandidateRetrySourceUnavailable
+	}
+	source.active++
+	manager.mu.Unlock()
+
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			manager.releaseTransport(key, source)
+		})
+	}
+	return source.transport, source, release, nil
+}
+
 func http3TransportHealthRank(health http3TransportHealth) int {
 	switch health {
 	case http3TransportHealthy:
@@ -605,6 +649,15 @@ func (manager *http3ConnectManager) noteStreamCreditTimeout(
 }
 
 func (manager *http3ConnectManager) dial(ctx context.Context, target *config.Target, destination string) (net.Conn, error) {
+	return manager.dialWithCandidateRetrySource(ctx, target, destination, nil)
+}
+
+func (manager *http3ConnectManager) dialWithCandidateRetrySource(
+	ctx context.Context,
+	target *config.Target,
+	destination string,
+	retrySource *http3ConnectTransportSlot,
+) (net.Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -616,7 +669,9 @@ func (manager *http3ConnectManager) dial(ctx context.Context, target *config.Tar
 	var transportSlot *http3ConnectTransportSlot
 	var releaseTransport func()
 	var err error
-	if http3RuleProbationFromContext(ctx) {
+	if retrySource != nil {
+		transport, transportSlot, releaseTransport, err = manager.acquireHTTP3CandidateRetrySource(key, retrySource)
+	} else if http3RuleProbationFromContext(ctx) {
 		transport, transportSlot, releaseTransport, err = manager.acquireHTTP3RuleProbationTransport(key)
 	} else {
 		transport, transportSlot, releaseTransport, err = manager.acquireTransport(key)
@@ -701,21 +756,28 @@ func (manager *http3ConnectManager) dial(ctx context.Context, target *config.Tar
 			setupErr = errors.Join(errConnectProxyProtocolCapacity, setupErr)
 		}
 		candidateFailed := false
+		var candidateRetrySource *http3ConnectTransportSlot
 		if candidateAttempt && ctx.Err() == nil {
-			candidateFailed = manager.markHTTP3CandidateFailed(key, transportSlot, setupErr)
+			candidateRetrySource, candidateFailed = manager.markHTTP3CandidateFailed(key, transportSlot, setupErr)
 		}
 		releaseTransport()
 		cancelStream()
 		_ = requestWriter.CloseWithError(setupErr)
 		_ = requestReader.CloseWithError(setupErr)
-		if candidateFailed && ctx.Err() == nil && !managedProbe && !http3RuleProbationFromContext(ctx) {
+		if candidateFailed && candidateRetrySource != nil && ctx.Err() == nil && !managedProbe && !http3RuleProbationFromContext(ctx) {
 			// The canary is an internal maintenance choice. If it fails while the
-			// verified old transport is still available, retry this untouched
+			// exact verified old transport is still available, retry this untouched
 			// CONNECT request there instead of leaking the maintenance failure into
-			// H2 fallback, route health, or the browser. Rule-level probation is
+			// H2 fallback, route health, or the browser. The exact-slot reservation
+			// prevents a concurrent blackhole drain from creating a fresh H3 transport
+			// behind an already committed rule cooldown. Rule-level probation is
 			// already the exclusive recovery attempt, so its failure must return to
 			// dialForRule instead of recursively creating replacement candidates.
-			return manager.dial(ctx, target, destination)
+			connection, retryErr := manager.dialWithCandidateRetrySource(ctx, target, destination, candidateRetrySource)
+			if errors.Is(retryErr, errHTTP3CandidateRetrySourceUnavailable) {
+				return nil, setupErr
+			}
+			return connection, retryErr
 		}
 		return nil, setupErr
 	}
@@ -724,6 +786,7 @@ func (manager *http3ConnectManager) dial(ctx context.Context, target *config.Tar
 	if candidateAttempt {
 		manager.promoteHTTP3Candidate(key, transportSlot)
 	}
+	manager.noteHTTP3ServingTakeoverValidated(key, transportSlot)
 	if ctx.Err() != nil {
 		releaseTransport()
 		cancelStream()
@@ -739,18 +802,32 @@ func (manager *http3ConnectManager) dial(ctx context.Context, target *config.Tar
 		_ = requestWriter.CloseWithError(errors.New("CONNECT proxy rejected stream"))
 		return nil, statusErr
 	}
-	tunnelStats := manager.registerHTTP3Tunnel(transportSlot)
-	return &http3TunnelConn{
-		reader: response.Body,
-		writer: requestWriter,
-		cancel: cancelStream,
-		release: func() {
-			manager.unregisterHTTP3Tunnel(transportSlot, tunnelStats)
-			releaseTransport()
-		},
+	ruleName, _ := connectProxyRuleNameFromContext(ctx)
+	userAgent, _ := connectProxyUserAgentFromContext(ctx)
+	tunnelStats := &http3TunnelStats{
+		slot:        transportSlot,
+		ruleName:    ruleName,
+		target:      target,
+		destination: destination,
+		userAgent:   userAgent,
+	}
+	conn := &http3TunnelConn{
+		reader:     response.Body,
+		writer:     requestWriter,
+		cancel:     cancelStream,
 		remoteAddr: tunnelAddr{network: config.ConnectProxyH3, value: target.Address},
 		stats:      tunnelStats,
-	}, nil
+	}
+	conn.release = func() {
+		manager.unregisterHTTP3Tunnel(transportSlot, tunnelStats)
+		releaseTransport()
+	}
+	tunnelStats.fastFail = func() bool {
+		_, closed := conn.closeWithCause(errHTTP3TunnelFastFailed)
+		return closed
+	}
+	manager.registerHTTP3Tunnel(tunnelStats)
+	return conn, nil
 }
 
 // close is called only after a routing generation has no leased client
@@ -790,6 +867,7 @@ type http3TunnelConn struct {
 	release    func()
 	remoteAddr net.Addr
 	closeOnce  sync.Once
+	fastFailed atomic.Bool
 	stats      *http3TunnelStats
 }
 
@@ -805,8 +883,12 @@ func (conn *http3TunnelConn) http3RuleProbationBinding() (http3RuleProbationBind
 }
 
 func (conn *http3TunnelConn) Read(buffer []byte) (int, error) {
+	conn.stats.beginRead()
 	read, err := conn.reader.Read(buffer)
-	conn.stats.recordRead(read)
+	conn.stats.finishRead(read)
+	if err != nil && conn.fastFailed.Load() {
+		return read, errHTTP3TunnelFastFailed
+	}
 	return read, err
 }
 
@@ -814,6 +896,9 @@ func (conn *http3TunnelConn) Write(buffer []byte) (int, error) {
 	conn.stats.beginWrite()
 	written, err := conn.writer.Write(buffer)
 	conn.stats.finishWrite(written)
+	if err != nil && conn.fastFailed.Load() {
+		return written, errHTTP3TunnelFastFailed
+	}
 	return written, err
 }
 
@@ -825,13 +910,27 @@ func (conn *http3TunnelConn) CloseWrite() error {
 }
 
 func (conn *http3TunnelConn) Close() error {
+	closeErr, _ := conn.closeWithCause(nil)
+	return closeErr
+}
+
+func (conn *http3TunnelConn) closeWithCause(cause error) (error, bool) {
 	var closeErr error
+	closed := false
 	conn.closeOnce.Do(func() {
+		closed = true
+		if cause != nil {
+			conn.fastFailed.Store(true)
+		}
 		if conn.cancel != nil {
 			conn.cancel()
 		}
 		if conn.writer != nil {
-			closeErr = conn.writer.Close()
+			if cause != nil {
+				closeErr = conn.writer.CloseWithError(cause)
+			} else {
+				closeErr = conn.writer.Close()
+			}
 		}
 		if conn.reader != nil {
 			if err := conn.reader.Close(); closeErr == nil {
@@ -842,7 +941,7 @@ func (conn *http3TunnelConn) Close() error {
 			conn.release()
 		}
 	})
-	return closeErr
+	return closeErr, closed
 }
 
 func (conn *http3TunnelConn) LocalAddr() net.Addr {

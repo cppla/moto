@@ -576,3 +576,350 @@ func TestHTTP3DegradationRequiresTwoIndividuallyLongBlockedWrites(t *testing.T) 
 		t.Fatalf("two writes blocked for four seconds were not detected: %+v", twoLong.Signals)
 	}
 }
+
+func TestHTTP3DegradationDetectsUDPBlackholeAfterRepeatedOutboundProbes(t *testing.T) {
+	start := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+	stats := quic.ConnectionStats{
+		MinRTT:          80 * time.Millisecond,
+		SmoothedRTT:     80 * time.Millisecond,
+		PacketsSent:     20,
+		BytesSent:       20 << 10,
+		PacketsReceived: 20,
+		BytesReceived:   20 << 10,
+	}
+	detector.observe(http3DegradationSample{At: start, Stats: stats, PayloadBytes: 4096})
+
+	var decision http3DegradationDecision
+	for index := 1; index <= 5; index++ {
+		// Model PTO backoff: the outbound counters advance in multiple, but not
+		// necessarily every, sampler intervals while every receive counter stays
+		// completely frozen.
+		if index == 1 || index == 3 {
+			stats.PacketsSent++
+			stats.BytesSent += 1200
+		}
+		decision = detector.observe(http3DegradationSample{
+			At:                    start.Add(time.Duration(index) * http3DegradationSampleInterval),
+			Stats:                 stats,
+			PayloadBytes:          4096,
+			BlockedWrites:         1,
+			OldestBlockedFor:      time.Duration(index) * http3DegradationSampleInterval,
+			LastPayloadProgressAt: start,
+		})
+		if index < 5 && decision.Rotate {
+			t.Fatalf("blackhole rotated too early at sample %d: %+v", index, decision)
+		}
+	}
+	if !decision.Rotate || decision.Reason != http3DegradationReasonUDPBlackhole {
+		t.Fatalf("blackhole decision = %+v", decision)
+	}
+	if !decision.Signals.SentNoReceive || !decision.Signals.UDPBlackhole ||
+		decision.Signals.NoReceiveFor < http3UDPBlackholeStallTimeout ||
+		decision.Signals.BlackholeWindows != http3UDPBlackholeConfirmations {
+		t.Fatalf("blackhole signals = %+v", decision.Signals)
+	}
+}
+
+func TestHTTP3DegradationDetectsReadOnlyUDPBlackhole(t *testing.T) {
+	start := time.Date(2026, 9, 1, 8, 10, 0, 0, time.UTC)
+	detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+	stats := quic.ConnectionStats{
+		MinRTT:          80 * time.Millisecond,
+		SmoothedRTT:     80 * time.Millisecond,
+		PacketsSent:     20,
+		BytesSent:       20 << 10,
+		PacketsReceived: 20,
+		BytesReceived:   20 << 10,
+	}
+	const downloaded = uint64(256 << 10)
+	detector.observe(http3DegradationSample{
+		At: start, Stats: stats, PayloadBytes: downloaded, PayloadReadBytes: downloaded,
+		LastPayloadProgressAt: start,
+	})
+
+	var decision http3DegradationDecision
+	for index := 1; index <= 5; index++ {
+		if index == 1 || index == 3 {
+			stats.PacketsSent++
+			stats.BytesSent += 1200
+		}
+		decision = detector.observe(http3DegradationSample{
+			At:                    start.Add(time.Duration(index) * http3DegradationSampleInterval),
+			Stats:                 stats,
+			PayloadBytes:          downloaded,
+			PayloadReadBytes:      downloaded,
+			BlockedReads:          1,
+			OldestReadBlockedFor:  time.Duration(index) * http3DegradationSampleInterval,
+			RecentReadDemand:      index == 1,
+			LastPayloadProgressAt: start,
+		})
+		if index < 5 && decision.Rotate {
+			t.Fatalf("read-only blackhole rotated too early at sample %d: %+v", index, decision)
+		}
+	}
+	if !decision.Rotate || decision.Reason != http3DegradationReasonUDPBlackhole {
+		t.Fatalf("read-only blackhole decision = %+v", decision)
+	}
+	if !decision.Signals.ReadDemand || decision.Signals.BlockedWrites != 0 ||
+		decision.Signals.BlackholeWindows != http3UDPBlackholeConfirmations {
+		t.Fatalf("read-only blackhole signals = %+v", decision.Signals)
+	}
+}
+
+func TestHTTP3DegradationPendingReadWithoutRecentPayloadIsIdle(t *testing.T) {
+	start := time.Date(2026, 9, 1, 8, 20, 0, 0, time.UTC)
+	detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+	stats := quic.ConnectionStats{
+		PacketsSent: 10, BytesSent: 10 << 10, PacketsReceived: 10, BytesReceived: 10 << 10,
+	}
+	detector.observe(http3DegradationSample{At: start, Stats: stats})
+	for index := 1; index <= 8; index++ {
+		stats.PacketsSent++
+		stats.BytesSent += 1200
+		decision := detector.observe(http3DegradationSample{
+			At: start.Add(time.Duration(index) * http3DegradationSampleInterval), Stats: stats,
+			BlockedReads: 1, OldestReadBlockedFor: time.Duration(index) * http3DegradationSampleInterval,
+			LastPayloadProgressAt: start,
+		})
+		if decision.Rotate || decision.Signals.ReadDemand || decision.Signals.UDPBlackhole {
+			t.Fatalf("idle pending Read false-positive at sample %d: %+v", index, decision)
+		}
+	}
+}
+
+func TestHTTP3DegradationReadOnlyBlackholeResetsOnQUICAck(t *testing.T) {
+	start := time.Date(2026, 9, 1, 8, 25, 0, 0, time.UTC)
+	detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+	stats := quic.ConnectionStats{
+		PacketsSent: 10, BytesSent: 10 << 10, PacketsReceived: 10, BytesReceived: 10 << 10,
+	}
+	const downloaded = uint64(128 << 10)
+	detector.observe(http3DegradationSample{
+		At: start, Stats: stats, PayloadBytes: downloaded, PayloadReadBytes: downloaded,
+	})
+	for index := 1; index <= 4; index++ {
+		if index <= 2 {
+			stats.PacketsSent++
+			stats.BytesSent += 1200
+		}
+		decision := detector.observe(http3DegradationSample{
+			At: start.Add(time.Duration(index) * http3DegradationSampleInterval), Stats: stats,
+			PayloadBytes: downloaded, PayloadReadBytes: downloaded, BlockedReads: 1,
+			OldestReadBlockedFor: time.Duration(index) * http3DegradationSampleInterval,
+			RecentReadDemand:     index == 1, LastPayloadProgressAt: start,
+		})
+		if decision.Rotate {
+			t.Fatalf("read-only blackhole rotated before ACK: %+v", decision)
+		}
+	}
+	stats.PacketsReceived++
+	stats.BytesReceived += 64
+	decision := detector.observe(http3DegradationSample{
+		At: start.Add(5 * http3DegradationSampleInterval), Stats: stats,
+		PayloadBytes: downloaded, PayloadReadBytes: downloaded, BlockedReads: 1,
+		OldestReadBlockedFor:  5 * http3DegradationSampleInterval,
+		LastPayloadProgressAt: start,
+	})
+	if decision.Rotate || decision.Signals.ReadDemand || decision.Signals.SentNoReceive ||
+		decision.Signals.BlackholeWindows != 0 {
+		t.Fatalf("QUIC ACK did not reset read-side blackhole: %+v", decision)
+	}
+}
+
+func TestHTTP3DegradationReadDemandLatchSurvivesRecentWindowUntilPTOEvidence(t *testing.T) {
+	start := time.Date(2026, 9, 1, 8, 27, 0, 0, time.UTC)
+	detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+	stats := quic.ConnectionStats{
+		PacketsSent: 10, BytesSent: 10 << 10, PacketsReceived: 10, BytesReceived: 10 << 10,
+	}
+	const downloaded = uint64(128 << 10)
+	detector.observe(http3DegradationSample{
+		At: start, Stats: stats, PayloadBytes: downloaded, PayloadReadBytes: downloaded,
+	})
+
+	var decision http3DegradationDecision
+	for index := 1; index <= 9; index++ {
+		// Model an idle QUIC whose first keepalive and a later PTO aren't visible
+		// until after the 12-second recent-read window. The demand observed at the
+		// first no-inbound sample must remain latched across that delay.
+		if index == 6 || index == 8 {
+			stats.PacketsSent++
+			stats.BytesSent += 1200
+		}
+		decision = detector.observe(http3DegradationSample{
+			At: start.Add(time.Duration(index) * http3DegradationSampleInterval), Stats: stats,
+			PayloadBytes: downloaded, PayloadReadBytes: downloaded, BlockedReads: 1,
+			OldestReadBlockedFor: time.Duration(index) * http3DegradationSampleInterval,
+			RecentReadDemand:     index == 1, LastPayloadProgressAt: start,
+		})
+		if index < 9 && decision.Rotate {
+			t.Fatalf("delayed PTO evidence rotated too early at sample %d: %+v", index, decision)
+		}
+	}
+	if !decision.Rotate || decision.Reason != http3DegradationReasonUDPBlackhole ||
+		!decision.Signals.ReadDemand || decision.Signals.NoReceiveFor <= http3UDPBlackholeRecentReadWindow {
+		t.Fatalf("read-demand latch did not survive the recent window: %+v", decision)
+	}
+}
+
+func TestHTTP3DegradationReadOnlyBlackholeRequiresMultipleOutboundSamples(t *testing.T) {
+	start := time.Date(2026, 9, 1, 8, 29, 0, 0, time.UTC)
+	detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+	stats := quic.ConnectionStats{
+		PacketsSent: 10, BytesSent: 10 << 10, PacketsReceived: 10, BytesReceived: 10 << 10,
+	}
+	const downloaded = uint64(128 << 10)
+	detector.observe(http3DegradationSample{
+		At: start, Stats: stats, PayloadBytes: downloaded, PayloadReadBytes: downloaded,
+	})
+	stats.PacketsSent++
+	stats.BytesSent += 1200
+	for index := 1; index <= 10; index++ {
+		decision := detector.observe(http3DegradationSample{
+			At: start.Add(time.Duration(index) * http3DegradationSampleInterval), Stats: stats,
+			PayloadBytes: downloaded, PayloadReadBytes: downloaded, BlockedReads: 1,
+			OldestReadBlockedFor: time.Duration(index) * http3DegradationSampleInterval,
+			RecentReadDemand:     index == 1, LastPayloadProgressAt: start,
+		})
+		if decision.Rotate || decision.Signals.SentNoReceive {
+			t.Fatalf("one read-side outbound burst looked like a blackhole at sample %d: %+v", index, decision)
+		}
+	}
+}
+
+func TestHTTP3DegradationUpgradesLatchedSevereLossToUDPBlackhole(t *testing.T) {
+	start := time.Date(2026, 9, 1, 8, 15, 0, 0, time.UTC)
+	detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+	stats := quic.ConnectionStats{
+		MinRTT:          80 * time.Millisecond,
+		SmoothedRTT:     80 * time.Millisecond,
+		PacketsSent:     20,
+		BytesSent:       20 << 10,
+		PacketsReceived: 20,
+		BytesReceived:   20 << 10,
+	}
+	detector.observe(http3DegradationSample{At: start, Stats: stats, PayloadBytes: 4096})
+	stats.PacketsSent += 300
+	stats.BytesSent += 600 << 10
+	stats.PacketsLost += 100
+	stats.BytesLost += 200 << 10
+	decision := detector.observe(http3DegradationSample{
+		At: start.Add(http3DegradationSampleInterval), Stats: stats, PayloadBytes: 4096,
+		BlockedWrites: 1, OldestBlockedFor: http3DegradationSingleWriteBlock,
+		LastPayloadProgressAt: start,
+	})
+	if !decision.Rotate || decision.Reason != http3DegradationReasonSevereLossAndWrite {
+		t.Fatalf("initial degradation = %+v, want severe loss", decision)
+	}
+
+	for index := 2; index <= 5; index++ {
+		stats.PacketsSent++
+		stats.BytesSent += 1200
+		decision = detector.observe(http3DegradationSample{
+			At: start.Add(time.Duration(index) * http3DegradationSampleInterval), Stats: stats, PayloadBytes: 4096,
+			BlockedWrites: 1, OldestBlockedFor: time.Duration(index) * http3DegradationSampleInterval,
+			LastPayloadProgressAt: start,
+		})
+	}
+	if !decision.Rotate || decision.Reason != http3DegradationReasonUDPBlackhole || !decision.Signals.UDPBlackhole {
+		t.Fatalf("latched degradation did not upgrade to blackhole: %+v", decision)
+	}
+}
+
+func TestHTTP3DegradationUDPBlackholeRequiresMultipleOutboundSamples(t *testing.T) {
+	start := time.Date(2026, 9, 1, 8, 30, 0, 0, time.UTC)
+	detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+	stats := quic.ConnectionStats{PacketsSent: 10, BytesSent: 10 << 10, PacketsReceived: 10, BytesReceived: 10 << 10}
+	detector.observe(http3DegradationSample{At: start, Stats: stats, PayloadBytes: 1024})
+	stats.PacketsSent++
+	stats.BytesSent += 1200
+	for index := 1; index <= 10; index++ {
+		decision := detector.observe(http3DegradationSample{
+			At:                    start.Add(time.Duration(index) * http3DegradationSampleInterval),
+			Stats:                 stats,
+			PayloadBytes:          1024,
+			BlockedWrites:         1,
+			OldestBlockedFor:      time.Duration(index) * http3DegradationSampleInterval,
+			LastPayloadProgressAt: start,
+		})
+		if decision.Rotate || decision.Signals.SentNoReceive {
+			t.Fatalf("one outbound burst looked like a sustained blackhole at %d: %+v", index, decision)
+		}
+	}
+}
+
+func TestHTTP3DegradationUDPBlackholeResetsOnReceivePayloadAndSampleGap(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*quic.ConnectionStats, *uint64)
+		gap    time.Duration
+	}{
+		{name: "QUIC ACK", mutate: func(stats *quic.ConnectionStats, _ *uint64) { stats.PacketsReceived++ }},
+		{name: "payload progress", mutate: func(_ *quic.ConnectionStats, payload *uint64) { *payload += 1024 }},
+		{name: "sleep gap", gap: http3UDPBlackholeMaxSampleGap + time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			start := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+			detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+			stats := quic.ConnectionStats{PacketsSent: 10, BytesSent: 10 << 10, PacketsReceived: 10, BytesReceived: 10 << 10}
+			payload := uint64(1024)
+			detector.observe(http3DegradationSample{At: start, Stats: stats, PayloadBytes: payload})
+			for index := 1; index <= 4; index++ {
+				stats.PacketsSent++
+				stats.BytesSent += 1200
+				detector.observe(http3DegradationSample{
+					At: start.Add(time.Duration(index) * http3DegradationSampleInterval), Stats: stats,
+					PayloadBytes: payload, BlockedWrites: 1,
+					OldestBlockedFor: time.Duration(index) * http3DegradationSampleInterval, LastPayloadProgressAt: start,
+				})
+			}
+			if test.mutate != nil {
+				test.mutate(&stats, &payload)
+			}
+			gap := test.gap
+			if gap == 0 {
+				gap = http3DegradationSampleInterval
+			}
+			at := start.Add(4*http3DegradationSampleInterval + gap)
+			decision := detector.observe(http3DegradationSample{
+				At: at, Stats: stats, PayloadBytes: payload, BlockedWrites: 1,
+				OldestBlockedFor: at.Sub(start), LastPayloadProgressAt: start,
+			})
+			if decision.Rotate || decision.Signals.BlackholeWindows != 0 || decision.Signals.SentNoReceive {
+				t.Fatalf("reset sample retained blackhole state: %+v", decision)
+			}
+		})
+	}
+}
+
+func TestHTTP3DegradationUDPBlackholeNeedsPriorBidirectionalTrafficAndPendingWrite(t *testing.T) {
+	start := time.Date(2026, 9, 1, 9, 30, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name          string
+		initialRecv   uint64
+		blockedWrites int
+	}{
+		{name: "never received", initialRecv: 0, blockedWrites: 1},
+		{name: "idle tunnel", initialRecv: 10, blockedWrites: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			detector := newHTTP3DegradationDetector(start.Add(-http3DegradationWarmup))
+			stats := quic.ConnectionStats{PacketsSent: 10, BytesSent: 10 << 10, PacketsReceived: test.initialRecv}
+			detector.observe(http3DegradationSample{At: start, Stats: stats, PayloadBytes: 1024})
+			for index := 1; index <= 8; index++ {
+				stats.PacketsSent++
+				stats.BytesSent += 1200
+				decision := detector.observe(http3DegradationSample{
+					At: start.Add(time.Duration(index) * http3DegradationSampleInterval), Stats: stats,
+					PayloadBytes: 1024, BlockedWrites: test.blockedWrites,
+					OldestBlockedFor: time.Duration(index) * http3DegradationSampleInterval, LastPayloadProgressAt: start,
+				})
+				if decision.Rotate || decision.Signals.UDPBlackhole {
+					t.Fatalf("sample %d false-positive: %+v", index, decision)
+				}
+			}
+		})
+	}
+}

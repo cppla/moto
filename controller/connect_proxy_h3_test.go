@@ -140,6 +140,72 @@ func TestHTTP3ConnectTunnelFullDuplexAndReuse(t *testing.T) {
 	}
 }
 
+func TestHTTP3ValidatedOrdinaryServingTakeoverBroadensRuleScopedDrain(t *testing.T) {
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		_, _ = io.Copy(io.Discard, request.Body)
+	})
+	endpoint, roots, closeServer, connectionCount := startHTTP3ConnectTestServer(t, handler)
+	defer closeServer()
+	manager := newHTTP3ConnectManager(func(key http3ConnectTransportKey, owner context.Context) *http3.Transport {
+		transport := newHTTP3ConnectTransportWithOwner(key, owner)
+		transport.TLSClientConfig.RootCAs = roots
+		return transport
+	})
+	defer manager.close()
+	target := &config.Target{
+		Address: endpoint,
+		ConnectProxy: &config.ConnectProxyConfig{
+			Protocols: []string{config.ConnectProxyH3},
+		},
+	}
+
+	firstCtx, cancelFirst := context.WithTimeout(withConnectProxyRuleName(context.Background(), "h3-only"), 3*time.Second)
+	first, err := manager.dial(firstCtx, target, "first.example:443")
+	cancelFirst()
+	if err != nil {
+		t.Fatalf("dial first H3-only tunnel: %v", err)
+	}
+	defer first.Close()
+	firstTunnel, ok := first.(*http3TunnelConn)
+	if !ok || firstTunnel.stats == nil || firstTunnel.stats.slot == nil {
+		t.Fatalf("first tunnel type = %T, want instrumented HTTP/3 tunnel", first)
+	}
+	oldSlot := firstTunnel.stats.slot
+	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	manager.mu.Lock()
+	oldSlot.health = http3TransportDegraded
+	oldSlot.rotationReason = http3DegradationReasonSevereLossAndWrite
+	oldSlot.lifecycle = http3TransportDraining
+	monitor := manager.prepareHTTP3ForcedDrainLocked(key, oldSlot, time.Now(), []string{"mixed"})
+	manager.mu.Unlock()
+	if monitor == nil || monitor.fastFailAll {
+		t.Fatalf("rule-scoped monitor before takeover = monitor:%p all:%t", monitor, monitor != nil && monitor.fastFailAll)
+	}
+
+	secondCtx, cancelSecond := context.WithTimeout(withConnectProxyRuleName(context.Background(), "h3-only"), 3*time.Second)
+	second, err := manager.dial(secondCtx, target, "second.example:443")
+	cancelSecond()
+	if err != nil {
+		t.Fatalf("dial replacement H3-only tunnel: %v", err)
+	}
+	defer second.Close()
+	secondTunnel, ok := second.(*http3TunnelConn)
+	if !ok || secondTunnel.stats == nil || secondTunnel.stats.slot == oldSlot {
+		t.Fatalf("replacement tunnel slot = %p, old = %p", secondTunnel.stats.slot, oldSlot)
+	}
+	manager.mu.Lock()
+	broadened := monitor.fastFailAll
+	manager.mu.Unlock()
+	if !broadened {
+		t.Fatal("validated ordinary H3 serving takeover did not broaden the old rule-scoped drain")
+	}
+	if got := connectionCount.Load(); got != 2 {
+		t.Fatalf("physical H3 connections = %d, want 2", got)
+	}
+}
+
 func TestHTTP3RuleProbationCandidateFailureDoesNotRedial(t *testing.T) {
 	var transports atomic.Int32
 	var physicalDials atomic.Int32
@@ -176,6 +242,123 @@ func TestHTTP3RuleProbationCandidateFailureDoesNotRedial(t *testing.T) {
 	}
 	if got := physicalDials.Load(); got != 1 {
 		t.Fatalf("rule probation physical dials = %d, want exactly one", got)
+	}
+}
+
+func TestHTTP3WarmingCandidateFailureDoesNotRedialAfterSourceDrains(t *testing.T) {
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		_, _ = io.Copy(writer, request.Body)
+	})
+	endpoint, roots, closeServer, _ := startHTTP3ConnectTestServer(t, handler)
+	defer closeServer()
+
+	candidateStarted := make(chan struct{})
+	releaseCandidate := make(chan struct{})
+	candidateErr := errors.New("synthetic warming candidate failure")
+	unexpectedRedialErr := errors.New("unexpected fresh H3 redial after source drain")
+	var candidateStartedOnce sync.Once
+	var transports atomic.Int32
+	manager := newHTTP3ConnectManager(func(key http3ConnectTransportKey, owner context.Context) *http3.Transport {
+		ordinal := transports.Add(1)
+		transport := newHTTP3ConnectTransportWithOwner(key, owner)
+		transport.TLSClientConfig.RootCAs = roots
+		switch ordinal {
+		case 2:
+			transport.Dial = func(ctx context.Context, _ string, _ *tls.Config, _ *quic.Config) (*quic.Conn, error) {
+				candidateStartedOnce.Do(func() { close(candidateStarted) })
+				select {
+				case <-releaseCandidate:
+					return nil, candidateErr
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+		default:
+			if ordinal > 2 {
+				transport.Dial = func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error) {
+					return nil, unexpectedRedialErr
+				}
+			}
+		}
+		return transport
+	})
+	defer manager.close()
+	target := &config.Target{
+		Address: endpoint,
+		ConnectProxy: &config.ConnectProxyConfig{
+			Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2},
+		},
+	}
+
+	sourceCtx, cancelSource := context.WithTimeout(withConnectProxyRuleName(context.Background(), "mixed"), 3*time.Second)
+	sourceTunnel, err := manager.dial(sourceCtx, target, "source.example:443")
+	cancelSource()
+	if err != nil {
+		t.Fatalf("establish source tunnel: %v", err)
+	}
+	defer sourceTunnel.Close()
+	instrumented, ok := sourceTunnel.(*http3TunnelConn)
+	if !ok || instrumented.stats == nil || instrumented.stats.slot == nil {
+		t.Fatalf("source tunnel type = %T, want instrumented H3 tunnel", sourceTunnel)
+	}
+	source := instrumented.stats.slot
+	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	manager.mu.Lock()
+	source.health = http3TransportDegraded
+	source.rotationReason = http3DegradationReasonUDPBlackhole
+	candidate, err := manager.ensureHTTP3RotationCandidateLocked(key, source, time.Now())
+	connectionID := source.connectionID
+	manager.mu.Unlock()
+	if err != nil || candidate == nil {
+		t.Fatalf("create warming candidate: candidate=%p err=%v", candidate, err)
+	}
+
+	type dialResult struct {
+		connection net.Conn
+		err        error
+	}
+	result := make(chan dialResult, 1)
+	candidateCtx, cancelCandidate := context.WithTimeout(withConnectProxyRuleName(context.Background(), "mixed"), 3*time.Second)
+	defer cancelCandidate()
+	go func() {
+		connection, dialErr := manager.dial(candidateCtx, target, "candidate.example:443")
+		result <- dialResult{connection: connection, err: dialErr}
+	}()
+	select {
+	case <-candidateStarted:
+	case <-time.After(time.Second):
+		t.Fatal("warming candidate physical dial did not start")
+	}
+
+	if !manager.armHTTP3ForcedDrainForBlackhole(http3UDPBlackholeScope{
+		key: key, slot: source, connectionID: connectionID,
+	}, []string{"mixed"}, time.Now()) {
+		t.Fatal("blackhole breaker did not move source to draining")
+	}
+	close(releaseCandidate)
+	got := <-result
+	if got.connection != nil {
+		_ = got.connection.Close()
+		t.Fatal("failed warming candidate unexpectedly returned a tunnel")
+	}
+	if !errors.Is(got.err, candidateErr) {
+		t.Fatalf("candidate error = %v, want original %v", got.err, candidateErr)
+	}
+	if gotCount := transports.Load(); gotCount != 2 {
+		t.Fatalf("H3 transports = %d, want source plus failed candidate only", gotCount)
+	}
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if source.lifecycle != http3TransportDraining {
+		t.Fatalf("source lifecycle = %s, want draining", source.lifecycle)
+	}
+	for _, slot := range manager.transports[key] {
+		if slot != source && slot.lifecycle == http3TransportServing {
+			t.Fatal("candidate failure created a fresh serving H3 behind cooldown")
+		}
 	}
 }
 
@@ -1060,7 +1243,12 @@ func TestConnectProxyHTTP3CooldownOnlyAfterSuccessfulHTTP2Fallback(t *testing.T)
 }
 
 func TestConnectProxyHTTP3CooldownAfterReachableHTTP2Status(t *testing.T) {
-	for _, statusCode := range []int{http.StatusForbidden, http.StatusServiceUnavailable} {
+	for _, statusCode := range []int{
+		http.StatusForbidden,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
 		t.Run(http.StatusText(statusCode), func(t *testing.T) {
 			now := time.Unix(1_800_000_000, 0)
 			h3Calls := 0
@@ -1105,6 +1293,59 @@ func TestConnectProxyHTTP3CooldownAfterReachableHTTP2Status(t *testing.T) {
 			}
 			if h3Calls != 1 || h2Calls != 2 {
 				t.Fatalf("protocol calls = h3:%d h2:%d, want 1/2 after reachable H2 status", h3Calls, h2Calls)
+			}
+		})
+	}
+}
+
+func TestConnectProxyHTTP3DoesNotCooldownAfterUnusableHTTP2Status(t *testing.T) {
+	for _, statusCode := range []int{
+		http.StatusUnauthorized,
+		http.StatusProxyAuthRequired,
+		http.StatusTooManyRequests,
+		http.StatusMethodNotAllowed,
+		http.StatusNotImplemented,
+		http.StatusHTTPVersionNotSupported,
+		http.StatusTeapot,
+	} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			h3Calls := 0
+			h2Calls := 0
+			manager := &connectProxyManager{
+				dialers: map[string]connectProxyDialFunc{
+					config.ConnectProxyH3: func(context.Context, *config.Target, string) (net.Conn, error) {
+						h3Calls++
+						return nil, errors.New("UDP path unavailable")
+					},
+					config.ConnectProxyH2: func(_ context.Context, target *config.Target, _ string) (net.Conn, error) {
+						h2Calls++
+						return nil, &connectProxyStatusError{
+							protocol: config.ConnectProxyH2, target: target.Address, statusCode: statusCode,
+						}
+					},
+				},
+			}
+			target := &config.Target{
+				Address: "proxy.example:443",
+				ConnectProxy: &config.ConnectProxyConfig{Protocols: []string{
+					config.ConnectProxyH3,
+					config.ConnectProxyH2,
+				}},
+			}
+
+			for attempt := 0; attempt < 2; attempt++ {
+				connection, err := manager.dial(context.Background(), target, "destination.example:443")
+				if connection != nil {
+					_ = connection.Close()
+					t.Fatal("unusable H2 response unexpectedly returned a tunnel")
+				}
+				var statusErr *connectProxyStatusError
+				if !errors.As(err, &statusErr) || statusErr.statusCode != statusCode {
+					t.Fatalf("dial error = %v, want final HTTP status %d", err, statusCode)
+				}
+			}
+			if h3Calls != 2 || h2Calls != 2 {
+				t.Fatalf("protocol calls = h3:%d h2:%d, want 2/2 without H3 cooldown", h3Calls, h2Calls)
 			}
 		})
 	}

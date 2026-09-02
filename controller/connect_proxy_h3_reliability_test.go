@@ -98,6 +98,23 @@ func TestHTTP3SetupDeadlineBudgetAndQUICClone(t *testing.T) {
 	}
 }
 
+func TestHTTP3TransportUsesFastKeepAliveWithConservativeIdleFallback(t *testing.T) {
+	transport := newHTTP3ConnectTransportWithOwner(
+		http3ConnectTransportKey{address: "proxy.example:443", serverName: "proxy.example"},
+		context.Background(),
+	)
+	defer transport.Close()
+	if transport.QUICConfig == nil {
+		t.Fatal("HTTP/3 transport has no QUIC config")
+	}
+	if got := transport.QUICConfig.KeepAlivePeriod; got != 10*time.Second {
+		t.Fatalf("QUIC keepalive = %s, want 10s", got)
+	}
+	if got := transport.QUICConfig.MaxIdleTimeout; got != 90*time.Second {
+		t.Fatalf("QUIC max idle timeout = %s, want 90s", got)
+	}
+}
+
 func TestHTTP3EstablishedTunnelSurvivesSetupDeadline(t *testing.T) {
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.WriteHeader(http.StatusOK)

@@ -3,6 +3,7 @@
 .idea
 bin
 config/setting.json
+test/native_proxy
 docs
 *.log
 *.out

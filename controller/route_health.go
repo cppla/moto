@@ -17,6 +17,7 @@ const (
 	routeExplorationAfter        = 30 * time.Second
 	routeExplorationLeaseMinimum = 5 * time.Second
 	routeExplorationLeaseGrace   = time.Second
+	routeRecoveryProbeInterval   = 5 * time.Second
 )
 
 // ErrCircuitOpen is returned when a route is cooling down or another caller
@@ -44,6 +45,7 @@ type routeHealthState struct {
 	halfOpen            bool
 	halfOpenAttempt     uint64
 	minValidAttempt     uint64
+	lastRecovery        time.Time
 }
 
 // routeHealthSnapshot is a read-only copy of one route's health. CircuitOpen
@@ -59,6 +61,7 @@ type routeHealthSnapshot struct {
 	ProbeRequired       bool
 	OpenUntil           time.Time
 	Cooldown            time.Duration
+	LastRecovery        time.Time
 }
 
 func newRouteHealthState(rule *config.Rule) *routeHealthState {
@@ -181,6 +184,7 @@ func routeProtocolProbeTokenFromContext(ctx context.Context) uint64 {
 type routeTargetSelection struct {
 	target           *config.Target
 	protocolProbe    routeProtocolProbeLease
+	recoveryProbe    bool
 	periodicExplorer bool
 	explorationLease routeExplorationLease
 }
@@ -199,12 +203,31 @@ type routeExplorationClaim struct {
 	expires time.Time
 }
 
+// routeRecoveryLease owns the single target-circuit recovery request allowed
+// for one rule. Actual half-open admission still happens after local dial
+// capacity has been acquired, so local pressure never mutates route health.
+type routeRecoveryLease struct {
+	ruleKey       string
+	address       string
+	token         uint64
+	protocolProbe routeProtocolProbeLease
+}
+
+type routeRecoveryClaim struct {
+	address string
+	token   uint64
+	expires time.Time
+}
+
 type routeHealthRegistry struct {
 	sync.Mutex
 	states                map[routeHealthKey]*routeHealthState
 	nextAttempt           uint64
 	exploration           map[string]routeExplorationClaim
 	nextExploration       uint64
+	recovery              map[string]routeRecoveryClaim
+	recoveryNext          map[string]time.Time
+	nextRecovery          uint64
 	protocolPenaltySource routeProtocolPenaltySource
 	protocolProbeClaim    routeProtocolProbeClaimSource
 	protocolProbeRelease  routeProtocolProbeReleaseSource
@@ -212,8 +235,10 @@ type routeHealthRegistry struct {
 
 func newRouteHealthRegistry(sources ...routeProtocolPenaltySource) *routeHealthRegistry {
 	registry := &routeHealthRegistry{
-		states:      make(map[routeHealthKey]*routeHealthState),
-		exploration: make(map[string]routeExplorationClaim),
+		states:       make(map[routeHealthKey]*routeHealthState),
+		exploration:  make(map[string]routeExplorationClaim),
+		recovery:     make(map[string]routeRecoveryClaim),
+		recoveryNext: make(map[string]time.Time),
 	}
 	if len(sources) > 0 {
 		registry.protocolPenaltySource = sources[0]
@@ -280,6 +305,110 @@ func (registry *routeHealthRegistry) releaseExploration(lease routeExplorationLe
 		delete(registry.exploration, lease.ruleKey)
 	}
 	registry.Unlock()
+}
+
+// claimRecoveryProbe selects the stalest circuit whose cooldown has expired
+// and reserves the rule-wide recovery slot. The caller gives this target one
+// exclusive setup attempt before trying a healthy fallback. routeBegin remains
+// the authority that atomically admits the actual half-open network attempt.
+func (registry *routeHealthRegistry) claimRecoveryProbe(
+	rule *config.Rule,
+	now time.Time,
+	excluded map[string]struct{},
+) (routeRecoveryLease, bool) {
+	if registry == nil || rule == nil || len(rule.Targets) == 0 {
+		return routeRecoveryLease{}, false
+	}
+	ruleID := boostRuleKey(rule)
+	registry.Lock()
+	defer registry.Unlock()
+	if claim, exists := registry.recovery[ruleID]; exists {
+		if now.Before(claim.expires) {
+			return routeRecoveryLease{}, false
+		}
+		delete(registry.recovery, ruleID)
+	}
+	if retryAt := registry.recoveryNext[ruleID]; now.Before(retryAt) {
+		return routeRecoveryLease{}, false
+	}
+
+	var selected *config.Target
+	var selectedState *routeHealthState
+	selectedIndex := -1
+	for index, target := range rule.Targets {
+		if target == nil || target.Address == "" {
+			continue
+		}
+		if _, skip := excluded[target.Address]; skip {
+			continue
+		}
+		state := registry.states[routeHealthKey{rule: ruleID, addr: target.Address}]
+		if state == nil || !state.circuitOpen || state.halfOpen || now.Before(state.openUntil) {
+			continue
+		}
+		if selectedState == nil || state.openUntil.Before(selectedState.openUntil) ||
+			(state.openUntil.Equal(selectedState.openUntil) && state.lastAttempt.Before(selectedState.lastAttempt)) ||
+			(state.openUntil.Equal(selectedState.openUntil) && state.lastAttempt.Equal(selectedState.lastAttempt) && index < selectedIndex) {
+			selected = target
+			selectedState = state
+			selectedIndex = index
+		}
+	}
+	if selected == nil || selectedState == nil {
+		return routeRecoveryLease{}, false
+	}
+	registry.nextRecovery++
+	if registry.nextRecovery == 0 {
+		registry.nextRecovery++
+	}
+	lease := routeRecoveryLease{ruleKey: ruleID, address: selected.Address, token: registry.nextRecovery}
+	registry.recovery[ruleID] = routeRecoveryClaim{
+		address: selected.Address,
+		token:   lease.token,
+		expires: now.Add(routeExplorationLeaseDuration(rule)),
+	}
+	registry.recoveryNext[ruleID] = now.Add(routeRecoveryProbeInterval)
+	return lease, true
+}
+
+func (registry *routeHealthRegistry) releaseRecoveryProbe(lease routeRecoveryLease) {
+	if registry == nil || lease.ruleKey == "" || lease.address == "" || lease.token == 0 {
+		return
+	}
+	registry.Lock()
+	claim, exists := registry.recovery[lease.ruleKey]
+	if exists && claim.address == lease.address && claim.token == lease.token {
+		delete(registry.recovery, lease.ruleKey)
+	}
+	registry.Unlock()
+}
+
+// recoveryProbeDue is a cheap first pass for the hot Boost path. Active health
+// is consulted only when at least one circuit is actually ready, avoiding one
+// extra active-health lock per target on every ordinary connection.
+func (registry *routeHealthRegistry) recoveryProbeDue(rule *config.Rule, now time.Time) bool {
+	if registry == nil || rule == nil || len(rule.Targets) == 0 {
+		return false
+	}
+	ruleID := boostRuleKey(rule)
+	registry.Lock()
+	defer registry.Unlock()
+	if claim, exists := registry.recovery[ruleID]; exists && now.Before(claim.expires) {
+		return false
+	}
+	if retryAt := registry.recoveryNext[ruleID]; now.Before(retryAt) {
+		return false
+	}
+	for _, target := range rule.Targets {
+		if target == nil || target.Address == "" {
+			continue
+		}
+		state := registry.states[routeHealthKey{rule: ruleID, addr: target.Address}]
+		if state != nil && state.circuitOpen && !state.halfOpen && !now.Before(state.openUntil) {
+			return true
+		}
+	}
+	return false
 }
 
 // protocolPenalty invokes the immutable protocol-health source without taking
@@ -414,6 +543,7 @@ func routeObserve(attempt routeAttempt, latency time.Duration, err error, now ti
 		state.halfOpen = false
 		state.halfOpenAttempt = 0
 		if wasHalfOpenProbe {
+			state.lastRecovery = now
 			// As with a successful half-open tunnel, outcomes from attempts that
 			// predate this conclusive reachability observation must not reopen the
 			// recovered circuit.
@@ -443,6 +573,7 @@ func routeObserve(attempt routeAttempt, latency time.Duration, err error, now ti
 		state.halfOpen = false
 		state.halfOpenAttempt = 0
 		if wasHalfOpenProbe {
+			state.lastRecovery = now
 			// Ignore late outcomes from every pre-recovery attempt. New attempts
 			// receive larger IDs from routeBegin.
 			state.minValidAttempt = attempt.id
@@ -551,6 +682,7 @@ func (registry *routeHealthRegistry) snapshot(rule *config.Rule, addr string, no
 		ProbeRequired:       state.circuitOpen && !state.halfOpen && !now.Before(state.openUntil),
 		OpenUntil:           state.openUntil,
 		Cooldown:            state.cooldown,
+		LastRecovery:        state.lastRecovery,
 	}
 }
 
@@ -572,6 +704,16 @@ func (registry *routeHealthRegistry) clear(rules []*config.Rule) {
 			delete(registry.exploration, key)
 		}
 	}
+	for key := range registry.recovery {
+		if _, ok := keys[key]; ok {
+			delete(registry.recovery, key)
+		}
+	}
+	for key := range registry.recoveryNext {
+		if _, ok := keys[key]; ok {
+			delete(registry.recoveryNext, key)
+		}
+	}
 	registry.Unlock()
 }
 
@@ -588,8 +730,9 @@ type routeCandidate struct {
 // selectRouteTargets returns at most limit currently admissible targets. Once
 // a healthy EWMA exists it keeps the best-known route and spends the second
 // slot on the least-recently attempted unknown route. Fully observed routes use
-// EWMA latency plus a failure penalty and periodic exploration. Callers must
-// still use routeBegin, which atomically excludes duplicate half-open probes.
+// EWMA latency plus a failure penalty and periodic exploration. Open circuits
+// are admitted only through a rule-wide recovery lease; routeBegin then owns
+// the atomic half-open transition after local dial capacity is available.
 func selectRouteTargets(rule *config.Rule, limit int, now time.Time) []*config.Target {
 	return defaultRoutingRuntime.routes.selectTargetsExcluding(rule, limit, now, nil)
 }
@@ -666,7 +809,7 @@ func (registry *routeHealthRegistry) selectTargetSelections(
 			}
 			continue
 		}
-		if state.circuitOpen && (now.Before(state.openUntil) || state.halfOpen) {
+		if state.circuitOpen {
 			continue
 		}
 		score := routeFailurePenalty

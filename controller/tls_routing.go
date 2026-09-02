@@ -132,11 +132,13 @@ func (runtime *routingRuntime) handleTLS(ctx context.Context, conn net.Conn, rul
 		return
 	}
 
-	utils.Logger.Debug("建立 TLS 透明连接",
-		zap.String("ruleName", rule.Name),
-		zap.String("serverName", probe.ServerName),
-		zap.Strings("alpn", probe.ALPNProtocols),
-		zap.String("targetAddr", connAddr(target)))
+	if entry := utils.Logger.Check(zap.DebugLevel, "建立 TLS 透明连接"); entry != nil {
+		entry.Write(
+			zap.String("ruleName", rule.Name),
+			zap.String("serverName", probe.ServerName),
+			zap.Strings("alpn", probe.ALPNProtocols),
+			zap.String("targetAddr", connAddr(target)))
+	}
 	result := relayBidirectional(ctx, conn, target)
 	result.ClientToTarget.Bytes += written
 	logRelayResult(rule, conn, target, result)

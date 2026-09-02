@@ -97,6 +97,11 @@ type connectProxyManager struct {
 	degradationPenaltyBase time.Duration
 	degradationPenaltyMax  time.Duration
 	h3RuleBreaker          *http3RuleBreaker
+	maintenanceCtx         context.Context
+	cancelMaintenance      context.CancelFunc
+	maintenanceMu          sync.Mutex
+	maintenanceWG          sync.WaitGroup
+	maintenanceClosed      bool
 }
 
 type http3FallbackState struct {
@@ -124,6 +129,7 @@ type http3FallbackState struct {
 func newConnectProxyManager() *connectProxyManager {
 	h2 := newHTTP2ConnectManager(nil)
 	h3 := newHTTP3ConnectManager(nil)
+	maintenanceCtx, cancelMaintenance := context.WithCancel(context.Background())
 	manager := &connectProxyManager{
 		h2:                     h2,
 		h3:                     h3,
@@ -136,6 +142,8 @@ func newConnectProxyManager() *connectProxyManager {
 		degradationWindow:      http3DegradationStrikeWindow,
 		degradationPenaltyBase: http3DegradationPenaltyBase,
 		degradationPenaltyMax:  http3DegradationPenaltyMax,
+		maintenanceCtx:         maintenanceCtx,
+		cancelMaintenance:      cancelMaintenance,
 		dialers: map[string]connectProxyDialFunc{
 			config.ConnectProxyH2: h2.dial,
 			config.ConnectProxyH3: h3.dial,
@@ -146,6 +154,7 @@ func newConnectProxyManager() *connectProxyManager {
 	h3.onRecovered = manager.noteHTTP3Recovery
 	h3.onConnectionDegraded = manager.noteHTTP3RuleDegradation
 	h3.onConnectionSample = manager.noteHTTP3RuleSample
+	h3.onUDPBlackhole = manager.noteHTTP3UDPBlackhole
 	return manager
 }
 
@@ -285,17 +294,19 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 		failures = append(failures, fmt.Errorf("%s CONNECT: %w", protocol, err))
 		var statusErr *connectProxyStatusError
 		if errors.As(err, &statusErr) {
-			if protocol == config.ConnectProxyH2 && pendingHTTP3RuleValidationToken != 0 {
+			h2FallbackReachable := protocol == config.ConnectProxyH2 &&
+				connectProxyStatusProvesFallbackReachable(statusErr.statusCode)
+			if h2FallbackReachable && pendingHTTP3RuleValidationToken != 0 {
 				ruleH2Reachable = true
 			}
 			if protocol == config.ConnectProxyH3 {
 				manager.failHTTP3RuleProbation(rule, ruleProbeToken, connectProxyAttemptOutcome(err))
 			}
-			if protocol == config.ConnectProxyH2 && (pendingHTTP3Failure != nil || joinedHTTP3PendingToken != 0) {
-				// Any H2 HTTP response proves that the fallback path reached the
-				// proxy. The requested destination may still be denied or broken,
-				// but future requests should not repeat a failed H3 handshake while
-				// this working fallback exists.
+			if h2FallbackReachable && (pendingHTTP3Failure != nil || joinedHTTP3PendingToken != 0) {
+				// Route-neutral H2 responses prove that the fallback path reached a
+				// usable forward-proxy handler. Auth, rate-limit, protocol-capability,
+				// and unknown responses must not suppress H3 in favor of a fallback
+				// that is already known to reject the tunnel contract.
 				fallbackReachable = true
 			}
 			if connectProxyStatusAllowsProtocolFallback(statusErr.statusCode) && index+1 < len(protocols) {
@@ -770,16 +781,15 @@ func (manager *connectProxyManager) noteHTTP3Recovery(key http3ConnectTransportK
 		return
 	}
 	manager.h3FallbackMu.Lock()
-	defer manager.h3FallbackMu.Unlock()
 	state := manager.h3Fallback[key]
-	if state == nil {
-		return
+	if state != nil {
+		state.degradationActive = false
+		state.degradationReason = http3DegradationReasonNone
+		state.lastBoostCanary = time.Time{}
+		state.boostCanaryInFlight = false
+		state.boostCanaryToken = 0
 	}
-	state.degradationActive = false
-	state.degradationReason = http3DegradationReasonNone
-	state.lastBoostCanary = time.Time{}
-	state.boostCanaryInFlight = false
-	state.boostCanaryToken = 0
+	manager.h3FallbackMu.Unlock()
 }
 
 // http3RoutePenalty is a protocol-only Boost signal. It never mutates the
@@ -1012,6 +1022,7 @@ func connectProxyAttemptContext(parent context.Context, remainingProtocols int) 
 }
 
 func (manager *connectProxyManager) close() {
+	manager.stopMaintenance()
 	if manager != nil && manager.h2 != nil {
 		manager.h2.closeIdle()
 	}
@@ -1021,6 +1032,7 @@ func (manager *connectProxyManager) close() {
 }
 
 func (manager *connectProxyManager) retire() {
+	manager.stopMaintenance()
 	if manager != nil && manager.h2 != nil {
 		manager.h2.retire()
 	}
@@ -1103,6 +1115,15 @@ func connectProxyStatusIsRouteNeutral(statusCode int) bool {
 		// a wrong endpoint, missing forward-proxy handler, or broken proxy.
 		return false
 	}
+}
+
+// connectProxyStatusProvesFallbackReachable is deliberately narrower than
+// "received an HTTP response". A fallback is safe to commit only when the
+// response follows the project's route-neutral CONNECT semantics. In
+// particular, 401/407 and 405/501/505 prove that this H2 path cannot currently
+// carry the configured tunnel and therefore must leave H3 fail-open.
+func connectProxyStatusProvesFallbackReachable(statusCode int) bool {
+	return connectProxyStatusIsRouteNeutral(statusCode)
 }
 
 // These statuses explicitly say that this HTTP version or handler cannot

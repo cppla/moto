@@ -6,6 +6,7 @@ import (
 	"io"
 	"moto/config"
 	"net"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -384,6 +385,80 @@ func TestRelayBidirectionalContextCancellationStopsIdleCopies(t *testing.T) {
 		t.Fatal("idle io.Copy calls did not stop after context cancellation")
 	}
 }
+
+func TestRelayBidirectionalUnregistersContextCallbackAfterCleanCompletion(t *testing.T) {
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &relayAfterFuncContext{Context: base}
+	client := &relayEOFConn{}
+	target := &relayEOFConn{}
+
+	result := relayBidirectional(ctx, client, target)
+	if result.ClientToTarget.Err != nil || result.TargetToClient.Err != nil {
+		t.Fatalf("clean relay errors: client->target=%v target->client=%v",
+			result.ClientToTarget.Err, result.TargetToClient.Err)
+	}
+	registered, stopped, invoked := ctx.snapshot()
+	if registered != 1 || stopped != 1 || invoked != 0 {
+		t.Fatalf("context callback lifecycle = registered:%d stopped:%d invoked:%d, want 1/1/0",
+			registered, stopped, invoked)
+	}
+}
+
+type relayAfterFuncContext struct {
+	context.Context
+
+	mu         sync.Mutex
+	registered int
+	stopped    int
+	invoked    int
+}
+
+// Hide the embedded cancelCtx's private identity so context.AfterFunc exercises
+// this wrapper's scheduling hook instead of registering directly on the parent.
+func (ctx *relayAfterFuncContext) Value(any) any { return nil }
+
+func (ctx *relayAfterFuncContext) AfterFunc(callback func()) func() bool {
+	ctx.mu.Lock()
+	ctx.registered++
+	ctx.mu.Unlock()
+	stop := context.AfterFunc(relayPlainContext{Context: ctx.Context}, func() {
+		ctx.mu.Lock()
+		ctx.invoked++
+		ctx.mu.Unlock()
+		callback()
+	})
+	return func() bool {
+		if !stop() {
+			return false
+		}
+		ctx.mu.Lock()
+		defer ctx.mu.Unlock()
+		ctx.stopped++
+		return true
+	}
+}
+
+func (ctx *relayAfterFuncContext) snapshot() (registered, stopped, invoked int) {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	return ctx.registered, ctx.stopped, ctx.invoked
+}
+
+// relayPlainContext deliberately exposes only context.Context's standard
+// methods, preventing the test hook above from recursively calling itself.
+type relayPlainContext struct{ context.Context }
+
+type relayEOFConn struct{}
+
+func (*relayEOFConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (*relayEOFConn) Write(buffer []byte) (int, error) { return len(buffer), nil }
+func (*relayEOFConn) Close() error                     { return nil }
+func (*relayEOFConn) LocalAddr() net.Addr              { return tunnelAddr{network: "test", value: "local"} }
+func (*relayEOFConn) RemoteAddr() net.Addr             { return tunnelAddr{network: "test", value: "remote"} }
+func (*relayEOFConn) SetDeadline(time.Time) error      { return nil }
+func (*relayEOFConn) SetReadDeadline(time.Time) error  { return nil }
+func (*relayEOFConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestRelayStopArbiterKeepsCauseAndInterruptTogether(t *testing.T) {
 	interrupts := 0

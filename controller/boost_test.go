@@ -1115,6 +1115,277 @@ func TestFreshBoostReleasesPeriodicExplorerAfterAdmissionFailure(t *testing.T) {
 	runtime.routes.releaseExploration(lease)
 }
 
+func TestFreshBoostRecoveryProbeFinishesBeforeSingleHealthyFallback(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"exclusive-circuit-recovery",
+		"127.0.0.1:18120",
+		"recovering.example:443",
+		"healthy-one.example:443",
+		"healthy-two.example:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+
+	now := time.Now()
+	for index, address := range []string{"healthy-one.example:443", "healthy-two.example:443"} {
+		attempt, err := runtime.routes.begin(rule, address, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routeObserve(attempt, time.Duration(index+1)*10*time.Millisecond, nil, now)
+	}
+	failureAt := now.Add(-routeInitialCooldown - time.Second)
+	for failure := 0; failure < routeFailureThreshold; failure++ {
+		at := failureAt.Add(time.Duration(failure) * time.Millisecond)
+		attempt, err := runtime.routes.begin(rule, "recovering.example:443", at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routeObserve(attempt, time.Millisecond, errors.New("recovery fixture failure"), at)
+	}
+	lease, claimed := runtime.routes.claimRecoveryProbe(rule, now, nil)
+	if !claimed || lease.address != "recovering.example:443" {
+		t.Fatalf("recovery lease = %+v claimed=%t", lease, claimed)
+	}
+	defer runtime.routes.releaseRecoveryProbe(lease)
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	fallbackStarted := make(chan string, 2)
+	peers := make(chan net.Conn, 2)
+	var probeOnce sync.Once
+	var callsMu sync.Mutex
+	calls := make(map[string]int)
+	dial := func(_ context.Context, address string) (net.Conn, error) {
+		callsMu.Lock()
+		calls[address]++
+		callsMu.Unlock()
+		switch address {
+		case "recovering.example:443":
+			probeOnce.Do(func() { close(probeStarted) })
+			<-releaseProbe
+			return nil, errors.New("half-open probe failed")
+		case "healthy-one.example:443", "healthy-two.example:443":
+			fallbackStarted <- address
+			connection, peer := net.Pipe()
+			peers <- peer
+			return connection, nil
+		default:
+			return nil, fmt.Errorf("unexpected target %s", address)
+		}
+	}
+	type result struct {
+		winner dialResult
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		winner, err := runtime.raceBoostTargetsPreparedWithAdmissionAndRecovery(
+			context.Background(),
+			rule,
+			dial,
+			nil,
+			func(context.Context, *config.Rule, string, bool) (boostDialRelease, error) {
+				return func() {}, nil
+			},
+			lease,
+		)
+		done <- result{winner: winner, err: err}
+	}()
+
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("due recovery probe did not start")
+	}
+	select {
+	case address := <-fallbackStarted:
+		t.Fatalf("healthy fallback %q started before the recovery result", address)
+	case early := <-done:
+		t.Fatalf("ordinary route completed before the recovery result: %+v", early)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseProbe)
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("failed recovery probe did not release one healthy fallback")
+	}
+	if got.err != nil {
+		t.Fatalf("Boost race after failed recovery probe: %v", got.err)
+	}
+	defer got.winner.conn.Close()
+	if got.winner.addr != "healthy-one.example:443" {
+		t.Fatalf("winner = %q, want first healthy fallback", got.winner.addr)
+	}
+	select {
+	case peer := <-peers:
+		defer peer.Close()
+	default:
+		t.Fatal("healthy fallback did not create its test connection")
+	}
+
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls["recovering.example:443"] != 1 || calls["healthy-one.example:443"] != 1 ||
+		calls["healthy-two.example:443"] != 0 {
+		t.Fatalf("dial calls = %v, want one probe followed by one healthy fallback", calls)
+	}
+	snapshot := runtime.routes.snapshot(rule, "recovering.example:443", time.Now())
+	if !snapshot.CircuitOpen || snapshot.HalfOpen || snapshot.ConsecutiveFailures != routeFailureThreshold+1 ||
+		snapshot.Cooldown != 2*routeInitialCooldown {
+		t.Fatalf("failed recovery snapshot = %+v, want open circuit with doubled cooldown", snapshot)
+	}
+}
+
+func TestConcurrentFreshBoostUsesOneCircuitRecoveryProbeWithoutBlockingSiblings(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	rule := boostTestRule(
+		"single-circuit-recovery",
+		"127.0.0.1:18121",
+		"recovering.example:443",
+		"healthy.example:443",
+	)
+	rule.Protocol = config.ProtocolSOCKS5
+
+	now := time.Now()
+	healthyAttempt, err := runtime.routes.begin(rule, "healthy.example:443", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routeObserve(healthyAttempt, 10*time.Millisecond, nil, now)
+	failureAt := now.Add(-routeInitialCooldown - time.Second)
+	for failure := 0; failure < routeFailureThreshold; failure++ {
+		at := failureAt.Add(time.Duration(failure) * time.Millisecond)
+		attempt, beginErr := runtime.routes.begin(rule, "recovering.example:443", at)
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		routeObserve(attempt, time.Millisecond, errors.New("recovery fixture failure"), at)
+	}
+	ownerLease, claimed := runtime.routes.claimRecoveryProbe(rule, now, nil)
+	if !claimed {
+		t.Fatal("failed to claim owner recovery lease")
+	}
+	defer runtime.routes.releaseRecoveryProbe(ownerLease)
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var probeOnce sync.Once
+	var probeCalls atomic.Int32
+	var healthyCalls atomic.Int32
+	dial := func(_ context.Context, address string) (net.Conn, error) {
+		switch address {
+		case "recovering.example:443":
+			probeCalls.Add(1)
+			probeOnce.Do(func() { close(probeStarted) })
+			<-releaseProbe
+			connection, peer := net.Pipe()
+			_ = peer.Close()
+			return connection, nil
+		case "healthy.example:443":
+			healthyCalls.Add(1)
+			connection, peer := net.Pipe()
+			_ = peer.Close()
+			return connection, nil
+		default:
+			return nil, fmt.Errorf("unexpected target %s", address)
+		}
+	}
+	acquire := func(context.Context, *config.Rule, string, bool) (boostDialRelease, error) {
+		return func() {}, nil
+	}
+	type result struct {
+		winner dialResult
+		err    error
+	}
+	ownerDone := make(chan result, 1)
+	go func() {
+		winner, raceErr := runtime.raceBoostTargetsPreparedWithAdmissionAndRecovery(
+			context.Background(), rule, dial, nil, acquire, ownerLease,
+		)
+		ownerDone <- result{winner: winner, err: raceErr}
+	}()
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("owner recovery probe did not start")
+	}
+
+	const siblings = 16
+	siblingErrors := make(chan error, siblings)
+	for range siblings {
+		go func() {
+			siblingLease, siblingClaimed := runtime.routes.claimRecoveryProbe(rule, time.Now(), nil)
+			if siblingClaimed {
+				runtime.routes.releaseRecoveryProbe(siblingLease)
+				siblingErrors <- fmt.Errorf("sibling unexpectedly claimed recovery lease %+v", siblingLease)
+				return
+			}
+			winner, raceErr := runtime.raceBoostTargetsPreparedWithAdmissionAndRecovery(
+				context.Background(), rule, dial, nil, acquire, siblingLease,
+			)
+			if winner.conn != nil {
+				_ = winner.conn.Close()
+			}
+			if raceErr != nil {
+				siblingErrors <- raceErr
+				return
+			}
+			if winner.addr != "healthy.example:443" {
+				siblingErrors <- fmt.Errorf("sibling winner = %q", winner.addr)
+				return
+			}
+			siblingErrors <- nil
+		}()
+	}
+	for range siblings {
+		select {
+		case siblingErr := <-siblingErrors:
+			if siblingErr != nil {
+				t.Error(siblingErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("sibling waited for the in-flight recovery probe")
+		}
+	}
+	select {
+	case early := <-ownerDone:
+		t.Fatalf("healthy sibling winner canceled the owner probe: %+v", early)
+	default:
+	}
+	if got := probeCalls.Load(); got != 1 {
+		t.Fatalf("recovery probe calls = %d, want 1", got)
+	}
+	if got := healthyCalls.Load(); got != siblings {
+		t.Fatalf("healthy sibling calls = %d, want %d", got, siblings)
+	}
+
+	close(releaseProbe)
+	var owner result
+	select {
+	case owner = <-ownerDone:
+	case <-time.After(time.Second):
+		t.Fatal("owner recovery probe did not finish")
+	}
+	if owner.err != nil {
+		t.Fatalf("owner recovery probe: %v", owner.err)
+	}
+	defer owner.winner.conn.Close()
+	if owner.winner.addr != "recovering.example:443" {
+		t.Fatalf("owner winner = %q, want recovering route", owner.winner.addr)
+	}
+	snapshot := runtime.routes.snapshot(rule, "recovering.example:443", time.Now())
+	if snapshot.CircuitOpen || snapshot.HalfOpen || snapshot.ConsecutiveFailures != 0 ||
+		snapshot.LastRecovery.IsZero() {
+		t.Fatalf("successful recovery snapshot = %+v", snapshot)
+	}
+}
+
 func TestCachedBoostSlowPrimaryLaunchesHedgeOnSignalAndCancelsLoser(t *testing.T) {
 	resetProcessMetricsForTest()
 	runtime := newRoutingRuntime()

@@ -105,18 +105,24 @@ type http3RuleProbationState struct {
 }
 
 type http3RuleBreakerState struct {
-	phase               http3RuleBreakerPhase
-	failures            int
-	retryAt             time.Time
-	recent              []http3RuleDegradationEvent
-	probation           http3RuleProbationState
-	evaluationToken     uint64
-	evaluationInFlight  int
-	evaluationReachable bool
-	evaluationDeadline  time.Time
-	routeProbeToken     uint64
-	routeProbeKey       http3ConnectTransportKey
-	events              map[string]uint64
+	phase                    http3RuleBreakerPhase
+	failures                 int
+	retryAt                  time.Time
+	recent                   []http3RuleDegradationEvent
+	probation                http3RuleProbationState
+	evaluationToken          uint64
+	evaluationInFlight       int
+	evaluationReachable      bool
+	evaluationDeadline       time.Time
+	evaluationBlackholes     []http3UDPBlackholeScope
+	evaluationBlackholeOwned bool
+	committedBlackholes      []http3UDPBlackholeScope
+	udpBlackholeCommitToken  uint64
+	udpBlackholeArmInFlight  int
+	udpBlackholeArmed        bool
+	routeProbeToken          uint64
+	routeProbeKey            http3ConnectTransportKey
+	events                   map[string]uint64
 }
 
 type http3RuleBreaker struct {
@@ -229,6 +235,12 @@ func (breaker *http3RuleBreaker) beginWithLease(
 		key:           key,
 		establishedAt: now,
 	}
+	state.evaluationBlackholes = nil
+	state.evaluationBlackholeOwned = false
+	state.committedBlackholes = nil
+	state.udpBlackholeCommitToken = 0
+	state.udpBlackholeArmInFlight = 0
+	state.udpBlackholeArmed = false
 	state.events["probation_started"]++
 	return token, true, true
 }
@@ -408,6 +420,12 @@ func (breaker *http3RuleBreaker) abortProbation(rule string, token uint64, reaso
 	state.phase = http3RuleBreakerCooldown
 	state.retryAt = breaker.now().Add(http3RuleProbationAbortDelay)
 	state.probation = http3RuleProbationState{}
+	state.evaluationBlackholes = nil
+	state.evaluationBlackholeOwned = false
+	state.committedBlackholes = nil
+	state.udpBlackholeCommitToken = 0
+	state.udpBlackholeArmInFlight = 0
+	state.udpBlackholeArmed = false
 	state.routeProbeToken = 0
 	state.routeProbeKey = http3ConnectTransportKey{}
 	state.events["probation_aborted"]++
@@ -428,10 +446,22 @@ func (manager *connectProxyManager) observeHTTP3RuleValidation(
 		return
 	}
 	if manager.h3RuleBreaker.observeValidation(rule, token, parentErr, h2Reachable) && manager.h3 != nil {
-		manager.h3.armHTTP3ForcedDrainsForBreaker(
-			manager.h3RuleBreaker.endpointKeysForRules([]string{rule}),
-			manager.timeNow(),
-		)
+		scopes := manager.h3RuleBreaker.takeCommittedUDPBlackholes(rule)
+		if len(scopes) > 0 {
+			armed := 0
+			for _, scope := range scopes {
+				if manager.h3.armHTTP3ForcedDrainForBlackhole(scope, []string{rule}, manager.timeNow()) {
+					armed++
+				}
+			}
+			manager.h3RuleBreaker.finishUDPBlackholeArming(rule, token, armed > 0)
+		} else {
+			manager.h3.armHTTP3ForcedDrainsForBreaker(
+				manager.h3RuleBreaker.endpointKeysForRules([]string{rule}),
+				[]string{rule},
+				manager.timeNow(),
+			)
+		}
 	}
 }
 
@@ -472,6 +502,7 @@ func (breaker *http3RuleBreaker) observeValidation(
 		state.evaluationReachable = true
 	}
 	if state.evaluationReachable {
+		committingToken := state.evaluationToken
 		state.phase = http3RuleBreakerCooldown
 		state.failures = 1
 		state.retryAt = breaker.now().Add(http3RuleCooldownSteps[0])
@@ -479,6 +510,18 @@ func (breaker *http3RuleBreaker) observeValidation(
 		state.evaluationInFlight = 0
 		state.evaluationReachable = false
 		state.evaluationDeadline = time.Time{}
+		state.committedBlackholes = append(state.committedBlackholes[:0], state.evaluationBlackholes...)
+		state.evaluationBlackholes = nil
+		state.evaluationBlackholeOwned = false
+		if len(state.committedBlackholes) > 0 {
+			state.udpBlackholeCommitToken = committingToken
+			state.udpBlackholeArmInFlight = 1
+			state.udpBlackholeArmed = false
+		} else {
+			state.udpBlackholeCommitToken = 0
+			state.udpBlackholeArmInFlight = 0
+			state.udpBlackholeArmed = false
+		}
 		state.routeProbeToken = 0
 		state.routeProbeKey = http3ConnectTransportKey{}
 		state.events["opened"]++
@@ -514,6 +557,12 @@ func (breaker *http3RuleBreaker) expireEvaluationLocked(state *http3RuleBreakerS
 	state.evaluationInFlight = 0
 	state.evaluationReachable = false
 	state.evaluationDeadline = time.Time{}
+	state.evaluationBlackholes = nil
+	state.evaluationBlackholeOwned = false
+	state.committedBlackholes = nil
+	state.udpBlackholeCommitToken = 0
+	state.udpBlackholeArmInFlight = 0
+	state.udpBlackholeArmed = false
 	state.routeProbeToken = 0
 	state.routeProbeKey = http3ConnectTransportKey{}
 	state.events["validation_failed"]++
@@ -550,6 +599,12 @@ func (breaker *http3RuleBreaker) reenterCooldownLocked(state *http3RuleBreakerSt
 	state.phase = http3RuleBreakerCooldown
 	state.retryAt = breaker.now().Add(delay)
 	state.probation = http3RuleProbationState{}
+	state.evaluationBlackholes = nil
+	state.evaluationBlackholeOwned = false
+	state.committedBlackholes = nil
+	state.udpBlackholeCommitToken = 0
+	state.udpBlackholeArmInFlight = 0
+	state.udpBlackholeArmed = false
 	state.routeProbeToken = 0
 	state.routeProbeKey = http3ConnectTransportKey{}
 	return delay
@@ -563,10 +618,19 @@ func (manager *connectProxyManager) noteHTTP3RuleDegradation(event http3RuleDegr
 	if len(openedRules) == 0 || manager.h3 == nil {
 		return
 	}
-	manager.h3.armHTTP3ForcedDrainsForBreaker(
-		manager.h3RuleBreaker.endpointKeysForRules(openedRules),
-		manager.timeNow(),
-	)
+	if event.reason == http3DegradationReasonUDPBlackhole {
+		// The dedicated callback runs immediately after this state transition and
+		// scopes the drain to the exact blackholed QUIC generation. The generic
+		// rule-wide drain would unnecessarily touch unrelated degraded endpoints.
+		return
+	}
+	for _, rule := range openedRules {
+		manager.h3.armHTTP3ForcedDrainsForBreaker(
+			manager.h3RuleBreaker.endpointKeysForRules([]string{rule}),
+			[]string{rule},
+			manager.timeNow(),
+		)
+	}
 }
 
 func (breaker *http3RuleBreaker) noteDegradation(event http3RuleDegradationEvent) []string {
@@ -626,6 +690,12 @@ func (breaker *http3RuleBreaker) noteDegradation(event http3RuleDegradationEvent
 		state.evaluationInFlight = 0
 		state.evaluationReachable = false
 		state.evaluationDeadline = time.Time{}
+		state.evaluationBlackholes = nil
+		state.evaluationBlackholeOwned = false
+		state.committedBlackholes = nil
+		state.udpBlackholeCommitToken = 0
+		state.udpBlackholeArmInFlight = 0
+		state.udpBlackholeArmed = false
 		state.routeProbeToken = 0
 		state.routeProbeKey = http3ConnectTransportKey{}
 		state.events["validation_started"]++
@@ -740,7 +810,14 @@ func (breaker *http3RuleBreaker) noteSample(event http3RuleSampleEvent) {
 			probe.packetsSent = event.stats.PacketsSent - probe.initialStats.PacketsSent
 		}
 		signals := event.decision.Signals
-		healthy := signals.Sampled && !signals.Warmup && !signals.RTTBad && !signals.LossBad &&
+		// The transport sampler may wake a fraction before the minimum interval.
+		// The degradation detector deliberately marks that observation unsampled;
+		// it carries no path-quality evidence and must not erase healthy probation
+		// samples collected on the surrounding ticks.
+		if !signals.Sampled {
+			continue
+		}
+		healthy := !signals.Warmup && !signals.RTTBad && !signals.LossBad &&
 			!signals.PayloadStalled && signals.BlockedWrites == 0
 		if healthy && (probe.lastHealthyAt.IsZero() || event.at.Sub(probe.lastHealthyAt) >= http3DegradationSampleInterval) {
 			probe.healthySamples++
@@ -757,6 +834,12 @@ func (breaker *http3RuleBreaker) noteSample(event http3RuleSampleEvent) {
 			state.retryAt = time.Time{}
 			state.recent = nil
 			state.probation = http3RuleProbationState{}
+			state.evaluationBlackholes = nil
+			state.evaluationBlackholeOwned = false
+			state.committedBlackholes = nil
+			state.udpBlackholeCommitToken = 0
+			state.udpBlackholeArmInFlight = 0
+			state.udpBlackholeArmed = false
 			state.routeProbeToken = 0
 			state.routeProbeKey = http3ConnectTransportKey{}
 			state.events["recovered"]++

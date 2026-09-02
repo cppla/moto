@@ -6,7 +6,11 @@ WORKDIR /src
 RUN apk add --no-cache ca-certificates
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY *.go ./
+COPY config ./config
+COPY controller ./controller
+COPY utils ./utils
+COPY LICENSE THIRD_PARTY_NOTICES ./
 
 ARG VERSION=dev
 ARG COMMIT=unknown

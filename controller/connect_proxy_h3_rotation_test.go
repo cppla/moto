@@ -196,7 +196,8 @@ func TestHTTP3WarmingFailureKeepsOldServingAndBacksOff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire candidate: %v", err)
 	}
-	if !manager.markHTTP3CandidateFailed(key, candidate, errors.New("candidate failed")) {
+	retrySource, accepted := manager.markHTTP3CandidateFailed(key, candidate, errors.New("candidate failed"))
+	if !accepted || retrySource != source {
 		t.Fatal("warming candidate failure was not accepted")
 	}
 	releaseCandidate()
@@ -222,6 +223,49 @@ func TestHTTP3WarmingFailureKeepsOldServingAndBacksOff(t *testing.T) {
 	manager.mu.Unlock()
 	if err != nil || replacement == nil || replacement.lifecycle != http3TransportWarming {
 		t.Fatalf("candidate after backoff = %p/%v", replacement, err)
+	}
+}
+
+func TestHTTP3CandidateRetrySourceRejectsConcurrentDrain(t *testing.T) {
+	manager := newHTTP3RotationTestManager(t)
+	key := http3ConnectTransportKey{address: "proxy.example:443", serverName: "proxy.example"}
+	_, source, releaseSource, err := manager.acquireTransport(key)
+	if err != nil {
+		t.Fatalf("acquire source: %v", err)
+	}
+	releaseSource()
+	now := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+	manager.mu.Lock()
+	source.health = http3TransportDegraded
+	source.rotationReason = http3DegradationReasonUDPBlackhole
+	candidate, err := manager.ensureHTTP3RotationCandidateLocked(key, source, now)
+	manager.mu.Unlock()
+	if err != nil || candidate == nil {
+		t.Fatalf("create warming candidate: candidate=%p err=%v", candidate, err)
+	}
+	_, selected, releaseCandidate, err := manager.acquireTransport(key)
+	if err != nil || selected != candidate {
+		t.Fatalf("acquire warming candidate: selected=%p candidate=%p err=%v", selected, candidate, err)
+	}
+	retrySource, accepted := manager.markHTTP3CandidateFailed(key, candidate, errors.New("candidate failed"))
+	if !accepted || retrySource != source {
+		t.Fatalf("candidate retry source = %p accepted:%t, want source %p", retrySource, accepted, source)
+	}
+	releaseCandidate()
+
+	// The source can enter a rule-level blackhole drain after candidate failure
+	// was recorded but before the internal retry reserves it. The second exact
+	// slot check must reject that transition without allocating a fresh H3 slot.
+	manager.mu.Lock()
+	source.lifecycle = http3TransportDraining
+	manager.mu.Unlock()
+	if _, _, _, err := manager.acquireHTTP3CandidateRetrySource(key, retrySource); !errors.Is(err, errHTTP3CandidateRetrySourceUnavailable) {
+		t.Fatalf("retry drained source error = %v, want %v", err, errHTTP3CandidateRetrySourceUnavailable)
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if got := len(manager.transports[key]); got != 1 || manager.transports[key][0] != source {
+		t.Fatalf("candidate retry pool = %+v, want only original draining source", manager.transports[key])
 	}
 }
 
@@ -334,6 +378,34 @@ func TestHTTP3TunnelStatsCountsSuccessfulBytesAndBlockedWrites(t *testing.T) {
 	}
 	if got := slot.payloadRead.Load(); got != 31 {
 		t.Fatalf("read payload = %d, want 31", got)
+	}
+}
+
+func TestHTTP3BlockedReadDemandRequiresRecentMeaningfulDownstreamProgress(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	newBlockedRead := func(payload uint64, progressAt time.Time) *http3TunnelStats {
+		tunnel := &http3TunnelStats{}
+		tunnel.pendingReads.Store(1)
+		tunnel.readStarted.Store(now.Add(-http3UDPBlackholeStallTimeout).UnixNano())
+		tunnel.payloadRead.Store(payload)
+		if !progressAt.IsZero() {
+			tunnel.lastReadProgress.Store(progressAt.UnixNano())
+		}
+		return tunnel
+	}
+
+	idle := newBlockedRead(0, time.Time{})
+	old := newBlockedRead(http3UDPBlackholeRecentReadMinBytes, now.Add(-http3UDPBlackholeRecentReadWindow-time.Nanosecond))
+	active := newBlockedRead(http3UDPBlackholeRecentReadMinBytes, now.Add(-http3UDPBlackholeRecentReadWindow))
+	blocked, oldest, recent := http3BlockedReadDemand(now, []*http3TunnelStats{idle, old, active})
+	if blocked != 3 || oldest != http3UDPBlackholeStallTimeout || !recent {
+		t.Fatalf("blocked read demand = blocked:%d oldest:%s recent:%t", blocked, oldest, recent)
+	}
+
+	active.pendingReads.Store(0)
+	blocked, _, recent = http3BlockedReadDemand(now, []*http3TunnelStats{idle, old, active})
+	if blocked != 2 || recent {
+		t.Fatalf("idle/old pending Reads became demand: blocked:%d recent:%t", blocked, recent)
 	}
 }
 

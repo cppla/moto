@@ -151,11 +151,13 @@ func (runtime *routingRuntime) handleRegexpMatch(ctx context.Context, conn net.C
 	}
 	defer target.Close()
 
-	utils.Logger.Debug("建立连接",
-		zap.String("ruleName", rule.Name),
-		zap.String("remoteAddr", connAddr(conn)),
-		zap.String("targetAddr", connAddr(target)),
-		zap.Int("probeBytes", len(firstPacket)))
+	if entry := utils.Logger.Check(zap.DebugLevel, "建立连接"); entry != nil {
+		entry.Write(
+			zap.String("ruleName", rule.Name),
+			zap.String("remoteAddr", connAddr(conn)),
+			zap.String("targetAddr", connAddr(target)),
+			zap.Int("probeBytes", len(firstPacket)))
+	}
 
 	written, err := io.Copy(target, bytes.NewReader(firstPacket))
 	if err != nil || written != int64(len(firstPacket)) {
