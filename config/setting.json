@@ -175,8 +175,64 @@
       ]
     },
     {
-      "name": "TLS SNI/ALPN 分流示例",
+      "name": "HTTP to H3/H2",
       "listen": "127.0.0.1:9006",
+      "mode": "boost",
+      "protocol": "http",
+      "prewarm": false,
+      "timeout": 2000,
+      "hedge": {
+        "minDelay": 25,
+        "maxDelay": 250
+      },
+      "healthCheck": {
+        "type": "tcp",
+        "interval": 10000,
+        "timeout": 2000,
+        "failureThreshold": 3,
+        "successThreshold": 2
+      },
+      "allowlist": ["127.0.0.0/8", "::1/128"],
+      "maxConnections": 4096,
+      "maxConnectionsPerIP": 1024,
+      "blacklist": null,
+      "userAgent": [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/133.0.0.0 Mobile/15E148 Safari/604.1"
+      ],
+      "targets": [
+        {
+          "address": "proxy-a.example.com:443",
+          "connectProxy": {
+            "protocols": ["h3", "h2"],
+            "serverName": "proxy-a.example.com",
+            "basicAuth": {
+              "username": "CHANGE_ME_USERNAME",
+              "password": "CHANGE_ME_PASSWORD"
+            }
+          }
+        },
+        {
+          "address": "proxy-b.example.com:443",
+          "connectProxy": {
+            "protocols": ["h3", "h2"],
+            "serverName": "proxy-b.example.com",
+            "basicAuth": {
+              "username": "CHANGE_ME_USERNAME",
+              "password": "CHANGE_ME_PASSWORD"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "TLS SNI/ALPN 分流示例",
+      "listen": "127.0.0.1:9007",
       "protocol": "tcp",
       "mode": "tls",
       "prewarm": false,

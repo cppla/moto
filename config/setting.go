@@ -41,6 +41,7 @@ const (
 	ModeTLS             = "tls"
 	ProtocolTCP         = "tcp"
 	ProtocolSOCKS5      = "socks5"
+	ProtocolHTTP        = "http"
 	ConnectProxyH2      = "h2"
 	ConnectProxyH3      = "h3"
 	HealthCheckTCP      = "tcp"
@@ -90,6 +91,13 @@ var validModes = map[string]struct{}{
 var validProtocols = map[string]struct{}{
 	ProtocolTCP:    {},
 	ProtocolSOCKS5: {},
+	ProtocolHTTP:   {},
+}
+
+// IsConnectProtocol reports whether the inbound protocol uses the shared
+// HTTP/2 and HTTP/3 CONNECT upstream transports.
+func IsConnectProtocol(protocol string) bool {
+	return protocol == ProtocolSOCKS5 || protocol == ProtocolHTTP
 }
 
 // Config is the complete Moto configuration.
@@ -135,7 +143,7 @@ type ConnectProxyConfig struct {
 }
 
 // BasicAuthConfig is sent only as an outbound Proxy-Authorization header. It
-// is never used for inbound SOCKS authentication.
+// is never used for inbound SOCKS or HTTP authentication.
 type BasicAuthConfig struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -437,14 +445,14 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		return fmt.Errorf("invalid protocol %q", r.Protocol)
 	}
 	if len(r.UserAgent) != 0 {
-		if r.Protocol != ProtocolSOCKS5 {
-			return errors.New("userAgent is only valid for protocol socks5")
+		if !IsConnectProtocol(r.Protocol) {
+			return errors.New("userAgent is only valid for protocol socks5 or http")
 		}
 		if err := validateUserAgents(r.UserAgent); err != nil {
 			return err
 		}
 	}
-	if r.Protocol == ProtocolSOCKS5 {
+	if IsConnectProtocol(r.Protocol) {
 		if r.Mode == ModeRegex || r.Mode == ModeTLS {
 			return fmt.Errorf("protocol %q is not compatible with mode %q", r.Protocol, r.Mode)
 		}
@@ -452,17 +460,17 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 			host, _, splitErr := net.SplitHostPort(r.Listen)
 			listenAddr, parseErr := netip.ParseAddr(host)
 			if splitErr != nil || parseErr != nil || !listenAddr.Unmap().IsLoopback() {
-				return errors.New("protocol socks5 on a non-loopback listener requires an explicit non-empty allowlist")
+				return fmt.Errorf("protocol %s on a non-loopback listener requires an explicit non-empty allowlist", r.Protocol)
 			}
 		}
 		if r.Prewarm {
-			return errors.New("protocol socks5 cannot use prewarm")
+			return fmt.Errorf("protocol %s cannot use prewarm", r.Protocol)
 		}
 		if r.HealthCheck != nil && strings.ToLower(strings.TrimSpace(r.HealthCheck.Type)) == HealthCheckHTTP {
-			return errors.New("protocol socks5 cannot use HTTP healthCheck; use a TCP endpoint check")
+			return fmt.Errorf("protocol %s cannot use HTTP healthCheck; use a TCP endpoint check", r.Protocol)
 		}
 		if r.ProxyProtocol != nil {
-			return errors.New("protocol socks5 cannot use proxyProtocol")
+			return fmt.Errorf("protocol %s cannot use proxyProtocol", r.Protocol)
 		}
 	}
 	if len(r.Targets) == 0 {
@@ -536,18 +544,18 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		}
 		_, duplicateTarget := uniqueTargets[target.Address]
 		uniqueTargets[target.Address] = struct{}{}
-		if r.Protocol == ProtocolSOCKS5 {
+		if IsConnectProtocol(r.Protocol) {
 			if duplicateTarget {
-				return fmt.Errorf("targets[%d]: protocol socks5 requires unique target addresses", i)
+				return fmt.Errorf("targets[%d]: protocol %s requires unique target addresses", i, r.Protocol)
 			}
 			if target.ConnectProxy == nil {
-				return fmt.Errorf("targets[%d]: connectProxy is required for protocol socks5", i)
+				return fmt.Errorf("targets[%d]: connectProxy is required for protocol %s", i, r.Protocol)
 			}
 			if err := target.ConnectProxy.Validate(); err != nil {
 				return fmt.Errorf("targets[%d].connectProxy: %w", i, err)
 			}
 		} else if target.ConnectProxy != nil {
-			return fmt.Errorf("targets[%d]: connectProxy is only valid for protocol socks5", i)
+			return fmt.Errorf("targets[%d]: connectProxy is only valid for protocol socks5 or http", i)
 		}
 		target.Re = nil
 		if r.Mode == ModeRegex {

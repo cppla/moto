@@ -34,7 +34,7 @@ func (runtime *routingRuntime) handleRoundrobin(ctx context.Context, conn net.Co
 		return
 	}
 	defer conn.Close()
-	defer failPendingSOCKS5(conn)
+	defer failPendingConnectClient(conn)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -52,15 +52,15 @@ func (runtime *routingRuntime) handleRoundrobin(ctx context.Context, conn net.Co
 	var target net.Conn
 	var targetAttempt routeAttempt
 	var err error
-	if rule.Protocol == config.ProtocolSOCKS5 {
+	if config.IsConnectProtocol(rule.Protocol) {
 		target, targetAttempt, selectedAddr, err = runtime.dialSequentialConnectProxyTargets(dialCtx, rule, index)
 		if err != nil {
+			setPendingConnectClientFailure(conn, err)
 			if connectProxySequentialFailureIsLocal(err) {
 				utils.Logger.Debug("RoundRobin 原生代理连接因本地准入或取消结束",
 					zap.String("ruleName", rule.Name), zap.Error(err))
 				return
 			}
-			setPendingSOCKS5Failure(conn, err)
 			logConnectProxyFailure(rule, selectedAddr, err, "RoundRobin 原生代理连接失败")
 			return
 		}
@@ -131,7 +131,7 @@ func (runtime *routingRuntime) handleRoundrobin(ctx context.Context, conn net.Co
 		return
 	}
 	cancelDial()
-	if err := markSOCKS5Connected(conn); err != nil {
+	if err := markConnectClientConnected(conn); err != nil {
 		_ = target.Close()
 		return
 	}

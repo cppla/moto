@@ -109,7 +109,7 @@ func newRoutingGeneration(
 			return nil, fmt.Errorf("rules[%d]: duplicate listener key %q", index, key)
 		}
 		binding := &ruleBinding{rule: rule}
-		if rule.Protocol == config.ProtocolSOCKS5 {
+		if config.IsConnectProtocol(rule.Protocol) {
 			binding.connectProxyUserAgent = selectConnectProxyUserAgent(rule.UserAgent, "")
 		}
 		generation.bindings[key] = binding

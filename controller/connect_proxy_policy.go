@@ -9,20 +9,20 @@ import (
 
 const connectProxyMaxTargetAttempts = 2
 
-// connectProxyTargetAttemptLimit bounds one inbound SOCKS CONNECT. H3 and H2
+// connectProxyTargetAttemptLimit bounds one inbound CONNECT. H3 and H2
 // attempts inside one target count as one target attempt; a Boost hedge counts
 // as the second target. Raw TCP rules retain their existing all-target policy.
 func connectProxyTargetAttemptLimit(rule *config.Rule) int {
 	if rule == nil || len(rule.Targets) == 0 {
 		return 0
 	}
-	if rule.Protocol != config.ProtocolSOCKS5 || len(rule.Targets) < connectProxyMaxTargetAttempts {
+	if !config.IsConnectProtocol(rule.Protocol) || len(rule.Targets) < connectProxyMaxTargetAttempts {
 		return len(rule.Targets)
 	}
 	return connectProxyMaxTargetAttempts
 }
 
-// dialSequentialConnectProxyTargets bounds normal/round-robin SOCKS requests
+// dialSequentialConnectProxyTargets bounds normal/round-robin CONNECT requests
 // by distinct admitted target attempts, not by locally rejected candidates.
 // The outbound start callback runs only after health, circuit, and dial-capacity
 // admission. Both protocols inside one target still consume a single attempt.

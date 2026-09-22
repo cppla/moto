@@ -622,7 +622,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 			if result.err != nil && !errors.Is(result.err, context.Canceled) {
 				dialErrors = append(dialErrors, fmt.Errorf("%s: %w", result.addr, result.err))
 				if isCached {
-					if rule.Protocol == config.ProtocolSOCKS5 && connectProxyErrorIsRouteNeutral(result.err) {
+					if config.IsConnectProtocol(rule.Protocol) && connectProxyErrorIsRouteNeutral(result.err) {
 						outcome.cachedFailureNeutral = true
 					} else {
 						outcome.cachedFailed = true
@@ -1216,7 +1216,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		return
 	}
 	defer conn.Close()
-	defer failPendingSOCKS5(conn)
+	defer failPendingConnectClient(conn)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1254,7 +1254,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 	if recovery.token == 0 {
 		if cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
 			cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
-			triggerLazy := rule.Protocol != config.ProtocolSOCKS5 && time.Until(cached.expires) < boostRevalidateAfter
+			triggerLazy := !config.IsConnectProtocol(rule.Protocol) && time.Until(cached.expires) < boostRevalidateAfter
 			outcome, err := runtime.raceCachedBoostTarget(decisionCtx, rule, cached.addr, prepare)
 			if err == nil {
 				cacheHit, winnerToken := runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, true)
@@ -1264,7 +1264,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 					metricBoostCache(rule.Name, false)
 				}
 				defer outcome.winner.conn.Close()
-				if err := markSOCKS5Connected(conn); err != nil {
+				if err := markConnectClientConnected(conn); err != nil {
 					return
 				}
 				// A true cache hit deliberately does not extend expires. Otherwise
@@ -1298,6 +1298,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 				return
 			}
 			runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, false)
+			setPendingConnectClientFailure(conn, err)
 			if isDialBulkheadError(err) && !outcome.cachedFailed {
 				// Local dial pressure says nothing about the cached route's health. Keep
 				// the winner so a later connection can reuse it after capacity drains.
@@ -1311,8 +1312,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 			if ctx.Err() != nil {
 				return
 			}
-			if rule.Protocol == config.ProtocolSOCKS5 {
-				setPendingSOCKS5Failure(conn, err)
+			if config.IsConnectProtocol(rule.Protocol) {
 				logConnectProxyFailure(rule, cached.addr, err, "缓存原生代理线路及备选均不可用")
 			} else {
 				utils.Logger.Error("缓存线路及备选均不可用",
@@ -1335,13 +1335,13 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		return runtime.raceBoostTargetsPreparedWithRecovery(decisionCtx, rule, dial, prepare, recovery)
 	}()
 	if err != nil {
+		setPendingConnectClientFailure(conn, err)
 		if isDialBulkheadError(err) {
 			utils.Logger.Debug("前台拨号容量暂时不可用，结束当前 Boost 连接",
 				zap.String("ruleName", rule.Name), zap.Error(err))
 			return
 		}
-		if rule.Protocol == config.ProtocolSOCKS5 {
-			setPendingSOCKS5Failure(conn, err)
+		if config.IsConnectProtocol(rule.Protocol) {
 			logConnectProxyFailure(rule, "", err, "原生代理加速决策失败")
 		} else {
 			utils.Logger.Error("加速决策失败：所有线路均不可用",
@@ -1350,7 +1350,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 		return
 	}
 	defer winner.conn.Close()
-	if err := markSOCKS5Connected(conn); err != nil {
+	if err := markConnectClientConnected(conn); err != nil {
 		return
 	}
 	winnerToken := runtime.storeBoostWinner(key, winner.addr)

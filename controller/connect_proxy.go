@@ -1183,12 +1183,12 @@ func connectProxyExclusiveSetupFailureGroup(err error) (*routeFailureGroup, bool
 }
 
 func (runtime *routingRuntime) dialRouteTarget(ctx context.Context, rule *config.Rule, address string) (net.Conn, error) {
-	if rule == nil || rule.Protocol != config.ProtocolSOCKS5 {
+	if rule == nil || !config.IsConnectProtocol(rule.Protocol) {
 		return DialFastContext(ctx, address)
 	}
 	destination, ok := connectDestinationFromContext(ctx)
 	if !ok {
-		return nil, errors.New("SOCKS5 CONNECT destination is missing")
+		return nil, errors.New("CONNECT destination is missing")
 	}
 	for _, target := range rule.Targets {
 		if target != nil && target.Address == address {

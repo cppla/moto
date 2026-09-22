@@ -575,6 +575,18 @@ func (runtime *routingRuntime) dispatch(ctx context.Context, conn net.Conn, rule
 		conn = client
 		ctx = withConnectDestination(ctx, client.destination)
 		ctx = withConnectProxyUserAgent(ctx, userAgent)
+	} else if rule != nil && rule.Protocol == config.ProtocolHTTP {
+		client, err := prepareHTTPConnectClient(conn, rule)
+		if err != nil {
+			utils.Logger.Debug("HTTP CONNECT 握手失败",
+				zap.String("ruleName", rule.Name),
+				zap.String("remoteAddr", connAddr(conn)),
+				zap.Error(err))
+			return
+		}
+		conn = client
+		ctx = withConnectDestination(ctx, client.destination)
+		ctx = withConnectProxyUserAgent(ctx, userAgent)
 	}
 	switch rule.Mode {
 	case "normal":

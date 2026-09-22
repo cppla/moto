@@ -24,7 +24,7 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 		ctx = context.Background()
 	}
 	defer conn.Close()
-	defer failPendingSOCKS5(conn)
+	defer failPendingConnectClient(conn)
 	dialCtx := ctx
 	cancelDial := func() {}
 	if rule.Timeout > 0 {
@@ -36,10 +36,11 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 	var targetAttempt routeAttempt
 	var dialFailures []error
 	lastFailedTarget := ""
-	if rule.Protocol == config.ProtocolSOCKS5 {
+	if config.IsConnectProtocol(rule.Protocol) {
 		var err error
 		target, targetAttempt, lastFailedTarget, err = runtime.dialSequentialConnectProxyTargets(dialCtx, rule, 0)
 		if err != nil {
+			setPendingConnectClientFailure(conn, err)
 			if connectProxySequentialFailureIsLocal(err) {
 				utils.Logger.Debug("原生代理连接因本地准入或取消结束",
 					zap.String("ruleName", rule.Name), zap.Error(err))
@@ -101,8 +102,8 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 	}
 	if target == nil {
 		finalErr := errors.Join(dialFailures...)
-		if rule.Protocol == config.ProtocolSOCKS5 {
-			setPendingSOCKS5Failure(conn, finalErr)
+		if config.IsConnectProtocol(rule.Protocol) {
+			setPendingConnectClientFailure(conn, finalErr)
 			logConnectProxyFailure(rule, lastFailedTarget, finalErr, "所有原生代理目标均连接失败")
 		} else {
 			utils.Logger.Error("所有目标均连接失败，无法处理连接",
@@ -112,7 +113,7 @@ func (runtime *routingRuntime) handleNormal(ctx context.Context, conn net.Conn, 
 		return
 	}
 	defer target.Close()
-	if err := markSOCKS5Connected(conn); err != nil {
+	if err := markConnectClientConnected(conn); err != nil {
 		return
 	}
 

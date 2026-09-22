@@ -12,13 +12,13 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/cppla/moto" alt="License"></a>
 </p>
 
-Moto 是轻量级、自适应的 TCP 网关，也可以把本地 SOCKS5 CONNECT 转换为复用连接的 HTTP/2 或 HTTP/3 CONNECT。应用只连接一个稳定入口，Moto 根据真实连接延迟、近期故障和转发规则，从多个上游、隧道或跨地域节点中动态选路。
+Moto 是轻量级、自适应的 TCP 网关，也可以把本地 SOCKS5 或 HTTP/1.1 CONNECT 转换为复用连接的 HTTP/2 或 HTTP/3 CONNECT。应用只连接一个稳定入口，Moto 根据真实连接延迟、近期故障和转发规则，从多个上游、隧道或跨地域节点中动态选路。
 
 ## 为什么是 Moto？
 
 - **自适应选路：** 顺序故障切换、首包与 TLS SNI/ALPN 分类、线路质量学习、候选竞速、主动健康检查、故障隔离和恢复探测都在一个进程内完成。
 - **协议透明：** 默认 `protocol: "tcp"` 不终止 TLS、不改写流量，也不要求接入 SDK；HTTP(S)、WebSocket、SSH、SOCKS5 和私有 TCP 协议均可直接使用。
-- **SOCKS5 CONNECT 桥接：** `protocol: "socks5"` 接收标准 SOCKS5 CONNECT，向支持 CONNECT 的上游代理发送带可选 Basic Auth 的 HTTP/3 或 HTTP/2 请求；H3 不可用时在同一决策期限内回退 H2。
+- **CONNECT 桥接：** `protocol: "socks5"` 接收标准 SOCKS5 CONNECT，`protocol: "http"` 接收 HTTP/1.1 CONNECT；两者向上游代理发送带可选 Basic Auth 的 HTTP/3 或 HTTP/2 CONNECT 请求；配置 H3 优先、H2 兜底时，可安全重试的 H3 故障会在同一决策期限内回退 H2。
 - **高效转发：** 稳定字节流直接交给 `io.Copy`；Linux 上符合条件的 TCP→TCP 路径通常由 Go 运行时自动使用 `splice(2)` 零拷贝，不支持时自动回退。
 - **轻而可靠：** 单个 Go 二进制加一份 JSON 即可运行，同时内置严格配置校验、资源上限、访问控制、Prometheus 指标、优雅退出和跨平台发布。
 
@@ -46,15 +46,15 @@ flowchart LR
     M -. 故障切换 / 周期探索 .-> S[其他 Targets]
 ```
 
-### SOCKS5 上游协议工作方式
+### SOCKS5 / HTTP CONNECT 上游协议工作方式
 
-`mode` 先决定选哪个 target，`connectProxy.protocols` 再决定如何连接该 target。下列协议选择以每个新的 SOCKS5 CONNECT 为单位；已建立的隧道不会在 H3 和 H2 之间迁移，通常会继续使用原协议排空。严重退化且长期无数据推进的旧 H3 连接可能被关闭，由客户端重连。
+`mode` 先决定选哪个 target，`connectProxy.protocols` 再决定如何连接该 target。下列协议选择以每个新的 SOCKS5 或 HTTP CONNECT 为单位；已建立的隧道不会在 H3 和 H2 之间迁移，通常会继续使用原协议排空。严重退化且长期无数据推进的旧 H3 连接可能被关闭，由客户端重连。
 
 #### `["h3", "h2"]`：H3 优先，H2 兜底
 
 ```mermaid
 flowchart TD
-    A[新 SOCKS5 CONNECT] --> B{H3 目标或规则状态}
+    A[新 CONNECT] --> B{H3 目标或规则状态}
     B -->|正常| C[尝试 H3]
     B -->|冷却中或需要验证 H2 可达| D[直接尝试 H2]
     B -->|冷却到期，仅放行一个请求| P[尝试 H3 恢复连接]
@@ -86,7 +86,7 @@ H3 轮换不会迁移已有连接。普通退化让旧连接自然结束；严�
 
 ```mermaid
 flowchart LR
-    A[新 SOCKS5 CONNECT] --> B[尝试 H3]
+    A[新 CONNECT] --> B[尝试 H3]
     B -->|成功| C[使用 H3]
     C -. 持续退化 .-> H[平滑轮换到新的 H3 连接]
     H --> C
@@ -105,7 +105,7 @@ H3 失败不会因缺少 H2 而将该协议长期锁死，后续新请求仍可�
 
 ```mermaid
 flowchart LR
-    A[新 SOCKS5 CONNECT] --> B[尝试 H2]
+    A[新 CONNECT] --> B[尝试 H2]
     B -->|成功| C[使用 H2]
     B -->|失败| D[当前 Target 失败]
     D --> E{选路仍有候选 Target}
@@ -127,7 +127,7 @@ flowchart LR
 | `roundrobin` | 按规则独立轮询；单个目标失败时回退到竞速选择 |
 | `tls` | 解析 ClientHello 的 SNI/ALPN 选路，再原样转发 TLS 字节流 |
 
-`mode` 只决定如何在 targets 之间选路；监听协议由 `protocol` 独立决定。`normal`、`boost` 和 `roundrobin` 都可用于 SOCKS5 → H2/H3 CONNECT。
+`mode` 只决定如何在 targets 之间选路；监听协议由 `protocol` 独立决定。`normal`、`boost` 和 `roundrobin` 都可用于 SOCKS5 / HTTP → H2/H3 CONNECT。
 
 <details>
 <summary><strong>选路与可靠性</strong></summary>
@@ -188,14 +188,14 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `mode` | 无 | `normal`、`regex`、`boost`、`roundrobin` 或 `tls` |
-| `protocol` | `tcp` | `tcp` 为透明字节流；`socks5` 解析入站 CONNECT 并使用 target 的 `connectProxy` |
+| `protocol` | `tcp` | `tcp` 为透明字节流；`socks5` / `http` 分别解析 SOCKS5 / HTTP/1.1 CONNECT，并使用 target 的 `connectProxy` |
 | `timeout` | `regex` 为 500 ms；其余为 3 s | 拨号或首包决策期限，不限制已建立连接的寿命 |
 | `prewarm` | `false` | 仅在上游允许业务握手前保持空闲 TCP 时启用 |
 | `hedge` | 关闭 | 仅用于至少两个唯一目标的 `boost`；空对象默认延迟范围 25–250 ms，且 `maxDelay` 必须小于规则 `timeout` |
 | `healthCheck` | 关闭 | 可选 TCP 或明文 HTTP 主动探测，达到阈值后暂时排除目标 |
 | `proxyProtocol` | 关闭 | 从可信 CIDR 接收 PROXY v1/v2，或向上游发送 v1/v2 |
-| `userAgent` | 缺省 | 仅用于 `socks5` 规则；Moto 启动时从非空数组中为每条规则随机选择一个上游身份，并在本次进程运行期间保持稳定 |
-| `allowlist` | 空 | CIDR 来源白名单；空值允许所有有效地址 |
+| `userAgent` | 缺省 | 用于 `socks5` / `http` 规则；Moto 启动时从非空数组中为每条规则随机选择一个上游身份，并在本次进程运行期间保持稳定 |
+| `allowlist` | 空 | CIDR 来源白名单；空值允许所有有效地址，CONNECT 入站使用非 loopback 监听时必须显式配置非空白名单 |
 | `blacklist` | 空 | 兼容旧配置的精确 IP 拒绝表 |
 | `maxConnections` | `4096` | 单规则连接上限 |
 | `maxConnectionsPerIP` | `256` | 单 IP、单规则连接上限 |
@@ -251,7 +251,43 @@ SOCKS5 到 H3/H2 CONNECT 的完整规则已经整合到 [config/setting.json](co
 
 HTTP/2 使用保守的协议级 PING 健康检测，识别并释放失联连接，后续请求可重新建连。健康的空闲隧道不会仅因没有业务流量而被关闭；失效连接上的已有隧道需要客户端重新连接。
 
-SOCKS5 模式使用独立的协议连接管理，因此必须保持 `prewarm: false`，也不能与 `regex`、`tls`、HTTP health check 或 PROXY protocol 组合。Basic Auth 凭据存放在 JSON 中，应严格限制配置文件权限。Moto 会在启动前校验配置，无效配置不会投入运行。
+SOCKS5 和 HTTP CONNECT 模式使用独立的协议连接管理，因此必须保持 `prewarm: false`，也不能与 `regex`、`tls`、HTTP health check 或 PROXY protocol 组合。Basic Auth 凭据存放在 JSON 中，应严格限制配置文件权限。Moto 会在启动前校验配置，无效配置不会投入运行。
+
+### HTTP/1.1 CONNECT → HTTP/3/HTTP/2 CONNECT
+
+`protocol: "http"` 提供本地 HTTP/1.1 CONNECT 入口，可用于通过 HTTP 代理访问 HTTPS 的客户端。它只支持 CONNECT 隧道，不支持普通 HTTP GET 等正向代理请求。建立隧道后，目标 HTTPS 的 TLS 流量保持加密，Moto 不解密目标网站内容。
+
+以下规则放入 `rules` 数组即可；上游地址和认证信息按实际环境填写，`connectProxy`、选路模式、H3/H2 回退和 `userAgent` 与 SOCKS5 入口一致：
+
+```json
+{
+  "name": "HTTP to H3/H2",
+  "listen": "127.0.0.1:9006",
+  "mode": "normal",
+  "protocol": "http",
+  "prewarm": false,
+  "timeout": 3000,
+  "allowlist": ["127.0.0.0/8", "::1/128"],
+  "targets": [{
+    "address": "proxy.example.com:443",
+    "connectProxy": {
+      "protocols": ["h3", "h2"],
+      "serverName": "proxy.example.com",
+      "basicAuth": {
+        "username": "YOUR_PROXY_USER",
+        "password": "YOUR_PROXY_PASSWORD"
+      }
+    }
+  }]
+}
+```
+
+```bash
+curl --proxy http://127.0.0.1:9006 https://example.com
+HTTPS_PROXY=http://127.0.0.1:9006 curl https://example.com
+```
+
+HTTP 入站不提供用户名/密码认证；`connectProxy.basicAuth` 仅用于 Moto 向上游代理认证。建议保持本地监听；非 loopback 监听必须配置明确的来源 `allowlist`，并配合防火墙限制访问，避免成为开放代理。
 
 <details>
 <summary><strong>TLS、健康检查与 PROXY protocol 示例</strong></summary>
@@ -299,7 +335,7 @@ TCP 检查在发现目标恢复后会提前进行第二次确认，但仍须满�
 
 - 示例配置只监听 `127.0.0.1` 并关闭预热，但各模式已启用 TCP 健康检查；启动后仍会周期连接配置的外部目标，部署前必须替换为自己的上游。
 - 进程最多同时处理 4,096 条客户端连接；若监听公网地址，应同时配置精确 `allowlist`，并使用防火墙或安全组限制来源。
-- 默认 TCP 规则是透明转发器；SOCKS5 bridge 会解析握手并终止到上游 proxy 的 TLS/QUIC，但不解密隧道内的最终 TLS。两种模式都不替代应用认证或网络访问控制；观测端点只能监听数字形式的 loopback 地址。
+- 默认 TCP 规则是透明转发器；SOCKS5 / HTTP CONNECT bridge 会解析握手并终止到上游 proxy 的 TLS/QUIC，但不解密隧道内的最终 TLS。这些模式都不替代应用认证或网络访问控制；观测端点只能监听数字形式的 loopback 地址。
 
 ```bash
 curl -fsS http://127.0.0.1:9090/healthz
@@ -323,7 +359,7 @@ python3 test/moto-route-watch.py --json
 
 Moto 在 TCP 层透明支持 `ws://` 和 `wss://`。HTTP Upgrade、TLS 握手和 WebSocket 帧不会被改写，已建立会话也不受规则 `timeout` 限制；通用四种模式均有 Upgrade、文本帧、Ping/Pong 和长连接端到端测试，`tls` 模式另有真实 ClientHello 分片与原字节重放测试。
 
-上述零拷贝和透明 WebSocket 说明针对 `protocol: "tcp"`。SOCKS5 → H2/H3 需要 TLS/QUIC 加密和 HTTP DATA framing，不能使用 TCP→TCP 的 `splice(2)` 零拷贝路径。
+上述零拷贝和透明 WebSocket 说明针对 `protocol: "tcp"`。SOCKS5 / HTTP CONNECT → H2/H3 需要 TLS/QUIC 加密和 HTTP DATA framing，不能使用 TCP→TCP 的 `splice(2)` 零拷贝路径。
 
 长连接会持续占用连接额度，并在 Moto 关闭超过 10 秒后被强制断开。`regex` 只能检查明文 WS 握手前 4 KiB；WSS 的 Host 和路径已加密，但 `tls` 模式可按 SNI/ALPN 分流。WebSocket 规则建议保持 `prewarm: false`。
 
@@ -346,7 +382,7 @@ make build
 <details>
 <summary><strong>Docker 与 systemd</strong></summary>
 
-Docker 镜像默认以非 root `65532:65532` 运行，包含系统 CA bundle，并从 `/etc/moto/setting.json` 读取挂载的配置。含 Basic Auth 的配置不要直接用工作区里通常为 `0644` 的文件；Linux 上先建立仅 root 与容器运行组可读的独立副本。当前示例监听 `9001`–`9005`，无需低端口绑定权限：
+Docker 镜像默认以非 root `65532:65532` 运行，包含系统 CA bundle，并从 `/etc/moto/setting.json` 读取挂载的配置。含 Basic Auth 的配置不要直接用工作区里通常为 `0644` 的文件；Linux 上先建立仅 root 与容器运行组可读的独立副本。当前示例监听 `9001`–`9007`，无需低端口绑定权限：
 
 ```bash
 sudo install -d -o root -g 65532 -m 0750 /etc/moto-container
