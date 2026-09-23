@@ -69,6 +69,17 @@ type http2ConnectDialCall struct {
 	err  error
 }
 
+// http2SetupError identifies a failed physical DNS/TCP/TLS setup, not an
+// individual CONNECT stream. Every waiter on one dial receives the same group
+// so route health counts the failure once per route and routing generation.
+type http2SetupError struct {
+	cause error
+	group *routeFailureGroup
+}
+
+func (err *http2SetupError) Error() string { return err.cause.Error() }
+func (err *http2SetupError) Unwrap() error { return err.cause }
+
 type http2ConnectIdleCheck struct {
 	again bool // guarded by the pool mutex
 }
@@ -169,6 +180,9 @@ func (pool *http2ConnectConnPool) dial(call *http2ConnectDialCall, address strin
 	pool.mu.Unlock()
 	if call.err != nil && call.conn != nil {
 		_ = call.conn.Close()
+	}
+	if call.err != nil {
+		call.err = &http2SetupError{cause: call.err, group: newRouteFailureGroup()}
 	}
 	close(call.done)
 }

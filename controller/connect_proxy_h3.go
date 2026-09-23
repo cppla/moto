@@ -55,6 +55,8 @@ type http3ConnectTransportSlot struct {
 	cancelSetup    context.CancelFunc
 	closeOnce      sync.Once
 	closeRequested atomic.Bool
+	physicalMu     sync.Mutex
+	physicalConns  map[*quic.Conn]struct{}
 	active         int
 	limit          int
 
@@ -98,6 +100,7 @@ func (slot *http3ConnectTransportSlot) close() {
 		if slot.cancelSetup != nil {
 			slot.cancelSetup()
 		}
+		slot.closePhysicalConnections()
 		if slot.transport != nil {
 			_ = slot.transport.Close()
 		}
@@ -559,6 +562,11 @@ func (manager *http3ConnectManager) releaseTransport(
 	}
 	if slot.active == 0 {
 		remove := manager.retired || slot.lifecycle == http3TransportDraining || slot.lifecycle == http3TransportFailed
+		// Concurrent RoundTrips may have redialed before an earlier error was
+		// observed, including an error racing with caller cancellation. Once all
+		// logical users leave, retire the whole slot instead of retaining hidden
+		// idle physical connections behind the Transport's current cache entry.
+		remove = remove || slot.hasMultiplePhysicalConnections()
 		if slot.lifecycle == http3TransportServing && !remove {
 			for _, candidate := range manager.transports[key] {
 				if candidate != nil && candidate != slot && candidate.lifecycle == http3TransportServing {
@@ -764,6 +772,9 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 		var candidateRetrySource *http3ConnectTransportSlot
 		if candidateAttempt && ctx.Err() == nil {
 			candidateRetrySource, candidateFailed = manager.markHTTP3CandidateFailed(key, transportSlot, setupErr)
+		}
+		if ctx.Err() == nil && streamCtx.Err() == nil {
+			manager.drainHTTP3ErroredTransport(key, transportSlot)
 		}
 		releaseTransport()
 		cancelStream()

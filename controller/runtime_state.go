@@ -28,6 +28,7 @@ type boostWinnerCacheRegistry struct {
 	sync.Mutex
 	entries        map[string]boostWinnerEntry
 	nextGeneration uint64
+	decisions      map[string]*boostWinnerDecisionState
 }
 
 type boostRuntime struct {
@@ -223,7 +224,7 @@ func (runtime *routingRuntime) clear(rules []*config.Rule) {
 			continue
 		}
 		key := boostRuleKey(rule)
-		delete(runtime.boost.cache.entries, key)
+		runtime.deleteBoostWinnerLocked(key)
 		runtime.boost.revalidating.Delete(key)
 		runtime.roundRobin.Delete(rule)
 	}

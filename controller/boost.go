@@ -36,6 +36,21 @@ type boostWinnerToken struct {
 	generation uint64
 }
 
+// Decision state exists only while an unpublished fresh/lazy race is in
+// flight. A cache mutation removes its identity from the registry, invalidating
+// every older decision without retaining per-key tombstones after completion.
+type boostWinnerDecisionState struct {
+	references int
+}
+
+type boostWinnerDecision struct {
+	cache    *boostWinnerCacheRegistry
+	key      string
+	state    *boostWinnerDecisionState
+	expires  time.Time
+	released bool // protected by cache.Lock
+}
+
 type boostRevalidation struct {
 	done chan struct{}
 }
@@ -112,7 +127,7 @@ func (runtime *routingRuntime) loadBoostWinner(key string) (string, bool, time.T
 		return "", false, time.Time{}
 	}
 	if !now.Before(entry.expires) {
-		delete(runtime.boost.cache.entries, key)
+		runtime.deleteBoostWinnerLocked(key)
 		return "", false, time.Time{}
 	}
 	return entry.addr, true, entry.expires
@@ -127,7 +142,7 @@ func (runtime *routingRuntime) loadBoostWinnerToken(key string) (boostWinnerEntr
 		return boostWinnerEntry{}, false
 	}
 	if !now.Before(entry.expires) {
-		delete(runtime.boost.cache.entries, key)
+		runtime.deleteBoostWinnerLocked(key)
 		return boostWinnerEntry{}, false
 	}
 	return entry, true
@@ -180,9 +195,12 @@ func (runtime *routingRuntime) storeBoostWinner(key, addr string) boostWinnerTok
 }
 
 func (runtime *routingRuntime) storeBoostWinnerLocked(key, addr string) boostWinnerToken {
+	if runtime.boost.cache.entries == nil {
+		runtime.boost.cache.entries = make(map[string]boostWinnerEntry)
+	}
 	if _, exists := runtime.boost.cache.entries[key]; !exists && len(runtime.boost.cache.entries) >= boostWinnerCacheMax {
 		for oldKey := range runtime.boost.cache.entries {
-			delete(runtime.boost.cache.entries, oldKey)
+			runtime.deleteBoostWinnerLocked(oldKey)
 			break
 		}
 	}
@@ -191,12 +209,75 @@ func (runtime *routingRuntime) storeBoostWinnerLocked(key, addr string) boostWin
 		runtime.boost.cache.nextGeneration++
 	}
 	token := boostWinnerToken{key: key, addr: addr, generation: runtime.boost.cache.nextGeneration}
+	delete(runtime.boost.cache.decisions, key)
 	runtime.boost.cache.entries[key] = boostWinnerEntry{
 		addr:       addr,
 		expires:    time.Now().Add(boostWinnerTTL),
 		generation: token.generation,
 	}
 	return token
+}
+
+func (runtime *routingRuntime) beginBoostWinnerDecision(key string) *boostWinnerDecision {
+	cache := runtime.boost.cache
+	cache.Lock()
+	defer cache.Unlock()
+	if entry, exists := cache.entries[key]; exists && !time.Now().Before(entry.expires) {
+		runtime.deleteBoostWinnerLocked(key)
+	}
+	if cache.decisions == nil {
+		cache.decisions = make(map[string]*boostWinnerDecisionState)
+	}
+	state := cache.decisions[key]
+	if state == nil {
+		state = &boostWinnerDecisionState{}
+		cache.decisions[key] = state
+	}
+	state.references++
+	return &boostWinnerDecision{cache: cache, key: key, state: state, expires: cache.entries[key].expires}
+}
+
+func (runtime *routingRuntime) releaseBoostWinnerDecision(decision *boostWinnerDecision) {
+	if decision == nil || decision.cache != runtime.boost.cache {
+		return
+	}
+	runtime.boost.cache.Lock()
+	runtime.releaseBoostWinnerDecisionLocked(decision)
+	runtime.boost.cache.Unlock()
+}
+
+func (runtime *routingRuntime) releaseBoostWinnerDecisionLocked(decision *boostWinnerDecision) {
+	if decision == nil || decision.cache != runtime.boost.cache || decision.released {
+		return
+	}
+	decision.released = true
+	decision.state.references--
+	if decision.state.references == 0 && runtime.boost.cache.decisions[decision.key] == decision.state {
+		delete(runtime.boost.cache.decisions, decision.key)
+	}
+}
+
+// Publishing consumes ownership, before a successful tunnel enters its relay
+// lifetime. A newer cache write, deletion, expiry, or eviction always wins over
+// a result obtained from an older cache view, even if the key became absent
+// again in the meantime. Other rule keys do not invalidate this decision.
+func (runtime *routingRuntime) publishBoostWinnerDecision(decision *boostWinnerDecision, addr string) boostWinnerToken {
+	if decision == nil || decision.cache != runtime.boost.cache {
+		return boostWinnerToken{}
+	}
+	cache := runtime.boost.cache
+	cache.Lock()
+	defer cache.Unlock()
+	if decision.released {
+		return boostWinnerToken{}
+	}
+	current := cache.decisions[decision.key] == decision.state &&
+		(decision.expires.IsZero() || time.Now().Before(decision.expires))
+	runtime.releaseBoostWinnerDecisionLocked(decision)
+	if !current {
+		return boostWinnerToken{}
+	}
+	return runtime.storeBoostWinnerLocked(decision.key, addr)
 }
 
 // A late hedge result may serve its own client, but cannot overwrite
@@ -221,8 +302,13 @@ func deleteBoostWinner(key string) {
 
 func (runtime *routingRuntime) deleteBoostWinner(key string) {
 	runtime.boost.cache.Lock()
-	delete(runtime.boost.cache.entries, key)
+	runtime.deleteBoostWinnerLocked(key)
 	runtime.boost.cache.Unlock()
+}
+
+func (runtime *routingRuntime) deleteBoostWinnerLocked(key string) {
+	delete(runtime.boost.cache.entries, key)
+	delete(runtime.boost.cache.decisions, key)
 }
 
 func (runtime *routingRuntime) deleteBoostWinnerIfCurrent(token boostWinnerToken) bool {
@@ -235,7 +321,7 @@ func (runtime *routingRuntime) deleteBoostWinnerIfCurrent(token boostWinnerToken
 	if !ok || entry.generation != token.generation || entry.addr != token.addr {
 		return false
 	}
-	delete(runtime.boost.cache.entries, token.key)
+	runtime.deleteBoostWinnerLocked(token.key)
 	return true
 }
 
@@ -1049,12 +1135,17 @@ func (runtime *routingRuntime) startLazyRevalidate(parent context.Context, rule 
 // lazyRevalidate runs one bounded background race without interrupting the
 // current stream. Deduplication and lifecycle tracking live in the starter.
 func (runtime *routingRuntime) lazyRevalidate(parent context.Context, rule *config.Rule, key string) {
+	runtime.lazyRevalidateWithDial(parent, rule, key, DialFastContext)
+}
+
+func (runtime *routingRuntime) lazyRevalidateWithDial(parent context.Context, rule *config.Rule, key string, dial boostDialFunc) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(parent, boostRevalidateLimit)
 	defer cancel()
-	dial := boostDialFunc(DialFastContext)
+	decision := runtime.beginBoostWinnerDecision(key)
+	defer runtime.releaseBoostWinnerDecision(decision)
 	var prepare boostPrepareFunc
 	if rule.ProxyProtocol != nil && rule.ProxyProtocol.Send != "" {
 		prepare = func(prepareCtx context.Context, connection net.Conn, _ string) error {
@@ -1072,7 +1163,9 @@ func (runtime *routingRuntime) lazyRevalidate(parent context.Context, rule *conf
 		return
 	}
 	defer winner.conn.Close()
-	runtime.storeBoostWinner(key, winner.addr)
+	if runtime.publishBoostWinnerDecision(decision, winner.addr).generation == 0 {
+		return
+	}
 	utils.Logger.Debug("懒惰刷新winner",
 		zap.String("ruleName", rule.Name),
 		zap.String("targetAddr", winner.addr))
@@ -1161,9 +1254,19 @@ func (runtime *routingRuntime) http3OnlyRecoveryRestricted(rule *config.Rule, ta
 // rate-limited protocol canary. Rule-level cooldown/probation remains authoritative;
 // when every route is penalized, retain the selector's deliberate fail-open behavior.
 func (runtime *routingRuntime) claimBoostRecoveryProbe(rule *config.Rule, now time.Time) routeRecoveryLease {
+	return runtime.claimBoostRecoveryProbeBeforeSelection(rule, now, nil)
+}
+
+// beforeSelection snapshots publication ownership only when recovery is due.
+// Normal cache hits retain the original token CAS path without allocating a
+// fresh-decision lease. The callback is synchronous and precedes selection.
+func (runtime *routingRuntime) claimBoostRecoveryProbeBeforeSelection(rule *config.Rule, now time.Time, beforeSelection func()) routeRecoveryLease {
 	if runtime == nil || runtime.routes == nil || rule == nil || len(rule.Targets) == 0 ||
 		!runtime.routes.recoveryProbeDue(rule, now) {
 		return routeRecoveryLease{}
+	}
+	if beforeSelection != nil {
+		beforeSelection()
 	}
 	excluded, penalties, hasUnpenalized := runtime.boostRecoveryPolicy(rule, now)
 	protocolRecoveryDue := runtime.connectProxy != nil && runtime.connectProxy.h3RuleBreaker != nil &&
@@ -1269,10 +1372,16 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 	// cached path instead of queueing behind the half-open probe. The combined
 	// helper also applies protocol health and carries an exclusive H3 recovery
 	// lease when target-circuit recovery and protocol probation are both due.
-	recovery := runtime.claimBoostRecoveryProbe(rule, time.Now())
+	var cacheDecision *boostWinnerDecision
+	defer func() { runtime.releaseBoostWinnerDecision(cacheDecision) }()
+	recovery := runtime.claimBoostRecoveryProbeBeforeSelection(rule, time.Now(), func() {
+		cacheDecision = runtime.beginBoostWinnerDecision(key)
+	})
 
 	if recovery.token == 0 {
 		if cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
+			runtime.releaseBoostWinnerDecision(cacheDecision)
+			cacheDecision = nil
 			cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
 			triggerLazy := !config.IsConnectProtocol(rule.Protocol) && time.Until(cached.expires) < boostRevalidateAfter
 			outcome, err := runtime.raceCachedBoostTarget(decisionCtx, rule, cached.addr, prepare)
@@ -1344,6 +1453,11 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 			}
 			return
 		}
+		// Expiry or protocol-health eviction during the cache lookup may have
+		// invalidated our first view. Start the fresh race from the post-eviction
+		// state, without weakening a recovery probe's original ownership.
+		runtime.releaseBoostWinnerDecision(cacheDecision)
+		cacheDecision = runtime.beginBoostWinnerDecision(key)
 	}
 	metricBoostCache(rule.Name, false)
 
@@ -1373,7 +1487,8 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 	if err := markConnectClientConnected(conn); err != nil {
 		return
 	}
-	winnerToken := runtime.storeBoostWinner(key, winner.addr)
+	winnerToken := runtime.publishBoostWinnerDecision(cacheDecision, winner.addr)
+	cacheDecision = nil
 	if entry := utils.Logger.Check(zap.DebugLevel, "建立连接"); entry != nil {
 		entry.Write(
 			zap.String("ruleName", rule.Name),

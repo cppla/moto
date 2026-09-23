@@ -3,6 +3,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"moto/config"
 	"sync"
 	"testing"
 	"time"
@@ -168,4 +169,196 @@ func TestCachedBoostReplacementTokenCannotInvalidateLaterWinner(t *testing.T) {
 	if !ok || entry.addr != current.addr || entry.generation != current.generation {
 		t.Fatalf("old replacement relay evicted the refreshed winner: entry=%+v exists=%t current=%+v", entry, ok, current)
 	}
+}
+
+func requireNoBoostWinnerDecisions(t *testing.T, runtime *routingRuntime) {
+	t.Helper()
+	runtime.boost.cache.Lock()
+	defer runtime.boost.cache.Unlock()
+	if count := len(runtime.boost.cache.decisions); count != 0 {
+		t.Fatalf("completed decisions retained %d ownership records", count)
+	}
+}
+
+func TestFreshBoostCacheDecisionRejectsABA(t *testing.T) {
+	for _, mutation := range []string{"store_delete", "delete_absent", "replace_delete", "conditional_delete", "expiry_load", "clear", "cached_replace"} {
+		t.Run(mutation, func(t *testing.T) {
+			runtime := newRoutingRuntime()
+			defer runtime.stopBackground()
+			rule := boostTestRule(t.Name(), "127.0.0.1:19901", "one.example:443", "two.example:443")
+			key := boostRuleKey(rule)
+			decision := runtime.beginBoostWinnerDecision(key)
+			defer runtime.releaseBoostWinnerDecision(decision)
+			switch mutation {
+			case "store_delete":
+				runtime.storeBoostWinner(key, "new.example:443")
+				runtime.deleteBoostWinner(key)
+			case "delete_absent":
+				runtime.deleteBoostWinner(key)
+			case "replace_delete":
+				runtime.storeBoostWinner(key, "same.example:443")
+				runtime.storeBoostWinner(key, "same.example:443")
+				runtime.deleteBoostWinner(key)
+			case "conditional_delete":
+				token := runtime.storeBoostWinner(key, "new.example:443")
+				runtime.deleteBoostWinnerIfCurrent(token)
+			case "expiry_load":
+				runtime.storeBoostWinner(key, "new.example:443")
+				runtime.boost.cache.Lock()
+				entry := runtime.boost.cache.entries[key]
+				entry.expires = time.Now().Add(-time.Second)
+				runtime.boost.cache.entries[key] = entry
+				runtime.boost.cache.Unlock()
+				runtime.loadBoostWinnerToken(key)
+			case "clear":
+				runtime.clear([]*config.Rule{rule})
+			case "cached_replace":
+				token := runtime.storeBoostWinner(key, "current.example:443")
+				runtime.releaseBoostWinnerDecision(decision)
+				decision = runtime.beginBoostWinnerDecision(key)
+				runtime.replaceBoostWinnerIfCurrent(token, "new.example:443")
+			}
+			before, existed := cachedBoostRawEntry(runtime, key)
+			if token := runtime.publishBoostWinnerDecision(decision, "stale.example:443"); token != (boostWinnerToken{}) {
+				t.Fatalf("superseded decision acquired cache ownership: %+v", token)
+			}
+			after, exists := cachedBoostRawEntry(runtime, key)
+			if exists != existed || after != before {
+				t.Fatalf("old result changed newer cache state: before=%+v exists=%t after=%+v exists=%t", before, existed, after, exists)
+			}
+			requireNoBoostWinnerDecisions(t, runtime)
+		})
+	}
+}
+
+func TestFreshBoostCacheDecisionIsolationAndCleanup(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	first := runtime.beginBoostWinnerDecision("first")
+	other := runtime.beginBoostWinnerDecision("other")
+	if token := runtime.publishBoostWinnerDecision(other, "other.example:443"); token.generation == 0 {
+		t.Fatal("first successful decision did not populate an empty cache")
+	}
+	if token := runtime.publishBoostWinnerDecision(first, "first.example:443"); token.generation == 0 {
+		t.Fatal("unrelated rule write invalidated this decision")
+	}
+	// An unchanged cached entry can still be replaced by a real recovery or
+	// maintenance result; ownership must not suppress every existing-cache race.
+	recovery := runtime.beginBoostWinnerDecision("first")
+	if token := runtime.publishBoostWinnerDecision(recovery, "recovered.example:443"); token.generation == 0 {
+		t.Fatal("unchanged cached baseline prevented recovery publication")
+	}
+	old := runtime.beginBoostWinnerDecision("first")
+	runtime.deleteBoostWinner("first")
+	current := runtime.beginBoostWinnerDecision("first")
+	runtime.releaseBoostWinnerDecision(old)
+	runtime.releaseBoostWinnerDecision(old)
+	if token := runtime.publishBoostWinnerDecision(current, "current.example:443"); token.generation == 0 {
+		t.Fatal("releasing an invalidated lease removed the new decision's ownership")
+	}
+	if token := runtime.publishBoostWinnerDecision(old, "old.example:443"); token.generation != 0 {
+		t.Fatal("released decision was allowed to publish")
+	}
+	failed := runtime.beginBoostWinnerDecision("failed")
+	runtime.releaseBoostWinnerDecision(failed)
+	if _, exists := runtime.loadBoostWinnerToken("failed"); exists {
+		t.Fatal("failed decision created a cache entry")
+	}
+	requireNoBoostWinnerDecisions(t, runtime)
+	// No permanently retained key revisions, including rules that never won.
+	for index := 0; index < 1024; index++ {
+		decision := runtime.beginBoostWinnerDecision(fmt.Sprintf("one-off-%d", index))
+		runtime.releaseBoostWinnerDecision(decision)
+	}
+	requireNoBoostWinnerDecisions(t, runtime)
+}
+
+func TestFreshBoostCacheDecisionExpiryAndRuntimeIsolation(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	runtime.storeBoostWinner("rule", "original.example:443")
+	decision := runtime.beginBoostWinnerDecision("rule")
+	// Model expiry during the race without sleeping for the production TTL.
+	decision.expires = time.Now().Add(-time.Second)
+	if token := runtime.publishBoostWinnerDecision(decision, "late.example:443"); token.generation != 0 {
+		t.Fatal("expired baseline was revived by a late decision")
+	}
+	other := newRoutingRuntime()
+	defer other.stopBackground()
+	active := runtime.beginBoostWinnerDecision("rule")
+	if token := other.publishBoostWinnerDecision(active, "other.example:443"); token.generation != 0 {
+		t.Fatal("decision escaped into another runtime")
+	}
+	other.releaseBoostWinnerDecision(active)
+	if token := runtime.publishBoostWinnerDecision(active, "own.example:443"); token.generation == 0 {
+		t.Fatal("other runtime consumed this runtime's ownership")
+	}
+	requireNoBoostWinnerDecisions(t, runtime)
+	requireNoBoostWinnerDecisions(t, other)
+}
+
+func TestFreshBoostConcurrentCacheDecisionsHaveSinglePublisher(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	const callers = 32
+	decisions := make([]*boostWinnerDecision, callers)
+	for index := range decisions {
+		decisions[index] = runtime.beginBoostWinnerDecision("shared")
+	}
+	start := make(chan struct{})
+	results := make(chan boostWinnerToken, callers)
+	var done sync.WaitGroup
+	for index, decision := range decisions {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			<-start
+			results <- runtime.publishBoostWinnerDecision(decision, fmt.Sprintf("winner-%d.example:443", index))
+			runtime.releaseBoostWinnerDecision(decision)
+		}()
+	}
+	close(start)
+	done.Wait()
+	close(results)
+	owners := 0
+	for result := range results {
+		if result.generation != 0 {
+			owners++
+		}
+	}
+	if owners != 1 {
+		t.Fatalf("got %d publishers from the same cache view, want 1", owners)
+	}
+	requireNoBoostWinnerDecisions(t, runtime)
+}
+
+func TestFreshBoostCacheEvictionInvalidatesDecision(t *testing.T) {
+	runtime := newRoutingRuntime()
+	defer runtime.stopBackground()
+	decisions := make(map[string]*boostWinnerDecision, boostWinnerCacheMax)
+	for index := 0; index < boostWinnerCacheMax; index++ {
+		key := fmt.Sprintf("rule-%d", index)
+		runtime.storeBoostWinner(key, "cached.example:443")
+		decisions[key] = runtime.beginBoostWinnerDecision(key)
+	}
+	defer func() {
+		for _, decision := range decisions {
+			runtime.releaseBoostWinnerDecision(decision)
+		}
+	}()
+	runtime.storeBoostWinner("overflow", "new.example:443")
+	evicted := 0
+	for key, decision := range decisions {
+		if _, exists := runtime.loadBoostWinnerToken(key); !exists {
+			evicted++
+			if token := runtime.publishBoostWinnerDecision(decision, "late.example:443"); token.generation != 0 {
+				t.Fatal("late decision recreated an evicted entry")
+			}
+		}
+		runtime.releaseBoostWinnerDecision(decision)
+	}
+	if evicted != 1 {
+		t.Fatalf("evicted %d entries, want 1", evicted)
+	}
+	requireNoBoostWinnerDecisions(t, runtime)
 }

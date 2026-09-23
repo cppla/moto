@@ -142,12 +142,19 @@ func (manager *http3ConnectManager) observeHTTP3PhysicalDial(
 	if manager == nil || slot == nil || connection == nil || err != nil {
 		return
 	}
+	// Register before checking pool membership: Close may have removed the slot
+	// while its detached physical Dial was completing. A late connection must
+	// either become owned or be closed immediately, never escape both owners.
+	if !slot.ownPhysicalConnection(connection) {
+		return
+	}
 	now := manager.timeNow()
 	var closeCandidate *http3ConnectTransportSlot
 	var recovered func(http3ConnectTransportKey)
 	manager.mu.Lock()
 	if !manager.containsSlotLocked(key, slot) {
 		manager.mu.Unlock()
+		_ = connection.CloseWithError(0, "")
 		return
 	}
 	slot.connection = connection

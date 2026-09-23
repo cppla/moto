@@ -1148,10 +1148,10 @@ func connectProxyRouteObservationError(err error) error {
 	return err
 }
 
-// connectProxyExclusiveSetupFailureGroup returns a shared physical H3 setup
+// connectProxyExclusiveSetupFailureGroup returns a shared physical H2/H3 setup
 // group only when every non-neutral failure in the composite came from that
-// same group. A later independent H2 transport/auth failure must remain a full
-// route failure and must never be hidden behind H3 setup de-duplication.
+// same group. A later independent transport/auth/CONNECT failure must remain a
+// full route failure and must never be hidden behind setup de-duplication.
 func connectProxyExclusiveSetupFailureGroup(err error) (*routeFailureGroup, bool) {
 	if err == nil || connectProxyErrorIsRouteNeutral(err) {
 		return nil, false
@@ -1175,9 +1175,20 @@ func connectProxyExclusiveSetupFailureGroup(err error) (*routeFailureGroup, bool
 		}
 		return selected, found
 	}
-	var setupErr *http3SetupError
-	if errors.As(err, &setupErr) && setupErr != nil && setupErr.group != nil {
-		return setupErr.group, true
+	switch setupErr := err.(type) {
+	case *http2SetupError:
+		if setupErr != nil && setupErr.group != nil {
+			return setupErr.group, true
+		}
+	case *http3SetupError:
+		if setupErr != nil && setupErr.group != nil {
+			return setupErr.group, true
+		}
+	}
+	// Inspect wrappers one level at a time. errors.As would find a setup error
+	// inside a wrapped Join without checking its independent sibling failures.
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return connectProxyExclusiveSetupFailureGroup(wrapped)
 	}
 	return nil, false
 }

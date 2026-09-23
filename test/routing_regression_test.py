@@ -27,6 +27,10 @@ NAMES = sorted([
     "TestCachedBoostLateFailureCannotDeleteNewGeneration",
     "TestCachedBoostConcurrentReplacementsHaveSingleOwner",
     "TestCachedBoostReplacementTokenCannotInvalidateLaterWinner",
+    "TestFreshBoostLateReplyCannotReplaceNewWinner",
+    "TestCachedBoostHitDoesNotCreateDecisionLease",
+    "TestFreshBoostCacheDecisionRejectsABA",
+    "TestLazyBoostRefreshCannotReplaceNewWinner",
     "TestCachedBoostHedgeDelayClampsTwiceEWMA",
     "TestCachedBoostHardFailureStartsFallbackWithoutHedgeDelay",
     "TestCachedBoostNeutralConnectFailurePreservesRuleWinner",
@@ -50,11 +54,19 @@ NAMES = sorted([
     "TestHTTP3RuleBreakerDifferentIPsRequireDataPlaneProbation",
     "TestHTTP3RuleRecoveryDueEvictsH2OnlyCacheForMixedCanary",
     "TestHTTP3UDPBlackholeStaleGenerationCannotCommitCooldown",
+    "TestHTTP3StreamResetClosesOrphanedPhysicalConnections",
+    "TestHTTP3StreamResetPreservesActiveSibling",
+    "TestHTTP3PhysicalDialCompletingDuringCloseIsClosed",
     "TestReloadRulesKeepsOldStreamAndSwitchesNewConnections",
     "TestReloadRulesRollsBackAllStagedListenersOnBindFailure",
     "TestConcurrentReloadAndConnectionsUseWholeGenerations",
     "TestHTTP2ConnectPingProductionDefaults",
     "TestHTTP2ConnectPingTimeoutClosesSharedConnectionAndReconnects",
+    "TestHTTP2SharedTLSSetupFailureCountsOncePerRoute",
+    "TestHTTP2IndependentSetupFailuresTripCircuit",
+    "TestHTTP2SharedSetupParentCancellationIsNeutral",
+    "TestHTTP2ConnectStatusFailuresAreNotSharedSetupFailures",
+    "TestConnectProxySharedSetupCompositePreservesIndependentFailures",
 ])
 
 
@@ -137,8 +149,8 @@ class RoutingRegressionTests(unittest.TestCase):
                 self.assertTrue(any("missing required" in error for error in summary["errors"]))
                 self.assertEqual(len(calls), 1)
 
-    def test_fixed_selection_matches_only_the_32_pinned_tests(self):
-        self.assertEqual(len(NAMES), 32)
+    def test_fixed_selection_matches_only_the_pinned_tests(self):
+        self.assertEqual(len(NAMES), 44)
         self.assertEqual(RUNNER.REQUIRED_TESTS, set(NAMES))
         for name in NAMES:
             self.assertIsNotNone(re.fullmatch(RUNNER.TEST_PATTERN, name))
