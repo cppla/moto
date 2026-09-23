@@ -51,6 +51,15 @@ DIAL_ATTEMPT_METRICS = {
     "moto_dial_failures_total": "failures",
     "moto_dial_canceled_total": "canceled",
 }
+LEARNING_METRICS = {
+    "moto_route_learning_samples": "samples",
+    "moto_route_learning_confidence": "confidence",
+    "moto_route_learning_setup_seconds": "setup_seconds",
+    "moto_route_learning_cost_seconds": "cost_seconds",
+    "moto_route_learning_last_observation_timestamp_seconds": "last_observation_timestamp_seconds",
+    "moto_route_learning_preferred": "preferred",
+}
+LEARNING_DECISIONS_METRIC = "moto_route_learning_decisions_total"
 
 H3_TRANSPORT_METRICS = {
     "moto_connect_proxy_h3_transports": "transports",
@@ -125,7 +134,8 @@ OPTIONAL_METRICS = tuple(
     + list(H3_RECOVERY_METRICS)
     + list(ROUTE_ATTEMPT_METRICS)
     + list(DIAL_ATTEMPT_METRICS)
-    + [H3_ROTATION_METRIC, H3_RULE_EVENT_METRIC]
+    + list(LEARNING_METRICS)
+    + [H3_ROTATION_METRIC, H3_RULE_EVENT_METRIC, LEARNING_DECISIONS_METRIC]
 )
 WATCHED_METRICS = REQUIRED_METRICS + OPTIONAL_METRICS
 
@@ -166,6 +176,8 @@ class Sample:
     h3_rule_events: Dict[H3RuleEventKey, float] = field(default_factory=dict)
     route_attempts: Dict[RouteAttemptKey, Dict[str, float]] = field(default_factory=dict)
     dial_attempts: Dict[AttemptKey, Dict[str, float]] = field(default_factory=dict)
+    learning: Dict[RouteKey, Dict[str, float]] = field(default_factory=dict)
+    learning_decisions: Dict[Tuple[str, str], float] = field(default_factory=dict)
     available_metrics: Set[str] = field(default_factory=set)
 
 
@@ -628,6 +640,16 @@ def parse_metrics(body: str, monotonic_time: float, wall_time: float) -> Sample:
             key = attempt_key(labels, metric)
             values = sample.dial_attempts.setdefault(key, {})
             values[DIAL_ATTEMPT_METRICS[metric]] = value
+        elif metric in LEARNING_METRICS:
+            key = route_key(labels, metric)
+            values = sample.learning.setdefault(key, {})
+            field_name = LEARNING_METRICS[metric]
+            values[field_name] = min(1.0, value) if field_name == "confidence" else value
+        elif metric == LEARNING_DECISIONS_METRIC:
+            rule = required_label(labels, metric, "rule")
+            reason = required_label(labels, metric, "reason")
+            if reason in ("quality", "explore"):
+                sample.learning_decisions[rule, reason] = value
 
     available = declared | parsed_names
     missing_metrics = [name for name in REQUIRED_METRICS if name not in available]
@@ -1878,6 +1900,7 @@ def snapshot_dict(
         # Rule results survive even when every visible route has closed. These
         # are exporter snapshots, not locally cached data from a previous run.
         "h3_last_recovery_by_rule": h3_last_recoveries(sample),
+        "route_learning": learning_snapshot(sample),
         "recent_target_attempts": attempt_window_to_dict(
             attempts,
             sample.wall_time,
@@ -1888,6 +1911,50 @@ def snapshot_dict(
             for route in routes
         ],
     }
+
+
+def learning_snapshot(sample: Sample) -> Dict[str, object]:
+    return {
+        "available": any(name in sample.available_metrics for name in LEARNING_METRICS),
+        "semantics": {
+            "preferred": "Learning preference, not the actual traffic winner or a health guarantee.",
+            "confidence": "Sample sufficiency, not success probability; only 1 means sufficient ranking evidence.",
+            "samples": "Freshness-weighted independent observation windows, not tunnel counts.",
+        },
+        "routes": [
+            {**route_key_to_dict(key), **values}
+            for key, values in sorted(sample.learning.items())
+        ],
+        "decisions": [
+            {"rule": rule, "reason": reason, "count": count}
+            for (rule, reason), count in sorted(sample.learning_decisions.items())
+        ],
+    }
+
+
+def learning_summary(sample: Sample, rule: Optional[str]) -> str:
+    if not any(name in sample.available_metrics for name in LEARNING_METRICS):
+        return "线路学习: 当前 Moto 未提供学习指标"
+    rules = sorted({key[0] for key in sample.learning})
+    if rule not in rules:
+        rule = rules[0] if rules else None
+    candidates = [(key, values) for key, values in sorted(sample.learning.items()) if key[0] == rule]
+    # Keep one line and the existing tables unchanged. Other rules remain in
+    # JSON; a preference never changes the observed traffic leader in this UI.
+    suffix = "" if rule is None else "  规则 " + "".join(c for c in rule if c.isprintable())
+    if len(rules) > 1:
+        suffix += f"（另 {len(rules) - 1} 条规则见 JSON）"
+    preferred = [(key, values) for key, values in candidates
+                 if values.get("preferred", 0) >= 0.5 and values.get("confidence", 0) >= 1]
+    if len(preferred) == 1:
+        key, values = preferred[0]
+        label = "".join(c for c in f"{key[2].upper()} {key[1]}" if c.isprintable())
+        return f"学习偏好: {label}  样本充分度 {values['confidence']:.0%}（非当前主线路）" + suffix
+    if not any(values.get("samples", 0) > 0 for _, values in candidates):
+        return "线路学习: 学习中（暂无有效样本）" + suffix
+    if any(values.get("confidence", 0) >= 1 for _, values in candidates):
+        return "线路学习: 暂无唯一偏好（继续比较）" + suffix
+    return "线路学习: 学习中（样本不足）" + suffix
 
 
 def format_share(value: Optional[float]) -> str:
@@ -2159,6 +2226,7 @@ def print_human(
     # Keep results available during quiet cooldown periods and for other rules
     # without repeating the dominant rule's result already printed above.
     dominant_rule = selection.dominant.key[0] if selection.dominant else None
+    print(learning_summary(sample, dominant_rule))
     for rule, recovery in h3_last_recoveries(sample).items():
         if rule != dominant_rule:
             rule_label = "".join(char for char in rule if char.isprintable())
@@ -2301,6 +2369,7 @@ def emit_error(args: argparse.Namespace, error: Exception, allow_clear: bool) ->
                         time.time(),
                         args.attempt_window,
                     ),
+                    "route_learning": learning_snapshot(Sample(0.0, 0.0)),
                     "routes": [],
                 },
                 ensure_ascii=False,

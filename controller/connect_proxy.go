@@ -274,6 +274,7 @@ func (manager *connectProxyManager) dialForRule(ctx context.Context, rule string
 		setupStarted := time.Now()
 		connection, err := dial(attemptCtx, target, destination)
 		setupDuration := time.Since(setupStarted)
+		observeRouteLearningSetup(ctx, target, protocol, setupDuration, err, manager.timeNow())
 		cancelAttempt()
 		metricConnectProxyAttempt(rule, target.Address, protocol, connectProxyAttemptOutcome(err), setupDuration, true)
 		if err == nil {
@@ -1192,6 +1193,9 @@ func (runtime *routingRuntime) dialRouteTarget(ctx context.Context, rule *config
 	}
 	for _, target := range rule.Targets {
 		if target != nil && target.Address == address {
+			if rule.Mode == config.ModeBoost {
+				ctx = withRouteLearningScope(ctx, runtime.learning, rule)
+			}
 			return runtime.connectProxy.dialForRule(ctx, rule.Name, target, destination)
 		}
 	}

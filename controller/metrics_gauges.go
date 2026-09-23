@@ -95,6 +95,7 @@ func renderOperationalGauges(output *strings.Builder) {
 }
 
 func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) {
+	runtime.renderLearningGauges(output)
 	routes := runtime.routes.snapshotGauges()
 	prewarm := runtime.prewarm.snapshotGauges()
 	activeHealth := snapshotActiveHealthGauges(runtime.health)

@@ -1447,5 +1447,83 @@ class RouteWatchTest(unittest.TestCase):
         self.assertEqual(labels["target"], r"a\b:443")
 
 
+class LearningTests(unittest.TestCase):
+    def sample(self, *, confidence: float = 1, samples: float = 3,
+               preferred: int = 1, rule: str = "mixed"):
+        metrics = {
+            "samples": samples, "confidence": confidence, "setup_seconds": 0.15,
+            "cost_seconds": 0.25, "last_observation_timestamp_seconds": 100,
+            "preferred": preferred,
+        }
+        body = metrics_body() + "\n".join(
+            f'moto_route_learning_{name}{{rule="{rule}",target="learned.example:443",protocol="h2"}} {value}'
+            for name, value in metrics.items()
+        )
+        body += '\nmoto_route_learning_decisions_total{rule="mixed",reason="explore"} 2\n'
+        return WATCH.parse_metrics(body, 1, 100)
+
+    def test_learning_metric_values_and_json_semantics(self):
+        sample = self.sample()
+        learning = WATCH.learning_snapshot(sample)
+        self.assertTrue(learning["available"])
+        self.assertEqual(learning["routes"][0]["target"], "learned.example:443")
+        self.assertEqual(learning["routes"][0]["setup_seconds"], 0.15)
+        self.assertEqual(learning["decisions"], [{"rule": "mixed", "reason": "explore", "count": 2}])
+        self.assertIn("not the actual traffic winner", learning["semantics"]["preferred"])
+        json.dumps(learning, allow_nan=False)
+
+    def test_learning_display_never_overrides_actual_route(self):
+        sample = self.sample()
+        actual = route(("mixed", "actual.example:443", "h3"), 10000.0, share=100.0)
+        view = WATCH.WatchView("transmitting", actual, [actual], 10.0, 2.0)
+        selection = WATCH.DominantSelection(actual, None, None, 0)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            WATCH.print_human("http://localhost/metrics", sample, view, selection, 10, 3)
+        lines = output.getvalue().splitlines()
+        actual_line = next(line for line in lines if line.startswith("当前主线路:"))
+        learned_line = next(line for line in lines if line.startswith("学习偏好:"))
+        self.assertIn("actual.example:443", actual_line)
+        self.assertNotIn("learned.example:443", actual_line)
+        self.assertIn("learned.example:443", learned_line)
+        self.assertIn("非当前主线路", learned_line)
+        self.assertIn("100%", learned_line)
+        payload = WATCH.snapshot_dict("http://localhost/metrics", sample, view, selection, 4096, 10, 3)
+        self.assertEqual(payload["dominant"]["target"], "actual.example:443")
+        self.assertTrue(payload["route_learning"]["available"])
+
+    def test_learning_insufficient_sample_is_not_confident_preference(self):
+        summary = WATCH.learning_summary(self.sample(confidence=0.99), "mixed")
+        self.assertIn("学习中", summary)
+        self.assertIn("样本不足", summary)
+        self.assertNotIn("99%", summary)
+        self.assertNotIn("学习偏好", summary)
+
+    def test_learning_empty_metrics_and_legacy_exporter(self):
+        legacy = WATCH.parse_metrics(metrics_body(), 1, 100)
+        self.assertIn("未提供", WATCH.learning_summary(legacy, None))
+        self.assertFalse(WATCH.learning_snapshot(legacy)["available"])
+        empty = WATCH.parse_metrics(metrics_body() + '\n# TYPE moto_route_learning_samples gauge\n', 1, 100)
+        self.assertIn("暂无有效样本", WATCH.learning_summary(empty, None))
+        self.assertTrue(WATCH.learning_snapshot(empty)["available"])
+
+    def test_learning_text_is_one_line_and_rules_stay_separate(self):
+        sample = self.sample(rule=r"line\nbreak")
+        sample.learning[("another", "other.example:443", "h3")] = {"samples": 1, "confidence": 0.4}
+        summary = WATCH.learning_summary(sample, "line\nbreak")
+        self.assertEqual(len(summary.splitlines()), 1)
+        self.assertIn("linebreak", summary)
+        self.assertIn("另 1 条规则", summary)
+        self.assertNotIn("other.example", summary)
+
+    def test_learning_invalid_values_and_unknown_reasons_do_not_escape(self):
+        body = metrics_body() + '\nmoto_route_learning_confidence{rule="mixed",target="x:443",protocol="h3"} NaN\n'
+        body += 'moto_route_learning_decisions_total{rule="mixed",reason="unbounded-secret"} 1\n'
+        sample = WATCH.parse_metrics(body, 1, 100)
+        self.assertEqual(sample.learning, {})
+        self.assertEqual(sample.learning_decisions, {})
+        self.assertNotIn("unbounded-secret", json.dumps(WATCH.learning_snapshot(sample)))
+
+
 if __name__ == "__main__":
     unittest.main()

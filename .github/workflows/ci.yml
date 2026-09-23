@@ -49,6 +49,38 @@ jobs:
       - name: Run loopback-only benchmark smoke
         run: make bench-smoke
 
+  routing-regression:
+    name: Routing regression (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.25.13
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Validate the regression gate
+        run: python3 -B test/routing_regression_test.py
+      - name: Stress learning and recovery interactions
+        run: make routing-regression
+        env:
+          REGRESSION_SEED: ${{ github.run_id }}
+      - name: Retain regression evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: routing-regression-${{ matrix.os }}
+          path: bin/routing-regression/
+          if-no-files-found: error
+          retention-days: 14
+
   build:
     strategy:
       matrix:

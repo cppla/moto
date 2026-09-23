@@ -289,6 +289,9 @@ func (runtime *routingRuntime) raceCachedBoostTarget(
 	prepare boostPrepareFunc,
 ) (cachedBoostOutcome, error) {
 	delay := runtime.cachedBoostHedgeDelay(rule, cachedAddr)
+	if routeLearningExplorer(ctx) {
+		delay = learningExplorationHedgeDelay(rule)
+	}
 	dial := func(dialCtx context.Context, dialRule *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
 		return runtime.outboundDialRouteWithOptions(dialCtx, dialRule, addr, options.tryOnly, options.onStart)
 	}
@@ -369,7 +372,8 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 
 	controlledHedgeSignal := hedgeReady != nil
 	var internalHedgeSignal chan time.Time
-	if rule.Hedge != nil && !controlledHedgeSignal {
+	allowHedge := rule.Hedge != nil || routeLearningExplorer(ctx)
+	if allowHedge && !controlledHedgeSignal {
 		internalHedgeSignal = make(chan time.Time, 1)
 		hedgeReady = internalHedgeSignal
 	}
@@ -378,7 +382,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 	var primaryStartOnce sync.Once
 	onPrimaryStart := func() {
 		primaryStartOnce.Do(func() {
-			if rule.Hedge == nil || exclusiveCachedProtocolProbe {
+			if !allowHedge || exclusiveCachedProtocolProbe {
 				return
 			}
 			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= hedgeDelay {
@@ -1252,12 +1256,22 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 	recovery := runtime.claimBoostRecoveryProbe(rule, time.Now())
 
 	if recovery.token == 0 {
-		if cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
+		choice := runtime.chooseLearningRoute(rule, time.Now())
+		cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now())
+		if choice.address != "" && (!ok || cached.addr != choice.address) {
+			cached, ok = boostWinnerEntry{addr: choice.address}, true
+		}
+		if ok {
 			cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
 			triggerLazy := !config.IsConnectProtocol(rule.Protocol) && time.Until(cached.expires) < boostRevalidateAfter
-			outcome, err := runtime.raceCachedBoostTarget(decisionCtx, rule, cached.addr, prepare)
+			learningCtx := decisionCtx
+			if choice.reason == "explore" {
+				learningCtx = context.WithValue(learningCtx, routeLearningExplorerContextKey{}, true)
+			}
+			outcome, err := runtime.raceCachedBoostTarget(learningCtx, rule, cached.addr, prepare)
+			runtime.releaseLearningChoice(rule, choice)
 			if err == nil {
-				cacheHit, winnerToken := runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, true)
+				cacheHit, winnerToken := runtime.reconcileLearningBoostWinner(key, cachedToken, choice, outcome, true)
 				if cacheHit {
 					metricBoostCache(rule.Name, true)
 				} else {
@@ -1284,6 +1298,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 						zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
 						zap.Bool("boostHedged", outcome.hedged),
 						zap.Bool("boostWinnerPreserved", outcome.cachedFailureNeutral),
+						zap.String("learningReason", choice.reason),
 					}
 					if cacheHit && triggerLazy {
 						fields = append(fields, zap.Bool("boostLazyRefresh", true))
@@ -1297,7 +1312,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 				runtime.finishBoostRelay(winnerToken, outcome.winner.attempt, result)
 				return
 			}
-			runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, false)
+			runtime.reconcileLearningBoostWinner(key, cachedToken, choice, outcome, false)
 			setPendingConnectClientFailure(conn, err)
 			if isDialBulkheadError(err) && !outcome.cachedFailed {
 				// Local dial pressure says nothing about the cached route's health. Keep
