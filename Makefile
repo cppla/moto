@@ -38,10 +38,10 @@ race:
 	$(GO) test -race ./...
 
 fault-test:
-	$(GO) test -race ./controller -shuffle=on -count=10 -skip '^TestRouteLearning' -run 'Test(ConcurrentReload|ReloadRules|RouteHealth|RaceBoostTargets|CachedBoost|FreshBoost|BoostProtocolCanary|DialBulkhead|Prewarm|ActiveHealth|HTTPConnect|HTTP2ConnectPing|HTTP3|.*ProtocolPenalty|SelectTargetsExcluding|.*TLS|.*ProxyProtocol|ServerClose)'
+	$(GO) test -race ./controller -shuffle=on -count=10 -run 'Test(ConcurrentReload|ReloadRules|RouteHealth|RaceBoostTargets|CachedBoost|FreshBoost|BoostProtocolCanary|DialBulkhead|Prewarm|ActiveHealth|HTTPConnect|HTTP2ConnectPing|HTTP3|.*ProtocolPenalty|SelectTargetsExcluding|.*TLS|.*ProxyProtocol|ServerClose)'
 
-# This family has its own evidence-checked stress gate; do not also repeat it
-# in fault-test. Ordinary test/race targets still include every test once.
+# Pin critical Boost/cache/health/recovery/reload cases with evidence-checked
+# run/pass counts. The broader fault suite complements this fixed coverage.
 routing-regression:
 	$(PYTHON) -B test/routing_regression.py --go "$(GO)" --count "$(REGRESSION_COUNT)" --output "$(REGRESSION_OUTPUT)" $(if $(REGRESSION_SEED),--seed "$(REGRESSION_SEED)")
 
@@ -79,11 +79,13 @@ container-image-check: container-context-check
 
 bench-check:
 	$(PYTHON) -c 'import py_compile, tempfile; cache = tempfile.TemporaryDirectory(); py_compile.compile("test/bench.py", cfile=cache.name + "/bench.pyc", doraise=True); py_compile.compile("test/bulk_relay_bench.py", cfile=cache.name + "/bulk_relay_bench.pyc", doraise=True); py_compile.compile("test/moto-route-watch.py", cfile=cache.name + "/moto-route-watch.pyc", doraise=True)'
-	$(PYTHON) -c 'import py_compile, tempfile; cache = tempfile.TemporaryDirectory(); py_compile.compile("test/http_connect_smoke.py", cfile=cache.name + "/http_connect_smoke.pyc", doraise=True)'
+	$(PYTHON) -c 'import py_compile, tempfile; cache = tempfile.TemporaryDirectory(); py_compile.compile("test/http_connect_smoke.py", cfile=cache.name + "/http_connect_smoke.pyc", doraise=True); py_compile.compile("test/connect_route_smoke.py", cfile=cache.name + "/connect_route_smoke.pyc", doraise=True)'
 	$(PYTHON) -B test/moto_route_watch_test.py
 	$(PYTHON) -B test/http_connect_smoke_test.py
-	$(PYTHON) -B test/route_learning_smoke_test.py
+	$(PYTHON) -B test/connect_route_smoke_test.py
 	$(PYTHON) -B test/routing_regression_test.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -B test/h2_timing_matrix_test.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -B test/h2_timing_origin_test.py
 
 bench-smoke:
 	$(PYTHON) test/bench.py --self-contained --mode normal -c 4 -t 12 --warmup 4 --timeout 2 --min-success-rate 100 --min-warm-throughput-ratio 0.02 --max-warm-p95-ms 500

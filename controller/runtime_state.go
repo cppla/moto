@@ -13,17 +13,15 @@ import (
 // servers and draining reload generations coexist without sharing circuits,
 // winner caches, prewarm sockets, or round-robin cursors.
 type routingRuntime struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	routes         *routeHealthRegistry
-	health         *activeHealthManager
-	boost          *boostRuntime
-	prewarm        *prewarmManager
-	connectProxy   *connectProxyManager
-	trafficDials   *dialBulkhead
-	learning       *routeLearner
-	learningPolicy *routeLearningPolicy
-	roundRobin     sync.Map // map[*config.Rule]*atomic.Uint64
+	ctx          context.Context
+	cancel       context.CancelFunc
+	routes       *routeHealthRegistry
+	health       *activeHealthManager
+	boost        *boostRuntime
+	prewarm      *prewarmManager
+	connectProxy *connectProxyManager
+	trafficDials *dialBulkhead
+	roundRobin   sync.Map // map[*config.Rule]*atomic.Uint64
 }
 
 type boostWinnerCacheRegistry struct {
@@ -62,21 +60,18 @@ func newRoutingRuntimeWithDialResources(prewarmDialSem chan struct{}, trafficDia
 	ctx, cancel := context.WithCancel(context.Background())
 	connectProxy := newConnectProxyManager()
 	runtime := &routingRuntime{
-		ctx:            ctx,
-		cancel:         cancel,
-		routes:         newRouteHealthRegistry(connectProxy.http3RoutePenalty),
-		health:         newActiveHealthManager(),
-		connectProxy:   connectProxy,
-		trafficDials:   trafficDials,
-		learning:       newRouteLearner(),
-		learningPolicy: newRouteLearningPolicy(),
+		ctx:          ctx,
+		cancel:       cancel,
+		routes:       newRouteHealthRegistry(connectProxy.http3RoutePenalty),
+		health:       newActiveHealthManager(),
+		connectProxy: connectProxy,
+		trafficDials: trafficDials,
 		boost: &boostRuntime{
 			cache: &boostWinnerCacheRegistry{entries: make(map[string]boostWinnerEntry)},
 		},
 	}
 	runtime.routes.protocolProbeClaim = connectProxy.claimHTTP3BoostProbe
 	runtime.routes.protocolProbeRelease = connectProxy.releaseHTTP3BoostProbe
-	runtime.installRouteLearningObservers()
 	runtime.prewarm = &prewarmManager{
 		runtime: runtime,
 		pools:   make(map[string]*prewarmPool),
@@ -114,11 +109,6 @@ func (runtime *routingRuntime) inheritUnchangedState(previous *routingRuntime, o
 	if len(pairs) == 0 {
 		return
 	}
-	learningRules := make(map[string]struct{}, len(pairs))
-	for _, pair := range pairs {
-		learningRules[boostRuleKey(pair.new)] = struct{}{}
-	}
-	runtime.learning.inherit(previous.learning, learningRules)
 
 	previous.routes.Lock()
 	runtime.routes.Lock()
@@ -233,7 +223,6 @@ func (runtime *routingRuntime) clear(rules []*config.Rule) {
 			continue
 		}
 		key := boostRuleKey(rule)
-		runtime.learning.clearRule(key)
 		delete(runtime.boost.cache.entries, key)
 		runtime.boost.revalidating.Delete(key)
 		runtime.roundRobin.Delete(rule)

@@ -176,6 +176,10 @@ func storeBoostWinner(key, addr string) boostWinnerToken {
 func (runtime *routingRuntime) storeBoostWinner(key, addr string) boostWinnerToken {
 	runtime.boost.cache.Lock()
 	defer runtime.boost.cache.Unlock()
+	return runtime.storeBoostWinnerLocked(key, addr)
+}
+
+func (runtime *routingRuntime) storeBoostWinnerLocked(key, addr string) boostWinnerToken {
 	if _, exists := runtime.boost.cache.entries[key]; !exists && len(runtime.boost.cache.entries) >= boostWinnerCacheMax {
 		for oldKey := range runtime.boost.cache.entries {
 			delete(runtime.boost.cache.entries, oldKey)
@@ -193,6 +197,22 @@ func (runtime *routingRuntime) storeBoostWinner(key, addr string) boostWinnerTok
 		generation: token.generation,
 	}
 	return token
+}
+
+// A late hedge result may serve its own client, but cannot overwrite
+// a newer winner or revive an expired one. Keep comparison and replacement
+// under the same lock; the returned token owns only the replacement it made.
+func (runtime *routingRuntime) replaceBoostWinnerIfCurrent(token boostWinnerToken, addr string) boostWinnerToken {
+	if token.key == "" || token.generation == 0 {
+		return boostWinnerToken{}
+	}
+	runtime.boost.cache.Lock()
+	defer runtime.boost.cache.Unlock()
+	entry, ok := runtime.boost.cache.entries[token.key]
+	if !ok || entry.generation != token.generation || entry.addr != token.addr || !time.Now().Before(entry.expires) {
+		return boostWinnerToken{}
+	}
+	return runtime.storeBoostWinnerLocked(token.key, addr)
 }
 
 func deleteBoostWinner(key string) {
@@ -242,7 +262,7 @@ func (runtime *routingRuntime) reconcileCachedBoostWinner(
 	if outcome.cachedFailureNeutral {
 		return false, boostWinnerToken{}
 	}
-	return false, runtime.storeBoostWinner(key, outcome.winner.addr)
+	return false, runtime.replaceBoostWinnerIfCurrent(cachedToken, outcome.winner.addr)
 }
 
 // finishBoostRelay never feeds an ambiguous io.Copy error into route health.
@@ -289,9 +309,6 @@ func (runtime *routingRuntime) raceCachedBoostTarget(
 	prepare boostPrepareFunc,
 ) (cachedBoostOutcome, error) {
 	delay := runtime.cachedBoostHedgeDelay(rule, cachedAddr)
-	if routeLearningExplorer(ctx) {
-		delay = learningExplorationHedgeDelay(rule)
-	}
 	dial := func(dialCtx context.Context, dialRule *config.Rule, addr string, options boostRouteDialOptions) (net.Conn, routeAttempt, error) {
 		return runtime.outboundDialRouteWithOptions(dialCtx, dialRule, addr, options.tryOnly, options.onStart)
 	}
@@ -372,8 +389,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 
 	controlledHedgeSignal := hedgeReady != nil
 	var internalHedgeSignal chan time.Time
-	allowHedge := rule.Hedge != nil || routeLearningExplorer(ctx)
-	if allowHedge && !controlledHedgeSignal {
+	if rule.Hedge != nil && !controlledHedgeSignal {
 		internalHedgeSignal = make(chan time.Time, 1)
 		hedgeReady = internalHedgeSignal
 	}
@@ -382,7 +398,7 @@ func (runtime *routingRuntime) raceCachedBoostTargetWithDial(
 	var primaryStartOnce sync.Once
 	onPrimaryStart := func() {
 		primaryStartOnce.Do(func() {
-			if !allowHedge || exclusiveCachedProtocolProbe {
+			if rule.Hedge == nil || exclusiveCachedProtocolProbe {
 				return
 			}
 			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= hedgeDelay {
@@ -1256,22 +1272,12 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 	recovery := runtime.claimBoostRecoveryProbe(rule, time.Now())
 
 	if recovery.token == 0 {
-		choice := runtime.chooseLearningRoute(rule, time.Now())
-		cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now())
-		if choice.address != "" && (!ok || cached.addr != choice.address) {
-			cached, ok = boostWinnerEntry{addr: choice.address}, true
-		}
-		if ok {
+		if cached, ok := runtime.loadUsableBoostWinnerToken(key, rule, time.Now()); ok {
 			cachedToken := boostWinnerToken{key: key, addr: cached.addr, generation: cached.generation}
 			triggerLazy := !config.IsConnectProtocol(rule.Protocol) && time.Until(cached.expires) < boostRevalidateAfter
-			learningCtx := decisionCtx
-			if choice.reason == "explore" {
-				learningCtx = context.WithValue(learningCtx, routeLearningExplorerContextKey{}, true)
-			}
-			outcome, err := runtime.raceCachedBoostTarget(learningCtx, rule, cached.addr, prepare)
-			runtime.releaseLearningChoice(rule, choice)
+			outcome, err := runtime.raceCachedBoostTarget(decisionCtx, rule, cached.addr, prepare)
 			if err == nil {
-				cacheHit, winnerToken := runtime.reconcileLearningBoostWinner(key, cachedToken, choice, outcome, true)
+				cacheHit, winnerToken := runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, true)
 				if cacheHit {
 					metricBoostCache(rule.Name, true)
 				} else {
@@ -1298,7 +1304,6 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 						zap.Bool("boostFallbackStarted", outcome.fallbackStarted),
 						zap.Bool("boostHedged", outcome.hedged),
 						zap.Bool("boostWinnerPreserved", outcome.cachedFailureNeutral),
-						zap.String("learningReason", choice.reason),
 					}
 					if cacheHit && triggerLazy {
 						fields = append(fields, zap.Bool("boostLazyRefresh", true))
@@ -1312,7 +1317,7 @@ func (runtime *routingRuntime) handleBoost(ctx context.Context, conn net.Conn, r
 				runtime.finishBoostRelay(winnerToken, outcome.winner.attempt, result)
 				return
 			}
-			runtime.reconcileLearningBoostWinner(key, cachedToken, choice, outcome, false)
+			runtime.reconcileCachedBoostWinner(key, cachedToken, outcome, false)
 			setPendingConnectClientFailure(conn, err)
 			if isDialBulkheadError(err) && !outcome.cachedFailed {
 				// Local dial pressure says nothing about the cached route's health. Keep

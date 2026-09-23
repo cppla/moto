@@ -2,13 +2,12 @@
 """Bounded, redacted real-route checks through isolated Moto HTTP CONNECT.
 
 Each target and then the Boost group run in separate Moto processes. Repeated
-requests within a case share one process, allowing transport reuse and online
-learning. The source configuration is read only. Reports contain target indices,
+requests within a case share one process, allowing transport reuse. The source configuration is read only. Reports contain target indices,
 not addresses, credentials, URLs, HTTP headers, or process logs.
 
 --bytes and --total-bytes bound origin body bytes consumed by this client, not
 wire traffic: handshakes, headers, buffering and retransmissions cost extra.
-This is a connectivity/learning evidence harness, not proof of speed improvement.
+This is a connectivity evidence harness, not proof of speed improvement.
 """
 
 from __future__ import annotations
@@ -32,22 +31,13 @@ import time
 from urllib.parse import urlsplit
 
 
-RULE_NAME = "route-learning-smoke"
+RULE_NAME = "connect-route-smoke"
 MAX_CONFIG_BYTES = 4 << 20
 MAX_METRICS_BYTES = 4 << 20
 MAX_CONNECT_HEADER_BYTES = 32 << 10
 PAYLOAD_METRIC = "moto_connect_proxy_payload_bytes_total"
 ATTEMPT_METRIC = "moto_connect_proxy_attempts_total"
 ACTIVE_METRIC = "moto_connect_proxy_active_tunnels"
-LEARNING_METRICS = {
-    "moto_route_learning_samples",
-    "moto_route_learning_confidence",
-    "moto_route_learning_setup_seconds",
-    "moto_route_learning_cost_seconds",
-    "moto_route_learning_last_observation_timestamp_seconds",
-    "moto_route_learning_preferred",
-    "moto_route_learning_decisions_total",
-}
 METRIC_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\{(.*)\}\s+([^\s]+)\s*$')
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"(?:,|$)')
 
@@ -132,10 +122,10 @@ def remaining(deadline: float) -> float:
 
 
 def https_request(port: int, destination: tuple[str, str, str], deadline: float, limit: int,
-                  expected_sha256: str | None, report: dict) -> None:
+                  expected_sha256: str | None, report: dict, *, ca_file: str | None = None) -> None:
     host, authority, path = destination
     started = time.monotonic()
-    context = ssl.create_default_context()
+    context = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
     context.set_alpn_protocols(["http/1.1"])
     with socket.create_connection(("127.0.0.1", port), timeout=remaining(deadline)) as raw:
         raw.settimeout(remaining(deadline))
@@ -177,6 +167,7 @@ def https_request(port: int, destination: tuple[str, str, str], deadline: float,
             try:
                 secured.settimeout(remaining(deadline))
                 secured.do_handshake()
+                report["timing_ms"]["tls_complete"] = round((time.monotonic() - started) * 1000, 2)
                 report["tls_verified"] = True
                 secured.sendall((f"GET {path} HTTP/1.1\r\nHost: {authority}\r\n"
                                  "User-Agent: Moto-Route-Smoke/1.0\r\nAccept-Encoding: identity\r\n"
@@ -229,7 +220,7 @@ def https_request(port: int, destination: tuple[str, str, str], deadline: float,
 
 def parse_metrics(encoded: str) -> dict[tuple, float]:
     result = {}
-    names = {PAYLOAD_METRIC, ATTEMPT_METRIC, ACTIVE_METRIC} | LEARNING_METRICS
+    names = {PAYLOAD_METRIC, ATTEMPT_METRIC, ACTIVE_METRIC}
     for line in encoded.splitlines():
         if not line or line.startswith("#"):
             continue
@@ -274,18 +265,9 @@ def read_metrics(port: int, deadline: float) -> dict[tuple, float]:
 def metric_evidence(before: dict, after: dict, addresses: dict[str, int]) -> dict:
     payload = {}
     attempts = []
-    learning = []
     for (name, label_items), value in sorted(after.items()):
         labels = dict(label_items)
         delta = max(0, value - before.get((name, label_items), 0))
-        # Policy decisions belong to the rule, not a target/protocol pair.
-        # Keep them even when no target has produced payload yet; do not invent
-        # target attribution from the request's winner or configured order.
-        if name == "moto_route_learning_decisions_total":
-            if labels.get("reason") in {"quality", "explore"}:
-                learning.append({"metric": name, "scope": "rule", "reason": labels["reason"],
-                                 "value": value, "delta": delta})
-            continue
         target_index = addresses.get(labels.get("target"))
         protocol = labels.get("protocol")
         if target_index is None:
@@ -297,14 +279,9 @@ def metric_evidence(before: dict, after: dict, addresses: dict[str, int]) -> dic
             outcome = labels.get("outcome", "")
             if re.fullmatch(r"[a-z_]{1,64}", outcome):
                 attempts.append({"target_index": target_index, "protocol": protocol, "outcome": outcome, "count": int(delta)})
-        elif name in LEARNING_METRICS:
-            item = {"metric": name, "target_index": target_index, "value": value}
-            if protocol in {"h2", "h3"}:
-                item["protocol"] = protocol
-            learning.append(item)
     routes = [{"target_index": index, "protocol": protocol, "tunnel_payload_bytes": count}
               for (index, protocol), count in sorted(payload.items())]
-    return {"actual_routes": routes, "attempts": attempts, "learning": learning}
+    return {"actual_routes": routes, "attempts": attempts}
 
 
 def tunnels_drained(snapshot: dict) -> bool:
@@ -362,7 +339,7 @@ def run_case(args: argparse.Namespace, rule: dict, indices: list[int], group: bo
         port = inbound.getsockname()[1]
         metrics_port = metrics.getsockname()[1]
     configuration = isolated_config(rule, port, metrics_port, args.protocol, indices, group)
-    with tempfile.TemporaryDirectory(prefix="moto-route-smoke-") as directory:
+    with tempfile.TemporaryDirectory(prefix="moto-connect-route-smoke-") as directory:
         config_path = Path(directory) / "config.json"
         with os.fdopen(os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as config_file:
             json.dump(configuration, config_file, allow_nan=False)
@@ -384,7 +361,7 @@ def run_case(args: argparse.Namespace, rule: dict, indices: list[int], group: bo
                     started = time.monotonic()
                     try:
                         https_request(port, destination, min(deadline, started + args.timeout), limit,
-                                      args.expected_sha256, sample)
+                                      args.expected_sha256, sample, ca_file=args.ca_file)
                     except Exception as error:
                         sample["error"] = error_code(error)
                         sample["ok"] = False
@@ -410,6 +387,8 @@ def run_case(args: argparse.Namespace, rule: dict, indices: list[int], group: bo
                         raise SmokeFailure("tunnel_cleanup_not_observed")
                     if sample["ok"] and len(sample["actual_routes"]) != 1:
                         sample.update(ok=False, error="winner_evidence_missing_or_ambiguous")
+                    if sample["ok"] and args.protocol != "auto" and sample["actual_routes"][0]["protocol"] != args.protocol:
+                        sample.update(ok=False, error="unexpected_upstream_protocol")
                     if args.pause and round_number + 1 < args.rounds:
                         time.sleep(min(args.pause, remaining(deadline)))
                 case["ok"] = all(sample["ok"] for sample in case["samples"])
@@ -431,11 +410,12 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=20, help="Per-request total seconds")
     parser.add_argument("--total-timeout", type=float, default=180, help="Overall work budget; cleanup may take up to 5s extra")
     parser.add_argument("--pause", type=float, default=0, help="Pause between requests within one process")
+    parser.add_argument("--ca-file", type=Path, help="Optional origin CA file; does not change upstream TLS verification")
     parser.add_argument("--expected-sha256", help="Require a complete body matching this SHA-256 digest")
     args = parser.parse_args()
     started = time.monotonic()
     report = {"ok": False, "protocol_policy": args.protocol, "cases": [], "bytes": 0,
-              "evidence_scope": "bounded_connectivity_and_learning_not_speed_benchmark"}
+              "evidence_scope": "bounded_connectivity_not_speed_benchmark"}
     try:
         if not 1 <= args.rounds <= 1000 or not 1 <= args.bytes <= 64 << 20 or not 1 <= args.total_bytes <= 1 << 30:
             raise SmokeFailure("invalid_byte_or_round_budget")
@@ -445,6 +425,11 @@ def main() -> int:
             if not re.fullmatch(r"[0-9a-fA-F]{64}", args.expected_sha256):
                 raise SmokeFailure("invalid_expected_sha256")
             args.expected_sha256 = args.expected_sha256.lower()
+        if args.ca_file is not None:
+            args.ca_file = args.ca_file.resolve()
+            if not args.ca_file.is_file() or not os.access(args.ca_file, os.R_OK):
+                raise SmokeFailure("invalid_origin_ca_file")
+            args.ca_file = str(args.ca_file)
         destination = https_destination(args.url)
         args.binary = args.binary.resolve()
         if not args.binary.is_file() or not os.access(args.binary, os.X_OK):

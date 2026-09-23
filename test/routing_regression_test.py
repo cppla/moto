@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -22,16 +23,38 @@ if SPEC is None or SPEC.loader is None:
 RUNNER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RUNNER)
 NAMES = sorted([
-    "TestRouteLearningScalingFastTailBecomesOrdinaryWinner",
-    "TestRouteLearningObserversIsolateCompleteEndpointIdentity",
-    "TestRouteLearningPolicyConcurrentExplorationHasOneLease",
-    "TestRouteLearningExpiredCacheCannotStarveEndpointH3Canary",
-    "TestRouteLearningScenarioReloadWithConfirmationAndLateOldEvents",
-    "TestRouteLearningScenarioMixedReloadRejectsChangedRuleEvidence",
-    "TestRouteLearningScenarioConfirmationHTTPStatusAndProtocolFallback",
-    "TestRouteLearningScenarioRuleCooldownProbationAndLearnedProtocol",
-    "TestRouteLearningScenarioConfirmationCannotCancelCircuitRecovery",
-    "TestRouteLearningScenarioIngressRecoveryPrecedesLearning",
+    "TestCachedBoostReplacementHonorsCacheLifecycle",
+    "TestCachedBoostLateFailureCannotDeleteNewGeneration",
+    "TestCachedBoostConcurrentReplacementsHaveSingleOwner",
+    "TestCachedBoostReplacementTokenCannotInvalidateLaterWinner",
+    "TestCachedBoostHedgeDelayClampsTwiceEWMA",
+    "TestCachedBoostHardFailureStartsFallbackWithoutHedgeDelay",
+    "TestCachedBoostNeutralConnectFailurePreservesRuleWinner",
+    "TestCachedBoostSlowPrimaryLaunchesHedgeOnSignalAndCancelsLoser",
+    "TestFreshBoostSOCKS5UsesStaleExplorerInTopTwo",
+    "TestFreshBoostRecoveryProbeFinishesBeforeSingleHealthyFallback",
+    "TestFreshBoostTargetSaturationReturnsAttemptBudget",
+    "TestRaceBoostTargetsClosesEveryLoser",
+    "TestRaceBoostTargetsHonorsCancellation",
+    "TestBoostProtocolCanaryGetsExclusiveSetupAndReleasesLease",
+    "TestBoostProtocolCanaryFailureRefillsHealthyTarget",
+    "TestSelectTargetsExcludingReservesOnePenalizedProtocolCanary",
+    "TestSelectTargetsExcludingDefersProtocolPenaltyUntilHealthyAlternativesExhausted",
+    "TestRouteHealthTripsAfterThreeConsecutiveFailures",
+    "TestRouteHealthAllowsOnlyOneConcurrentHalfOpenProbe",
+    "TestRouteHealthProbeBackoffAndRecovery",
+    "TestRouteHealthCancelledProbeIsNeutralAndReleasesClaim",
+    "TestRouteHealthIgnoresOutOfOrderPreCircuitResults",
+    "TestHTTP3RepeatedDegradationUsesH2CooldownAndHalfOpenRecovery",
+    "TestHTTP3DegradationCooldownRequiresReachableHTTP2",
+    "TestHTTP3RuleBreakerDifferentIPsRequireDataPlaneProbation",
+    "TestHTTP3RuleRecoveryDueEvictsH2OnlyCacheForMixedCanary",
+    "TestHTTP3UDPBlackholeStaleGenerationCannotCommitCooldown",
+    "TestReloadRulesKeepsOldStreamAndSwitchesNewConnections",
+    "TestReloadRulesRollsBackAllStagedListenersOnBindFailure",
+    "TestConcurrentReloadAndConnectionsUseWholeGenerations",
+    "TestHTTP2ConnectPingProductionDefaults",
+    "TestHTTP2ConnectPingTimeoutClosesSharedConnectionAndReconnects",
 ])
 
 
@@ -92,7 +115,7 @@ class RoutingRegressionTests(unittest.TestCase):
         self.assertEqual(metadata["source_revision"], "fixture-commit")
         self.assertEqual(metadata["source_sha256"], "fixture-source-sha256")
         self.assertEqual(metadata["commands"]["test"], ["go", "test", "-race", "-json", "-shuffle=17",
-                         "-count=2", "-timeout=8m", "./controller", "-run", "^TestRouteLearning"])
+                         "-count=2", "-timeout=8m", "./controller", "-run", "^(" + "|".join(NAMES) + ")$"])
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].kwargs, {"timeout": 180})
         self.assertIn("Reproduce: go test -race -json -shuffle=17", console)
@@ -102,7 +125,7 @@ class RoutingRegressionTests(unittest.TestCase):
     def test_empty_discovery_fails_without_running_tests(self):
         status, summary, directory, calls, _ = self.invoke(names=[])
         self.assertEqual(status, 1)
-        self.assertIn("no route-learning tests discovered", summary["errors"])
+        self.assertIn("no routing regression tests discovered", summary["errors"])
         self.assertEqual(len(calls), 1)
         self.assertEqual((directory / "events.jsonl").read_bytes(), b"")
 
@@ -112,6 +135,25 @@ class RoutingRegressionTests(unittest.TestCase):
                 status, summary, _, calls, _ = self.invoke(names=[name for name in NAMES if name != missing])
                 self.assertEqual(status, 1)
                 self.assertTrue(any("missing required" in error for error in summary["errors"]))
+                self.assertEqual(len(calls), 1)
+
+    def test_fixed_selection_matches_only_the_32_pinned_tests(self):
+        self.assertEqual(len(NAMES), 32)
+        self.assertEqual(RUNNER.REQUIRED_TESTS, set(NAMES))
+        for name in NAMES:
+            self.assertIsNotNone(re.fullmatch(RUNNER.TEST_PATTERN, name))
+            self.assertIsNone(re.fullmatch(RUNNER.TEST_PATTERN, name + "Extra"))
+        for name in ("TestHTTP3NetemRuleBreakerCooldownAndDataPlaneProbation",
+                     "TestHTTP2ConnectPingTCPNetemRealClock", "TestUnknown"):
+            self.assertIsNone(re.fullmatch(RUNNER.TEST_PATTERN, name))
+
+    def test_duplicate_or_extra_discovered_tests_fail_before_execution(self):
+        for names, message in ((NAMES + [NAMES[0]], "duplicate top-level"),
+                               (NAMES + ["TestUnexpected"], "unexpected discovered")):
+            with self.subTest(message=message):
+                status, summary, _, calls, _ = self.invoke(names=names)
+                self.assertEqual(status, 1)
+                self.assertTrue(any(message in error for error in summary["errors"]))
                 self.assertEqual(len(calls), 1)
 
     def test_skip_or_failure_at_any_level_fails(self):
@@ -175,7 +217,7 @@ class RoutingRegressionTests(unittest.TestCase):
 
     def test_unlisted_top_level_test_fails(self):
         events = successful_events()
-        events.insert(0, {"Action": "run", "Package": RUNNER.PACKAGE, "Test": "TestRouteLearningUnexpected"})
+        events.insert(0, {"Action": "run", "Package": RUNNER.PACKAGE, "Test": "TestUnexpected"})
         status, summary, *_ = self.invoke(events=events)
         self.assertEqual(status, 1)
         self.assertTrue(any("unexpected top-level" in error for error in summary["errors"]))

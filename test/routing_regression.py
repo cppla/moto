@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed route-learning regression suite and retain reproducible evidence."""
+"""Run fixed Boost/cache/health/recovery regressions with reproducible evidence."""
 
 from __future__ import annotations
 
@@ -19,22 +19,46 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_PATTERN = "^TestRouteLearning"
 PACKAGE = "moto/controller"
 PROCESS_TIMEOUT = 8 * 60 + 30
 DISCOVERY_TIMEOUT = 180
 REQUIRED_TESTS = {
-    "TestRouteLearningScalingFastTailBecomesOrdinaryWinner",
-    "TestRouteLearningObserversIsolateCompleteEndpointIdentity",
-    "TestRouteLearningPolicyConcurrentExplorationHasOneLease",
-    "TestRouteLearningExpiredCacheCannotStarveEndpointH3Canary",
-    "TestRouteLearningScenarioReloadWithConfirmationAndLateOldEvents",
-    "TestRouteLearningScenarioMixedReloadRejectsChangedRuleEvidence",
-    "TestRouteLearningScenarioConfirmationHTTPStatusAndProtocolFallback",
-    "TestRouteLearningScenarioRuleCooldownProbationAndLearnedProtocol",
-    "TestRouteLearningScenarioConfirmationCannotCancelCircuitRecovery",
-    "TestRouteLearningScenarioIngressRecoveryPrecedesLearning",
+    "TestCachedBoostReplacementHonorsCacheLifecycle",
+    "TestCachedBoostLateFailureCannotDeleteNewGeneration",
+    "TestCachedBoostConcurrentReplacementsHaveSingleOwner",
+    "TestCachedBoostReplacementTokenCannotInvalidateLaterWinner",
+    "TestCachedBoostHedgeDelayClampsTwiceEWMA",
+    "TestCachedBoostHardFailureStartsFallbackWithoutHedgeDelay",
+    "TestCachedBoostNeutralConnectFailurePreservesRuleWinner",
+    "TestCachedBoostSlowPrimaryLaunchesHedgeOnSignalAndCancelsLoser",
+    "TestFreshBoostSOCKS5UsesStaleExplorerInTopTwo",
+    "TestFreshBoostRecoveryProbeFinishesBeforeSingleHealthyFallback",
+    "TestFreshBoostTargetSaturationReturnsAttemptBudget",
+    "TestRaceBoostTargetsClosesEveryLoser",
+    "TestRaceBoostTargetsHonorsCancellation",
+    "TestBoostProtocolCanaryGetsExclusiveSetupAndReleasesLease",
+    "TestBoostProtocolCanaryFailureRefillsHealthyTarget",
+    "TestSelectTargetsExcludingReservesOnePenalizedProtocolCanary",
+    "TestSelectTargetsExcludingDefersProtocolPenaltyUntilHealthyAlternativesExhausted",
+    "TestRouteHealthTripsAfterThreeConsecutiveFailures",
+    "TestRouteHealthAllowsOnlyOneConcurrentHalfOpenProbe",
+    "TestRouteHealthProbeBackoffAndRecovery",
+    "TestRouteHealthCancelledProbeIsNeutralAndReleasesClaim",
+    "TestRouteHealthIgnoresOutOfOrderPreCircuitResults",
+    "TestHTTP3RepeatedDegradationUsesH2CooldownAndHalfOpenRecovery",
+    "TestHTTP3DegradationCooldownRequiresReachableHTTP2",
+    "TestHTTP3RuleBreakerDifferentIPsRequireDataPlaneProbation",
+    "TestHTTP3RuleRecoveryDueEvictsH2OnlyCacheForMixedCanary",
+    "TestHTTP3UDPBlackholeStaleGenerationCannotCommitCooldown",
+    "TestReloadRulesKeepsOldStreamAndSwitchesNewConnections",
+    "TestReloadRulesRollsBackAllStagedListenersOnBindFailure",
+    "TestConcurrentReloadAndConnectionsUseWholeGenerations",
+    "TestHTTP2ConnectPingProductionDefaults",
+    "TestHTTP2ConnectPingTimeoutClosesSharedConnectionAndReconnects",
 }
+# Exact names exclude opt-in network experiments and cannot silently lose a
+# renamed/deleted sentinel. Discovery and JSON run/pass counts must agree.
+TEST_PATTERN = "^(" + "|".join(sorted(REQUIRED_TESTS)) + ")$"
 
 
 def count_argument(value: str) -> int:
@@ -115,15 +139,18 @@ def run_command(command: list[str], stdout: Path, stderr: Path, *,
 
 def listed_tests(path: Path) -> tuple[list[str], list[str]]:
     names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
-             if re.fullmatch(r"TestRouteLearning\w*", line.strip())]
+             if re.fullmatch(r"Test\w*", line.strip())]
     errors = []
     if not names:
-        errors.append("no route-learning tests discovered")
+        errors.append("no routing regression tests discovered")
     if len(names) != len(set(names)):
         errors.append("duplicate top-level test names in discovery output")
     missing = sorted(REQUIRED_TESTS - set(names))
     if missing:
         errors.append("missing required tests: " + ", ".join(missing))
+    unexpected = sorted(set(names) - REQUIRED_TESTS)
+    if unexpected:
+        errors.append("unexpected discovered tests: " + ", ".join(unexpected))
     return sorted(set(names)), errors
 
 

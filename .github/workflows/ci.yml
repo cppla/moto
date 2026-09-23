@@ -68,7 +68,7 @@ jobs:
           cache-dependency-path: go.sum
       - name: Validate the regression gate
         run: python3 -B test/routing_regression_test.py
-      - name: Stress learning and recovery interactions
+      - name: Verify Boost, cache, health, and recovery regressions
         run: make routing-regression
         env:
           REGRESSION_SEED: ${{ github.run_id }}

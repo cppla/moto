@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline stdlib tests for bounded, private real-route learning checks."""
+"""Offline stdlib tests for bounded, private real-route CONNECT checks."""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ import unittest
 from unittest import mock
 
 
-SPEC = importlib.util.spec_from_file_location("route_learning_smoke", Path(__file__).with_name("route_learning_smoke.py"))
+SPEC = importlib.util.spec_from_file_location("connect_route_smoke", Path(__file__).with_name("connect_route_smoke.py"))
 if SPEC is None or SPEC.loader is None:
-    raise RuntimeError("cannot load route learning smoke utility")
+    raise RuntimeError("cannot load CONNECT route smoke utility")
 SMOKE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SMOKE)
 SENTINEL = "private-redaction-sentinel"
@@ -74,7 +74,7 @@ def payload(target="one.example:443", protocol="h2", count=100):
     return f'{SMOKE.PAYLOAD_METRIC}{{rule="{SMOKE.RULE_NAME}",target="{target}",protocol="{protocol}",direction="target_to_client"}} {count}\n'
 
 
-class RouteLearningSmokeTests(unittest.TestCase):
+class ConnectRouteSmokeTests(unittest.TestCase):
     def test_http_preferred_socks_fallback_and_source_unchanged(self):
         source = configuration()
         original = copy.deepcopy(source)
@@ -124,7 +124,7 @@ class RouteLearningSmokeTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(SMOKE.SmokeFailure, "invalid_https_url"):
                 SMOKE.https_destination(value)
 
-    def perform_request(self, body, *, limit=1024, declared=None, connect_status=200, expected=None, origin_status=200, extra_headers=b""):
+    def perform_request(self, body, *, limit=1024, declared=None, connect_status=200, expected=None, origin_status=200, extra_headers=b"", ca_file=None):
         raw = FakeSocket(f"HTTP/1.1 {connect_status} Status\r\n\r\n".encode())
         size = len(body) if declared is None else declared
         secured = FakeSocket(f"HTTP/1.1 {origin_status} Status\r\nContent-Length: {size}\r\n".encode() + extra_headers + b"\r\n" + body)
@@ -133,8 +133,8 @@ class RouteLearningSmokeTests(unittest.TestCase):
         self.sample = {"ok": False, "bytes": 0, "body_complete": False, "timing_ms": {}}
         with mock.patch.object(SMOKE.socket, "create_connection", return_value=raw), \
                 mock.patch.object(SMOKE.ssl, "create_default_context", return_value=self.context) as trust:
-            SMOKE.https_request(12000, ("origin.example", "origin.example:443", "/" + SENTINEL), time.monotonic() + 5, limit, expected, self.sample)
-            trust.assert_called_once_with()
+            SMOKE.https_request(12000, ("origin.example", "origin.example:443", "/" + SENTINEL), time.monotonic() + 5, limit, expected, self.sample, ca_file=ca_file)
+            trust.assert_called_once_with(**({"cafile": ca_file} if ca_file else {}))
         self.context.wrap_socket.assert_called_once_with(raw, server_hostname="origin.example", do_handshake_on_connect=False)
         self.context.set_alpn_protocols.assert_called_once_with(["http/1.1"])
         self.assertNotIn(SENTINEL, json.dumps(self.sample))
@@ -149,6 +149,14 @@ class RouteLearningSmokeTests(unittest.TestCase):
         self.assertTrue(sample["body_complete"])
         self.assertEqual(sample["sha256"], digest)
         self.assertEqual(sample["hash_scope"], "complete_body")
+
+    def test_origin_ca_retains_tls_hostname_and_body_verification(self):
+        body = b"controlled-origin-body"
+        sample = self.perform_request(body, expected=hashlib.sha256(body).hexdigest(),
+                                      ca_file="/private/" + SENTINEL + ".crt")
+        self.assertTrue(sample["ok"])
+        self.assertTrue(sample["tls_verified"])
+        self.assertNotIn(SENTINEL, json.dumps(sample))
 
     def test_strict_prefix_limit_not_complete_body(self):
         sample = self.perform_request(b"x" * 100, limit=20)
@@ -199,7 +207,7 @@ class RouteLearningSmokeTests(unittest.TestCase):
     def test_metrics_unknown_targets_and_unrelated_metrics_not_leaked(self):
         encoded = payload(target=SENTINEL) + f'private_secret{{rule="{SMOKE.RULE_NAME}",target="one.example:443",secret="{SENTINEL}"}} 10\n'
         evidence = SMOKE.metric_evidence({}, SMOKE.parse_metrics(encoded), {"one.example:443": 0})
-        self.assertEqual(evidence, {"actual_routes": [], "attempts": [], "learning": []})
+        self.assertEqual(evidence, {"actual_routes": [], "attempts": []})
         self.assertNotIn(SENTINEL, json.dumps(evidence))
 
     def test_metrics_nonfinite_rejected_and_counter_reset_not_negative(self):
@@ -222,49 +230,6 @@ class RouteLearningSmokeTests(unittest.TestCase):
         evidence = SMOKE.metric_evidence({}, SMOKE.parse_metrics(encoded), {"one.example:443": 0})
         self.assertEqual(evidence["actual_routes"], [])
 
-    def test_learning_metrics_are_whitelisted_with_redacted_targets(self):
-        labels = f'rule="{SMOKE.RULE_NAME}",target="one.example:443",protocol="h2"'
-        before = SMOKE.parse_metrics('moto_route_learning_decisions_total{' + labels + ',reason="quality"} 2\n')
-        encoded = ('moto_route_learning_samples{' + labels + '} 3\n' +
-                   'moto_route_learning_confidence{' + labels + '} 0.4\n' +
-                   'moto_route_learning_preferred{' + labels + '} 1\n' +
-                   'moto_route_learning_decisions_total{' + labels + ',reason="quality"} 5\n' +
-                   'moto_route_learning_decisions_total{' + labels + ',reason="' + SENTINEL + '"} 1\n')
-        evidence = SMOKE.metric_evidence(before, SMOKE.parse_metrics(encoded), {"one.example:443": 0})
-        self.assertEqual(len(evidence["learning"]), 4)
-        decisions = next(item for item in evidence["learning"] if item["metric"].endswith("decisions_total"))
-        self.assertEqual(decisions["delta"], 3)
-        self.assertEqual(decisions["reason"], "quality")
-        self.assertNotIn(SENTINEL, json.dumps(evidence))
-        self.assertNotIn("one.example", json.dumps(evidence))
-
-    def test_rule_level_decisions_do_not_require_or_invent_target_protocol(self):
-        name = "moto_route_learning_decisions_total"
-        labels = f'rule="{SMOKE.RULE_NAME}"'
-        before = SMOKE.parse_metrics(name + '{' + labels + ',reason="quality"} 2\n')
-        encoded = (name + '{' + labels + ',reason="quality"} 5\n' +
-                   name + '{' + labels + ',reason="explore"} 1\n' +
-                   name + '{' + labels + ',reason="' + SENTINEL + '"} 9\n' +
-                   name + '{rule="' + SENTINEL + '",reason="quality"} 20\n')
-        evidence = SMOKE.metric_evidence(before, SMOKE.parse_metrics(encoded), {})
-        self.assertEqual(evidence["actual_routes"], [])
-        self.assertEqual(len(evidence["learning"]), 2)
-        for item in evidence["learning"]:
-            self.assertEqual(item["scope"], "rule")
-            self.assertNotIn("target_index", item)
-            self.assertNotIn("protocol", item)
-        decisions = {item["reason"]: item for item in evidence["learning"]}
-        self.assertEqual(decisions["quality"]["value"], 5)
-        self.assertEqual(decisions["quality"]["delta"], 3)
-        self.assertEqual(decisions["explore"]["delta"], 1)
-        self.assertNotIn(SENTINEL, json.dumps(evidence))
-
-    def test_rule_level_decision_counter_reset_never_reports_negative_delta(self):
-        line = 'moto_route_learning_decisions_total{rule="' + SMOKE.RULE_NAME + '",reason="quality"} '
-        evidence = SMOKE.metric_evidence(SMOKE.parse_metrics(line + '20\n'), SMOKE.parse_metrics(line + '1\n'), {})
-        self.assertEqual(evidence["learning"][0]["value"], 1)
-        self.assertEqual(evidence["learning"][0]["delta"], 0)
-
     def test_private_process_reused_and_cleanup(self):
         rule = SMOKE.select_rule(configuration())
         process = mock.Mock()
@@ -281,11 +246,13 @@ class RouteLearningSmokeTests(unittest.TestCase):
                 self.assertEqual(json.load(config_file)["rules"][0]["targets"][0]["connectProxy"]["basicAuth"]["password"], SENTINEL)
             return process
 
-        def fetch(_port, _destination, _deadline, limit, _hash, sample):
+        def fetch(_port, _destination, _deadline, limit, _hash, sample, *, ca_file=None):
+            self.assertEqual(ca_file, "/private/" + SENTINEL + ".crt")
             sample.update(ok=True, bytes=min(8, limit), body_complete=True, tls_verified=True)
 
         args = argparse.Namespace(binary=Path("/unused/moto"), protocol="auto", rounds=3, bytes=8,
-                                  timeout=5, pause=0, expected_sha256=None)
+                                  timeout=5, pause=0, expected_sha256=None,
+                                  ca_file="/private/" + SENTINEL + ".crt")
         case = {"samples": [], "ok": False}
         budget = {"remaining_bytes": 20}
         snapshots = [SMOKE.parse_metrics(payload(count=count)) for count in (0, 100, 100, 200, 200, 300)]
@@ -303,6 +270,63 @@ class RouteLearningSmokeTests(unittest.TestCase):
         process.wait.assert_called_once_with(timeout=3)
         self.assertFalse(directories[0].exists())
 
+    def test_forced_protocol_uses_payload_evidence_and_auto_reports_actual_protocol(self):
+        for policy, actual, expected in (("h2", "h2", True), ("h3", "h3", True),
+                                         ("h2", "h3", False), ("h3", "h2", False),
+                                         ("auto", "h2", True)):
+            with self.subTest(policy=policy, actual=actual):
+                process = mock.Mock()
+                process.poll.return_value = None
+                args = argparse.Namespace(binary=Path("/unused/moto"), protocol=policy,
+                                          rounds=1, bytes=8, timeout=5, pause=0,
+                                          expected_sha256=None, ca_file=None)
+                case = {"samples": [], "ok": False}
+
+                def fetch(_port, _destination, _deadline, _limit, _hash, sample, **_kwargs):
+                    sample.update(ok=True, bytes=8, body_complete=True, tls_verified=True)
+
+                snapshots = [{}, SMOKE.parse_metrics(payload(protocol=actual, count=100))]
+                with mock.patch.object(SMOKE.subprocess, "Popen", return_value=process), \
+                        mock.patch.object(SMOKE, "wait_ready"), \
+                        mock.patch.object(SMOKE, "https_request", side_effect=fetch), \
+                        mock.patch.object(SMOKE, "read_metrics", side_effect=snapshots):
+                    SMOKE.run_case(args, SMOKE.select_rule(configuration()), [0], False,
+                                   ("origin.example", "origin.example:443", "/"),
+                                   time.monotonic() + 10, {"remaining_bytes": 8}, case)
+                self.assertEqual(case["ok"], expected)
+                self.assertEqual(case["samples"][0]["actual_routes"][0]["protocol"], actual)
+                if not expected:
+                    self.assertEqual(case["samples"][0]["error"], "unexpected_upstream_protocol")
+                process.terminate.assert_called_once()
+
+    def test_failed_request_kept_and_later_request_still_tested(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        args = argparse.Namespace(binary=Path("/unused/moto"), protocol="h3", rounds=2,
+                                  bytes=8, timeout=5, pause=0, expected_sha256=None, ca_file=None)
+        case = {"samples": [], "ok": False}
+        budget = {"remaining_bytes": 16}
+
+        def fetch(_port, _destination, _deadline, _limit, _hash, sample, **_kwargs):
+            if sample["round"] == 1:
+                sample["bytes"] = 3
+                raise SMOKE.SmokeFailure("timeout")
+            sample.update(ok=True, bytes=8, body_complete=True, tls_verified=True)
+
+        snapshots = [{}, {}, {}, SMOKE.parse_metrics(payload(protocol="h3", count=100))]
+        with mock.patch.object(SMOKE.subprocess, "Popen", return_value=process), \
+                mock.patch.object(SMOKE, "wait_ready"), \
+                mock.patch.object(SMOKE, "https_request", side_effect=fetch), \
+                mock.patch.object(SMOKE, "read_metrics", side_effect=snapshots):
+            SMOKE.run_case(args, SMOKE.select_rule(configuration()), [0], False,
+                           ("origin.example", "origin.example:443", "/"),
+                           time.monotonic() + 10, budget, case)
+        self.assertFalse(case["ok"])
+        self.assertEqual(len(case["samples"]), 2)
+        self.assertEqual(case["samples"][0]["error"], "timeout")
+        self.assertTrue(case["samples"][1]["ok"])
+        self.assertEqual(budget["remaining_bytes"], 5)
+
     def test_request_error_is_redacted_and_counted(self):
         self.assertEqual(SMOKE.error_code(OSError(SENTINEL)), "io_or_http_error")
         self.assertEqual(SMOKE.error_code(ValueError(SENTINEL)), "invalid_input")
@@ -316,6 +340,18 @@ class RouteLearningSmokeTests(unittest.TestCase):
                     self.assertEqual(SMOKE.main(), 1)
                 self.assertFalse(json.loads(output.getvalue())["ok"])
                 self.assertNotIn(SENTINEL, output.getvalue())
+
+    def test_invalid_origin_ca_is_redacted_before_starting_process(self):
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["smoke", "--config", "/unused/config", "--binary", "/unused/moto",
+                                             "--ca-file", "/unused/" + SENTINEL]), \
+                mock.patch.object(Path, "is_file", return_value=False), \
+                mock.patch.object(SMOKE.subprocess, "Popen") as popen, \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(SMOKE.main(), 1)
+        self.assertEqual(json.loads(output.getvalue())["error"], "invalid_origin_ca_file")
+        self.assertNotIn(SENTINEL, output.getvalue())
+        popen.assert_not_called()
 
     def test_main_runs_each_target_then_group_without_private_output(self):
         output = io.StringIO()

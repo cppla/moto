@@ -16,7 +16,7 @@ Moto 是轻量级、自适应的 TCP 网关，也可以把本地 SOCKS5 或 HTTP
 
 ## 为什么是 Moto？
 
-- **自适应选路：** 顺序故障切换、首包与 TLS SNI/ALPN 分类、线路质量学习、候选竞速、主动健康检查、故障隔离和恢复探测都在一个进程内完成。
+- **自适应选路：** 顺序故障切换、首包与 TLS SNI/ALPN 分类、近期建连质量评估、候选竞速、主动健康检查、故障隔离和恢复探测都在一个进程内完成。
 - **协议透明：** 默认 `protocol: "tcp"` 不终止 TLS、不改写流量，也不要求接入 SDK；HTTP(S)、WebSocket、SSH、SOCKS5 和私有 TCP 协议均可直接使用。
 - **CONNECT 桥接：** `protocol: "socks5"` 接收标准 SOCKS5 CONNECT，`protocol: "http"` 接收 HTTP/1.1 CONNECT；两者向上游代理发送带可选 Basic Auth 的 HTTP/3 或 HTTP/2 CONNECT 请求；配置 H3 优先、H2 兜底时，可安全重试的 H3 故障会在同一决策期限内回退 H2。
 - **高效转发：** 稳定字节流直接交给 `io.Copy`；Linux 上符合条件的 TCP→TCP 路径通常由 Go 运行时自动使用 `splice(2)` 零拷贝，不支持时自动回退。
@@ -134,7 +134,7 @@ flowchart LR
 
 Moto 综合连接质量、近期结果和主动健康状态选择线路，并自动隔离、恢复异常上游。`boost` 与可选 `hedge` 用于降低连接建立的尾延迟，同时保持有界并发，避免故障放大。
 
-SOCKS5 / HTTP CONNECT 的 `boost` 会按实际 H2/H3 协议学习近期建连质量、可靠性和已确认的连接退化，并低频探索其他健康线路；有足够证据时更新新连接的线路偏好，不按时间段切换，也不迁移已有隧道。学习结果在内存中保存，同配置热重载继承、重启后重新学习；它不把空闲流量当成测速结果，也不保证下载带宽提升。
+SOCKS5 / HTTP CONNECT 的 `boost` 根据近期建连耗时和健康状态选择候选，复用可用的赢家缓存，并通过竞速、备选探索和恢复探测适应线路变化。线路变化只影响新连接，不迁移已有隧道；建连更快不等于下载带宽更高。
 
 预热仅适用于确认能够安全复用空闲连接的 TCP 上游。Moto 对前台拨号、后台维护和健康探测实施独立资源限制，以在高并发或上游故障时保护进程稳定性。
 
@@ -357,9 +357,7 @@ python3 test/moto-route-watch.py --once
 python3 test/moto-route-watch.py --json
 ```
 
-脚本还会显示学习进度或学习偏好，后者不等于当前承载流量的主线路。对应 `/metrics` 指标提供样本新鲜度、建连评价及探索/选路计数。
-
-私人线路可用 `test/route_learning_smoke.py --binary /path/to/moto --config /path/to/private.json` 做有流量和时间上限的真实 CONNECT 检查。脚本使用临时配置，报告只显示目标索引，不输出账号密码；这类连通性检查不替代正式速度 A/B。
+真实线路连通性可用 `python3 test/connect_route_smoke.py --binary /path/to/moto --config /path/to/private.json --protocol h2` 检查，或将协议改为 `h3`。工具使用临时配置和有界流量，报告只显示目标索引；连通性检查不等于速度 A/B。
 
 ## WebSocket
 
@@ -425,7 +423,7 @@ CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达�
 <details>
 <summary><strong>本地回归与性能采样</strong></summary>
 
-`make routing-regression` 会在 race 检查下重复运行线路学习与恢复回归，并保存测试清单、随机种子、原始结果和通过次数；空测试集、跳过或未完成的测试均不会通过。CI 在 Linux 和 macOS 上执行这项检查。需要重现测试顺序时使用 `make routing-regression REGRESSION_SEED=<报告中的种子>`；种子仅复现测试顺序，不保证复现线程调度。
+`make routing-regression` 会在 race 检查下重复运行选路、赢家缓存及恢复回归，并保存测试清单、随机种子、原始结果和通过次数；空测试集、跳过或未完成的测试均不会通过。CI 在 Linux 和 macOS 上执行这项检查。需要重现测试顺序时使用 `make routing-regression REGRESSION_SEED=<报告中的种子>`；种子仅复现测试顺序，不保证复现线程调度。
 
 完全本地的回归门禁不访问外网，会报告直连、启动初期（输出中保留名称 `cold`，但同一阶段后续请求会逐渐变热）和热态的成功吞吐与 p50/p95/p99，并采样 CPU、RSS、FD 和 goroutine。这是功能与回归 smoke，不是绝对容量结论：
 
