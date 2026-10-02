@@ -278,6 +278,8 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 
 	requestReader, requestWriter := io.Pipe()
 	streamCtx, cancelStream := context.WithCancel(context.Background())
+	setupWaiter := &http2SetupWaiter{}
+	streamCtx = withHTTP2SetupWaiter(streamCtx, setupWaiter)
 	// Retain only the bounded rule identity on the detached stream context.
 	// x/net passes it to a physical dial when needed; pooled reuse emits no
 	// handshake. Setup cancellation still leaves an established tunnel alive.
@@ -323,7 +325,7 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 		case result := <-resultReady:
 			response, err = result.response, result.err
 		default:
-			setupErr := ctx.Err()
+			setupErr := http2SetupCallerError(setupWaiter, nil, ctx.Err())
 			cancelStream()
 			_ = requestWriter.CloseWithError(setupErr)
 			_ = requestReader.CloseWithError(setupErr)
@@ -338,12 +340,7 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 		}
 	}
 	if err != nil {
-		setupErr := err
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			// Preserve the caller's deadline/cancellation cause for route health
-			// and protocol metrics instead of returning context.Canceled blindly.
-			setupErr = ctxErr
-		}
+		setupErr := http2SetupCallerError(setupWaiter, err, ctx.Err())
 		cancelStream()
 		_ = requestWriter.CloseWithError(setupErr)
 		_ = requestReader.CloseWithError(setupErr)

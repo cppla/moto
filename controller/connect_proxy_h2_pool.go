@@ -63,10 +63,11 @@ type http2ConnectConnPool struct {
 }
 
 type http2ConnectDialCall struct {
-	ctx  context.Context
-	done chan struct{}
-	conn *xhttp2.ClientConn
-	err  error
+	ctx   context.Context
+	group *routeFailureGroup
+	done  chan struct{}
+	conn  *xhttp2.ClientConn
+	err   error
 }
 
 // http2SetupError identifies a failed physical DNS/TCP/TLS setup, not an
@@ -99,6 +100,7 @@ func newHTTP2ConnectConnPool(template *xhttp2.Transport) *http2ConnectConnPool {
 
 func (pool *http2ConnectConnPool) GetClientConn(request *http.Request, address string) (*xhttp2.ClientConn, error) {
 	ctx := request.Context()
+	waiter := http2SetupWaiterFromContext(ctx)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -106,6 +108,7 @@ func (pool *http2ConnectConnPool) GetClientConn(request *http.Request, address s
 		pool.mu.Lock()
 		for _, connection := range pool.conns[address] {
 			if connection.ReserveNewRequest() {
+				waiter.waitingOn(nil)
 				pool.reservations[connection]++
 				traceHTTP2ConnectGetConn(ctx, address)
 				pool.mu.Unlock()
@@ -115,10 +118,11 @@ func (pool *http2ConnectConnPool) GetClientConn(request *http.Request, address s
 		traceHTTP2ConnectGetConn(ctx, address)
 		call := pool.dialing[address]
 		if call == nil {
-			call = &http2ConnectDialCall{ctx: ctx, done: make(chan struct{})}
+			call = &http2ConnectDialCall{ctx: ctx, group: newRouteFailureGroup(), done: make(chan struct{})}
 			pool.dialing[address] = call
 			go pool.dial(call, address)
 		}
+		waiter.waitingOn(call)
 		pool.mu.Unlock()
 
 		// The CONNECT manager returns to canceled callers immediately but
@@ -131,10 +135,14 @@ func (pool *http2ConnectConnPool) GetClientConn(request *http.Request, address s
 			// waiter, and an initiating request never retries its own cancel.
 			if call.ctx != ctx && call.ctx.Err() != nil &&
 				(errors.Is(call.err, context.Canceled) || errors.Is(call.err, context.DeadlineExceeded)) {
+				// Keep the failed flight until this request actually joins its
+				// replacement or reserves a usable connection. If its own deadline
+				// expires during this retry, it still shared the previous setup.
 				continue
 			}
 			return nil, call.err
 		}
+		waiter.finished(call)
 
 		pool.mu.Lock()
 		// Idle closing or GOAWAY may have removed this freshly dialed
@@ -182,7 +190,7 @@ func (pool *http2ConnectConnPool) dial(call *http2ConnectDialCall, address strin
 		_ = call.conn.Close()
 	}
 	if call.err != nil {
-		call.err = &http2SetupError{cause: call.err, group: newRouteFailureGroup()}
+		call.err = &http2SetupError{cause: call.err, group: call.group}
 	}
 	close(call.done)
 }

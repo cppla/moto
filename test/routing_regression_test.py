@@ -63,6 +63,13 @@ NAMES = sorted([
     "TestHTTP2ConnectPingProductionDefaults",
     "TestHTTP2ConnectPingTimeoutClosesSharedConnectionAndReconnects",
     "TestHTTP2SharedTLSSetupFailureCountsOncePerRoute",
+    "TestHTTP2SharedSetupWaiterDeadlineCountsOncePerRoute",
+    "TestHTTP2SharedSetupCommonDeadlineRetainsPhysicalIdentity",
+    "TestHTTP2SharedSetupCanceledRetryRetainsDeadlineIdentity",
+    "TestHTTP2SetupCallerErrorPreservesOnlyPhysicalFailures",
+    "TestHTTP2IndependentPhysicalSetupDeadlinesTripCircuit",
+    "TestHTTP2ConnectResponseDeadlinesRemainIndependentFailures",
+    "TestHTTP2ConnectResponseDeadlineDoesNotJoinAnotherPhysicalSetup",
     "TestHTTP2IndependentSetupFailuresTripCircuit",
     "TestHTTP2SharedSetupParentCancellationIsNeutral",
     "TestHTTP2ConnectStatusFailuresAreNotSharedSetupFailures",
@@ -150,7 +157,7 @@ class RoutingRegressionTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
 
     def test_fixed_selection_matches_only_the_pinned_tests(self):
-        self.assertEqual(len(NAMES), 44)
+        self.assertEqual(len(NAMES), 51)
         self.assertEqual(RUNNER.REQUIRED_TESTS, set(NAMES))
         for name in NAMES:
             self.assertIsNotNone(re.fullmatch(RUNNER.TEST_PATTERN, name))
