@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"moto/utils"
 	"net"
 	"strings"
 	"sync"
@@ -57,11 +56,8 @@ func TestHTTP3CloseClassification(t *testing.T) {
 
 func TestHTTP3CloseObservationOnceAndGenerationIsolation(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
-	previous := utils.Logger
-	utils.Logger = zap.New(core)
-	t.Cleanup(func() { utils.Logger = previous })
 	now := time.Now()
-	manager := newHTTP3ConnectManager(nil)
+	manager := newHTTP3ConnectManagerWithLogger(nil, zap.New(core))
 	manager.now = func() time.Time { return now }
 	t.Cleanup(manager.close)
 	key := http3ConnectTransportKey{address: "proxy.example:443", serverName: "private-server-name"}
@@ -130,10 +126,7 @@ func TestHTTP3CloseLifecycleLogLevels(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			core, logs := observer.New(zapcore.DebugLevel)
-			previous := utils.Logger
-			utils.Logger = zap.New(core)
-			t.Cleanup(func() { utils.Logger = previous })
-			manager := newHTTP3ConnectManager(nil)
+			manager := newHTTP3ConnectManagerWithLogger(nil, zap.New(core))
 			t.Cleanup(manager.close)
 			slot := &http3ConnectTransportSlot{tunnels: make(map[*http3TunnelStats]struct{})}
 			slot.closeRequested.Store(test.local)

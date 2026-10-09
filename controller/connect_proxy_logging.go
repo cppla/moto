@@ -14,6 +14,12 @@ var connectProxyFailureLogLimiter = newConnectProxyErrorLogLimiter()
 // protocol attempts remain visible through metrics, avoiding one Error line per
 // target plus another aggregate line for the same inbound SOCKS request.
 func logConnectProxyFailure(rule *config.Rule, fallbackTarget string, err error, message string) {
+	logConnectProxyFailureTo(utils.Logger, connectProxyFailureLogLimiter, rule, fallbackTarget, err, message)
+}
+
+// Keep capture sinks and limiter state local to their caller. Tests must not
+// swap process-global logging while an older transport can still emit events.
+func logConnectProxyFailureTo(logger *zap.Logger, limiter *connectProxyErrorLogLimiter, rule *config.Rule, fallbackTarget string, err error, message string) {
 	if rule == nil || err == nil {
 		return
 	}
@@ -30,7 +36,7 @@ func logConnectProxyFailure(rule *config.Rule, fallbackTarget string, err error,
 	if class == "" {
 		class = connectProxyAttemptTransportError
 	}
-	allowed, suppressed := connectProxyFailureLogLimiter.allow(rule.Name, target, protocol, class)
+	allowed, suppressed := limiter.allow(rule.Name, target, protocol, class)
 	if !allowed {
 		return
 	}
@@ -54,12 +60,12 @@ func logConnectProxyFailure(rule *config.Rule, fallbackTarget string, err error,
 
 	switch class {
 	case string(connectProxyFailureProxyAuth):
-		utils.Logger.Error(message, fields...)
+		logger.Error(message, fields...)
 	case string(connectProxyFailureRateLimited), string(connectProxyFailureServiceUnavailable),
 		connectProxyAttemptTransportError, connectProxyAttemptTimeout, string(connectProxyFailureStatusUnknown):
-		utils.Logger.Warn(message, fields...)
+		logger.Warn(message, fields...)
 	default:
-		utils.Logger.Info(message, fields...)
+		logger.Info(message, fields...)
 	}
 }
 

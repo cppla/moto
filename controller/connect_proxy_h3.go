@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"moto/config"
+	"moto/utils"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
+	"go.uber.org/zap"
 )
 
 const (
@@ -162,6 +164,7 @@ func (err *http3SetupError) Unwrap() error {
 type http3ConnectManager struct {
 	mu                   sync.Mutex
 	observerMu           sync.Mutex
+	logger               *zap.Logger // Immutable after construction, including asynchronous callbacks.
 	transports           map[http3ConnectTransportKey][]*http3ConnectTransportSlot
 	learnedStreamLimits  map[http3ConnectTransportKey]int
 	newTransport         func(http3ConnectTransportKey, context.Context) *http3.Transport
@@ -185,11 +188,22 @@ type http3ConnectManager struct {
 }
 
 func newHTTP3ConnectManager(factory func(http3ConnectTransportKey, context.Context) *http3.Transport) *http3ConnectManager {
+	return newHTTP3ConnectManagerWithLogger(factory, utils.Logger)
+}
+
+func newHTTP3ConnectManagerWithLogger(
+	factory func(http3ConnectTransportKey, context.Context) *http3.Transport,
+	logger *zap.Logger,
+) *http3ConnectManager {
 	dialCtx, cancelDials := context.WithCancel(context.Background())
 	if factory == nil {
 		factory = newHTTP3ConnectTransportWithOwner
 	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &http3ConnectManager{
+		logger:              logger,
 		transports:          make(map[http3ConnectTransportKey][]*http3ConnectTransportSlot),
 		learnedStreamLimits: make(map[http3ConnectTransportKey]int),
 		newTransport:        factory,

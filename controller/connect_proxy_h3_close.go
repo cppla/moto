@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"errors"
-	"moto/utils"
 	"net"
 	"sort"
 	"strconv"
@@ -135,7 +134,7 @@ func (manager *http3ConnectManager) recordHTTP3ConnectionClose(
 		}
 		logger := observation.logger
 		if logger == nil {
-			logger = utils.Logger
+			logger = manager.logger
 		}
 		logger.Log(level, "HTTP/3 物理连接已结束", fields...)
 	})

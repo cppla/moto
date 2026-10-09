@@ -9,7 +9,6 @@ import (
 	"errors"
 	"io"
 	"moto/config"
-	"moto/utils"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -33,10 +32,8 @@ func TestHTTP3PhysicalCloseIntegration(t *testing.T) {
 	const destination = "private-destination.example:443"
 	wantAuthorization := "Basic " + base64.StdEncoding.EncodeToString([]byte("fixture:"+password))
 
-	previousLogger := utils.Logger
 	core, observed := observer.New(zapcore.DebugLevel)
-	utils.Logger = zap.New(core)
-	t.Cleanup(func() { utils.Logger = previousLogger })
+	logger := zap.New(core)
 
 	for _, test := range []struct {
 		name          string
@@ -72,7 +69,7 @@ func TestHTTP3PhysicalCloseIntegration(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			observed.TakeAll()
 			endpoint, roots, peers, connectionCount := startHTTP3CloseObservationServer(t, wantAuthorization)
-			manager := newHTTP3ConnectManager(func(key http3ConnectTransportKey, owner context.Context) *http3.Transport {
+			manager := newHTTP3ConnectManagerWithLogger(func(key http3ConnectTransportKey, owner context.Context) *http3.Transport {
 				transport := newHTTP3ConnectTransportWithOwner(key, owner)
 				transport.TLSClientConfig.RootCAs = roots
 				if test.idle {
@@ -81,7 +78,7 @@ func TestHTTP3PhysicalCloseIntegration(t *testing.T) {
 					transport.QUICConfig.MaxIdleTimeout = 200 * time.Millisecond
 				}
 				return transport
-			})
+			}, logger)
 			t.Cleanup(manager.close)
 			target := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{
 				Protocols: []string{config.ConnectProxyH3},

@@ -3,8 +3,6 @@ package controller
 import (
 	"time"
 
-	"moto/utils"
-
 	"go.uber.org/zap"
 )
 
@@ -315,7 +313,7 @@ func (manager *http3ConnectManager) startHTTP3ForcedDrainMonitor(monitor *http3F
 	if manager == nil || monitor == nil {
 		return
 	}
-	utils.Logger.Info("HTTP/3 严重退化旧连接进入限时排空",
+	manager.logger.Info("HTTP/3 严重退化旧连接进入限时排空",
 		zap.String("targetAddr", monitor.key.address),
 		zap.String("reason", string(monitor.reason)),
 		zap.Duration("streamStallTimeout", http3StreamFastFailTimeout(monitor.reason)),
@@ -530,7 +528,7 @@ func (manager *http3ConnectManager) checkHTTP3ForcedDrainAt(
 				manager.recordHTTP3RotationEventLocked(monitor.key, string(monitor.reason), "stream_fast_failed")
 			}
 			manager.mu.Unlock()
-			utils.Logger.Warn("HTTP/3 退化旧连接中的阻塞隧道长期无数据推进，已快速失败",
+			manager.logger.Warn("HTTP/3 退化旧连接中的阻塞隧道长期无数据推进，已快速失败",
 				zap.String("targetAddr", monitor.key.address),
 				zap.String("reason", string(monitor.reason)),
 				zap.Int("tunnels", result.fastFailedTunnels),
@@ -547,7 +545,7 @@ func (manager *http3ConnectManager) checkHTTP3ForcedDrainAt(
 	manager.mu.Unlock()
 
 	slot.close()
-	utils.Logger.Warn("HTTP/3 严重退化旧连接长期无数据推进，已强制排空",
+	manager.logger.Warn("HTTP/3 严重退化旧连接长期无数据推进，已强制排空",
 		zap.String("targetAddr", monitor.key.address),
 		zap.String("reason", string(monitor.reason)),
 		zap.String("closeReason", result.closeReason),

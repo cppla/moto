@@ -3,9 +3,10 @@ package controller
 import (
 	"errors"
 	"moto/config"
-	"moto/utils"
 	"net/http"
+	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -40,18 +41,12 @@ func TestLogConnectProxyFailureInfersProtocolForGenericMultiTargetErrors(t *test
 		},
 	}
 
-	previousLogger := utils.Logger
-	previousLimiter := connectProxyFailureLogLimiter
-	t.Cleanup(func() {
-		utils.Logger = previousLogger
-		connectProxyFailureLogLimiter = previousLimiter
-	})
-
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			core, observed := observer.New(zapcore.DebugLevel)
-			utils.Logger = zap.New(core)
-			connectProxyFailureLogLimiter = newConnectProxyErrorLogLimiter()
+			logger := zap.New(core)
+			limiter := newConnectProxyErrorLogLimiter()
 
 			rule := &config.Rule{
 				Name:     "generic-failure-" + test.name,
@@ -68,7 +63,7 @@ func TestLogConnectProxyFailureInfersProtocolForGenericMultiTargetErrors(t *test
 				})
 			}
 
-			logConnectProxyFailure(rule, rule.Targets[len(rule.Targets)-1].Address,
+			logConnectProxyFailureTo(logger, limiter, rule, rule.Targets[len(rule.Targets)-1].Address,
 				errors.New("generic transport failure"), "test CONNECT failure")
 			entries := observed.AllUntimed()
 			if len(entries) != 1 {
@@ -102,18 +97,12 @@ func TestLogConnectProxyFailureUsesUpstreamCONNECTResponseMessage(t *testing.T) 
 		},
 	}
 
-	previousLogger := utils.Logger
-	previousLimiter := connectProxyFailureLogLimiter
-	t.Cleanup(func() {
-		utils.Logger = previousLogger
-		connectProxyFailureLogLimiter = previousLimiter
-	})
-
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			core, observed := observer.New(zapcore.DebugLevel)
-			utils.Logger = zap.New(core)
-			connectProxyFailureLogLimiter = newConnectProxyErrorLogLimiter()
+			logger := zap.New(core)
+			limiter := newConnectProxyErrorLogLimiter()
 			rule := &config.Rule{Name: "status-message", Protocol: config.ProtocolSOCKS5, Mode: config.ModeBoost}
 			statusErr := &connectProxyStatusError{
 				protocol:   config.ConnectProxyH2,
@@ -122,7 +111,7 @@ func TestLogConnectProxyFailureUsesUpstreamCONNECTResponseMessage(t *testing.T) 
 				class:      classifyConnectProxyStatus(test.statusCode),
 			}
 
-			logConnectProxyFailure(rule, statusErr.target, statusErr, "缓存原生代理线路及备选均不可用")
+			logConnectProxyFailureTo(logger, limiter, rule, statusErr.target, statusErr, "缓存原生代理线路及备选均不可用")
 			entries := observed.AllUntimed()
 			if len(entries) != 1 {
 				t.Fatalf("log entries = %d, want 1", len(entries))
@@ -136,6 +125,54 @@ func TestLogConnectProxyFailureUsesUpstreamCONNECTResponseMessage(t *testing.T) 
 			}
 			if got := entry.ContextMap()["statusCode"]; got != int64(test.statusCode) {
 				t.Fatalf("statusCode field = %#v, want %d", got, test.statusCode)
+			}
+		})
+	}
+}
+
+func TestLogConnectProxyFailureIsolatesConcurrentSinksAndLimiters(t *testing.T) {
+	for _, name := range []string{"old", "new"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			core, observed := observer.New(zapcore.DebugLevel)
+			logger := zap.New(core)
+			now := time.Unix(1, 0)
+			limiter := newConnectProxyErrorLogLimiterWithNow(func() time.Time { return now })
+			// Identical keys must not share capture sinks or rate-limit tokens.
+			rule := &config.Rule{Name: "same-rule"}
+			err := errors.New("transport failure")
+			const attempts = 24
+			var workers sync.WaitGroup
+			start := make(chan struct{})
+			for range attempts {
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					<-start
+					logConnectProxyFailureTo(logger, limiter, rule, "proxy.example:443", err, name)
+				}()
+			}
+			close(start)
+			workers.Wait()
+			if got := observed.Len(); got != connectProxyErrorLogBurst {
+				t.Fatalf("initial log count = %d, want %d", got, connectProxyErrorLogBurst)
+			}
+
+			// Advance only after all workers exit; the injected clock is immutable
+			// while concurrent calls are running.
+			now = now.Add(connectProxyErrorLogWindow)
+			logConnectProxyFailureTo(logger, limiter, rule, "proxy.example:443", err, name)
+			entries := observed.AllUntimed()
+			if len(entries) != connectProxyErrorLogBurst+1 {
+				t.Fatalf("refilled log count = %d, want %d", len(entries), connectProxyErrorLogBurst+1)
+			}
+			for _, entry := range entries {
+				if entry.Message != name {
+					t.Fatalf("cross-sink message = %q, want %q", entry.Message, name)
+				}
+			}
+			if got := entries[len(entries)-1].ContextMap()["suppressed"]; got != uint64(attempts-connectProxyErrorLogBurst) {
+				t.Fatalf("suppressed = %#v, want %d", got, attempts-connectProxyErrorLogBurst)
 			}
 		})
 	}
