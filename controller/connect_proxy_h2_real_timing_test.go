@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	xhttp2 "golang.org/x/net/http2"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 // TestHTTP2RealRoutePingTiming is opt-in and never changes the production

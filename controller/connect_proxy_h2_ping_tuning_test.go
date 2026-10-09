@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	xhttp2 "golang.org/x/net/http2"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 // TestHTTP2ConnectPingTuning measures real seconds using the same certificate-

@@ -419,7 +419,7 @@ func (manager *connectProxyManager) beginHTTP3Attempt(_ context.Context, target 
 	if manager == nil || target == nil || target.ConnectProxy == nil {
 		return 0, false, false
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	now := manager.timeNow()
 	manager.h3FallbackMu.Lock()
 	if manager.h3Fallback == nil {
@@ -489,7 +489,7 @@ func (manager *connectProxyManager) joinHTTP3PendingFallback(target *config.Targ
 	if manager == nil || target == nil || target.ConnectProxy == nil {
 		return 0
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	manager.h3FallbackMu.Lock()
 	defer manager.h3FallbackMu.Unlock()
 	state := manager.h3Fallback[key]
@@ -532,7 +532,7 @@ func (manager *connectProxyManager) markHTTP3FailurePending(target *config.Targe
 	if manager == nil || target == nil || target.ConnectProxy == nil {
 		return
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	manager.h3FallbackMu.Lock()
 	defer manager.h3FallbackMu.Unlock()
 	state := manager.h3Fallback[key]
@@ -558,7 +558,7 @@ func (manager *connectProxyManager) abandonHTTP3Attempt(target *config.Target, t
 	if manager == nil || target == nil || target.ConnectProxy == nil {
 		return
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	manager.h3FallbackMu.Lock()
 	defer manager.h3FallbackMu.Unlock()
 	state := manager.h3Fallback[key]
@@ -593,7 +593,7 @@ func (manager *connectProxyManager) observeHTTP3Attempt(
 	if manager == nil || target == nil || target.ConnectProxy == nil {
 		return
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	manager.h3FallbackMu.Lock()
 	defer manager.h3FallbackMu.Unlock()
 	if manager.h3Fallback == nil {
@@ -821,7 +821,7 @@ func (manager *connectProxyManager) http3RoutePenalty(rule *config.Rule, target 
 	if target.ConnectProxy.Protocols[0] != config.ConnectProxyH3 {
 		return 0
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	mixedFallback := protocolAppearsAfter(target.ConnectProxy.Protocols, 0, config.ConnectProxyH2)
 	manager.h3FallbackMu.Lock()
 	defer manager.h3FallbackMu.Unlock()
@@ -861,7 +861,7 @@ func (manager *connectProxyManager) claimHTTP3BoostProbe(rule *config.Rule, targ
 		return 0, false
 	}
 	if rule != nil && manager.h3RuleBreaker != nil && targetUsesMixedHTTP3First(target) {
-		key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+		key := http3ConnectKey(target)
 		if token, claimed := manager.h3RuleBreaker.claimRecoveryRouteProbe(rule.Name, key, now); claimed {
 			return token, true
 		}
@@ -869,7 +869,7 @@ func (manager *connectProxyManager) claimHTTP3BoostProbe(rule *config.Rule, targ
 			return 0, false
 		}
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	manager.h3FallbackMu.Lock()
 	defer manager.h3FallbackMu.Unlock()
 	state := manager.h3Fallback[key]
@@ -911,7 +911,7 @@ func (manager *connectProxyManager) releaseHTTP3BoostProbe(rule *config.Rule, ta
 		}
 		return
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	manager.h3FallbackMu.Lock()
 	defer manager.h3FallbackMu.Unlock()
 	state := manager.h3Fallback[key]

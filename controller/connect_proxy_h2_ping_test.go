@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	xhttp2 "golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 func TestHTTP2ConnectPingProductionDefaults(t *testing.T) {

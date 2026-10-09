@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"moto/config"
+	xhttp2 "moto/internal/browserhttp2"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,7 +17,6 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
-	xhttp2 "golang.org/x/net/http2"
 )
 
 const (
@@ -28,10 +28,11 @@ const (
 )
 
 type http2ConnectTransportKey struct {
-	address    string
-	serverName string
-	userAgent  string
-	tlsProfile http2TLSClientHelloProfile
+	address        string
+	serverName     string
+	userAgent      string
+	tlsProfile     http2TLSClientHelloProfile
+	browserProfile string
 }
 
 type http2TLSClientHelloProfile uint8
@@ -110,6 +111,7 @@ func newHTTP2ConnectManager(factory func(http2ConnectTransportKey) *xhttp2.Trans
 func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
 	profile := key.tlsProfile
 	transport := &xhttp2.Transport{
+		ChromeProfile: key.browserProfile == config.BrowserProfileChrome,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			ServerName: key.serverName,
@@ -182,7 +184,6 @@ func newHTTP2UTLSConfig(config *tls.Config) (*utls.Config, error) {
 		return nil, errors.New("HTTP/2 TLS crypto/tls VerifyConnection callback is unsupported")
 	}
 	return &utls.Config{
-		Rand:                        config.Rand,
 		Time:                        config.Time,
 		RootCAs:                     config.RootCAs,
 		ServerName:                  config.ServerName,
@@ -267,12 +268,16 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 	if target == nil || target.ConnectProxy == nil {
 		return nil, errors.New("HTTP/2 CONNECT target is not configured")
 	}
-	userAgent, hasUserAgent := connectProxyUserAgentFromContext(ctx)
+	userAgent, hasUserAgent := connectProxyProfileUserAgent(ctx, target)
 	key := http2ConnectTransportKey{
-		address:    target.Address,
-		serverName: target.ConnectProxy.ServerName,
-		userAgent:  userAgent,
-		tlsProfile: http2TLSProfileForUserAgent(userAgent),
+		address:        target.Address,
+		serverName:     target.ConnectProxy.ServerName,
+		userAgent:      userAgent,
+		tlsProfile:     http2TLSProfileForUserAgent(userAgent),
+		browserProfile: target.ConnectProxy.BrowserProfile,
+	}
+	if key.browserProfile == config.BrowserProfileChrome {
+		key.tlsProfile = http2TLSProfileChrome133
 	}
 	transport, releaseTransport := manager.acquireTransport(key)
 

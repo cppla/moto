@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	xhttp2 "golang.org/x/net/http2"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 // The peer consumes a complete, real ClientHello but never sends ServerHello.

@@ -291,6 +291,14 @@ HTTPS_PROXY=http://127.0.0.1:9006 curl https://example.com
 
 HTTP 入站不提供用户名/密码认证；`connectProxy.basicAuth` 仅用于 Moto 向上游代理认证。建议保持本地监听；非 loopback 监听必须配置明确的来源 `allowlist`，并配合防火墙限制访问，避免成为开放代理。
 
+### 可选的 Chrome 风格连接
+
+在目标的 `connectProxy` 中设置 `"browserProfile": "chrome"` 可启用实验性兼容模板；不写此字段则保留原有行为，支持 SOCKS5 和 HTTP CONNECT 入口。
+
+H2 对齐 TLS 握手及部分 HTTP/2 协议特征；H3 对齐 QUIC/TLS 握手特征，**尚未对齐 HTTP/3 SETTINGS 和 QPACK 动态压缩行为**。这不是完整浏览器，也不保证流量不可识别；不会关闭证书校验或隐藏上游可见的 CONNECT 请求。模板随 Moto 版本固定，不代表自动跟随最新 Chrome。
+
+未配置 `userAgent` 时该模板提供 Chrome UA；显式配置的 UA 仍优先，请保持浏览器类型一致。建议先在自己的上游验证兼容性，再用于日常流量。
+
 <details>
 <summary><strong>TLS、健康检查与 PROXY protocol 示例</strong></summary>
 
@@ -369,7 +377,7 @@ Moto 在 TCP 层透明支持 `ws://` 和 `wss://`。HTTP Upgrade、TLS 握手和
 
 ## 构建与验证
 
-项目要求 Go 1.25.13 或更高的兼容版本。
+项目要求 Go 1.27.2 或更高的兼容版本。
 
 ```bash
 # 完整本地门禁

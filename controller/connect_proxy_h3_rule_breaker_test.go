@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/apernet/quic-go"
 )
 
 func TestHTTP3RuleBreakerDifferentIPsRequireDataPlaneProbation(t *testing.T) {

@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/http3"
 )
 
 const (
@@ -41,8 +41,9 @@ var (
 )
 
 type http3ConnectTransportKey struct {
-	address    string
-	serverName string
+	address        string
+	serverName     string
+	browserProfile string
 }
 
 type http3AddressResolver interface {
@@ -231,6 +232,15 @@ func newHTTP3ConnectTransportWithResolver(
 		DisableCompression:     true,
 		MaxResponseHeaderBytes: http3ConnectMaxResponseHeaders,
 	}
+	if key.browserProfile == config.BrowserProfileChrome {
+		transport.QUICConfig.ChromeParrot = true
+		// The pinned QUIC transport-parameter template advertises v1. It is
+		// separate from the TCP ClientHello template used for this profile.
+		transport.QUICConfig.Versions = []quic.Version{quic.Version1}
+		// ChromeParrot advertises a 30s idle timeout. Keep Moto's 10s
+		// keepalive so established, quiet CONNECT tunnels remain usable.
+		transport.QUICConfig.MaxIdleTimeout = 30 * time.Second
+	}
 	// quic-go coalesces the first connection setup per proxy host. Its default
 	// dial inherits the first request's context, so canceling one Boost loser can
 	// otherwise abort the shared handshake for unrelated callers. Parent the
@@ -257,6 +267,9 @@ func newHTTP3ConnectTransportWithResolver(
 			return nil, context.DeadlineExceeded
 		}
 		dialQUICConfig := cloneHTTP3QUICConfigForSetup(quicConfig, remaining)
+		if key.browserProfile == config.BrowserProfileChrome {
+			return dialHTTP3Chrome(dialCtx, resolved, tlsConfig, dialQUICConfig)
+		}
 		return quic.DialAddr(dialCtx, resolved, tlsConfig, dialQUICConfig)
 	}
 	return transport
@@ -677,7 +690,7 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 	if target == nil || target.ConnectProxy == nil {
 		return nil, errors.New("HTTP/3 CONNECT target is not configured")
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	var transport *http3.Transport
 	var transportSlot *http3ConnectTransportSlot
 	var releaseTransport func()
@@ -743,7 +756,7 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 		token := base64.StdEncoding.EncodeToString([]byte(auth.Username + ":" + auth.Password))
 		request.Header.Set("Proxy-Authorization", "Basic "+token)
 	}
-	if userAgent, ok := connectProxyUserAgentFromContext(ctx); ok {
+	if userAgent, ok := connectProxyProfileUserAgent(ctx, target); ok {
 		request.Header.Set("User-Agent", userAgent)
 	}
 
@@ -819,7 +832,7 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 		return nil, statusErr
 	}
 	ruleName, _ := connectProxyRuleNameFromContext(ctx)
-	userAgent, _ := connectProxyUserAgentFromContext(ctx)
+	userAgent, _ := connectProxyProfileUserAgent(ctx, target)
 	tunnelStats := &http3TunnelStats{
 		slot:        transportSlot,
 		ruleName:    ruleName,

@@ -137,10 +137,15 @@ type Target struct {
 // one forward-proxy endpoint. HTTP/3 may be listed ahead of HTTP/2 so a runtime
 // with H3 support can fall back without changing the routing configuration.
 type ConnectProxyConfig struct {
-	Protocols  []string         `json:"protocols"`
-	ServerName string           `json:"serverName,omitempty"`
-	BasicAuth  *BasicAuthConfig `json:"basicAuth,omitempty"`
+	Protocols      []string         `json:"protocols"`
+	ServerName     string           `json:"serverName,omitempty"`
+	BasicAuth      *BasicAuthConfig `json:"basicAuth,omitempty"`
+	BrowserProfile string           `json:"browserProfile,omitempty"`
 }
+
+// BrowserProfileChrome is an explicit, version-pinned compatibility profile.
+// It does not claim to reproduce all browser behavior or conceal proxy use.
+const BrowserProfileChrome = "chrome"
 
 // BasicAuthConfig is sent only as an outbound Proxy-Authorization header. It
 // is never used for inbound SOCKS or HTTP authentication.
@@ -645,6 +650,9 @@ func validateUserAgents(userAgents []string) error {
 func (c *ConnectProxyConfig) Validate() error {
 	if c == nil {
 		return errors.New("connect proxy config is nil")
+	}
+	if c.BrowserProfile != "" && c.BrowserProfile != BrowserProfileChrome {
+		return fmt.Errorf("unsupported browserProfile %q (want %q or omitted)", c.BrowserProfile, BrowserProfileChrome)
 	}
 	if len(c.Protocols) == 0 {
 		c.Protocols = []string{ConnectProxyH2}

@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	xhttp2 "golang.org/x/net/http2"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 // GetConn runs under the pool lock before the shared dial is selected. Once

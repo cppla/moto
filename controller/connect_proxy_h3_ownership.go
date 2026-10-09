@@ -3,7 +3,7 @@ package controller
 import (
 	"context"
 
-	"github.com/quic-go/quic-go"
+	"github.com/apernet/quic-go"
 )
 
 // ownPhysicalConnection covers connections removed from http3.Transport's

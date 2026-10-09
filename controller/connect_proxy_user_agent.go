@@ -9,6 +9,20 @@ import (
 
 type connectProxyUserAgentContextKey struct{}
 
+const connectProxyChromeUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+
+// An explicit browser profile supplies a matching default header, but never
+// silently overwrites a user-configured identity.
+func connectProxyProfileUserAgent(ctx context.Context, target *config.Target) (string, bool) {
+	if userAgent, ok := connectProxyUserAgentFromContext(ctx); ok {
+		return userAgent, true
+	}
+	if target != nil && target.ConnectProxy != nil && target.ConnectProxy.BrowserProfile == config.BrowserProfileChrome {
+		return connectProxyChromeUserAgent, true
+	}
+	return "", false
+}
+
 // selectConnectProxyUserAgent chooses a process-lifetime identity for one
 // CONNECT rule. A preferred identity survives a successful reload while it is
 // still present in the rule's candidate list.

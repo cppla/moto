@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/http3"
 )
 
 type http3OwnershipFixture struct {
@@ -256,6 +256,10 @@ func TestHTTP3IdleSlotClosesAllOwnedPhysicalConnections(t *testing.T) {
 	// RoundTrip's internal redial, without depending on quic-go retry timing.
 	tlsConfig := slot.transport.TLSClientConfig.Clone()
 	tlsConfig.NextProtos = []string{http3.NextProtoH3}
+	// This direct Dial bypasses http3.Transport's normal SNI population.
+	if tlsConfig.ServerName == "" {
+		tlsConfig.ServerName, _, _ = net.SplitHostPort(fixture.target.Address)
+	}
 	second, err := slot.transport.Dial(ctx, fixture.target.Address, tlsConfig, slot.transport.QUICConfig)
 	if err != nil {
 		t.Fatalf("second physical Dial: %v", err)

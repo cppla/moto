@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	xhttp2 "golang.org/x/net/http2"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 func TestHTTP2ConnectTunnelBasicAuthAndServerFirstData(t *testing.T) {

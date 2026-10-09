@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	xhttp2 "golang.org/x/net/http2"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/http3"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 // TestHTTP3NetemDegradationCreatesAndPromotesCandidate is intentionally opt-in:

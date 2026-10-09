@@ -41,7 +41,7 @@ import (
 	"slices"
 	"sync"
 
-	xhttp2 "golang.org/x/net/http2"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 // http2ConnectConnPool gives each physical connection its own error callback
@@ -245,6 +245,7 @@ func (pool *http2ConnectConnPool) physicalTransport(config *tls.Config, countErr
 	// exactly one ClientConn; its callback and all internal state are private
 	// to that physical connection. MarkDead still returns to the shared pool.
 	return &xhttp2.Transport{
+		ChromeProfile:              template.ChromeProfile,
 		DialTLSContext:             template.DialTLSContext,
 		TLSClientConfig:            config,
 		ConnPool:                   pool,

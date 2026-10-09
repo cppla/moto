@@ -21,7 +21,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
-	xhttp2 "golang.org/x/net/http2"
+	xhttp2 "moto/internal/browserhttp2"
 )
 
 func TestHTTP2TLSClientHelloUsesChromeProfile(t *testing.T) {

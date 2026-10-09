@@ -17,7 +17,7 @@ var (
 		"healthCheck", "hedge", "proxyProtocol", "userAgent",
 	)
 	configTargetFields       = stringSet("regexp", "address", "serverNames", "alpn", "connectProxy")
-	configConnectProxyFields = stringSet("protocols", "serverName", "basicAuth")
+	configConnectProxyFields = stringSet("protocols", "serverName", "basicAuth", "browserProfile")
 	configBasicAuthFields    = stringSet("username", "password")
 	configHealthFields       = stringSet(
 		"type", "interval", "timeout", "failureThreshold", "successThreshold",

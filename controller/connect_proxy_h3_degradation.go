@@ -3,7 +3,7 @@ package controller
 import (
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/apernet/quic-go"
 )
 
 const (

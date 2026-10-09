@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/http3"
 	"go.uber.org/zap"
 )
 
@@ -157,7 +157,7 @@ func (manager *connectProxyManager) registerHTTP3RuleTarget(rule string, target 
 	if manager == nil || manager.h3RuleBreaker == nil || rule == "" || !targetUsesMixedHTTP3First(target) {
 		return
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	manager.h3RuleBreaker.register(rule, key)
 }
 
@@ -180,7 +180,7 @@ func (manager *connectProxyManager) beginHTTP3RuleAttempt(ctx context.Context, r
 	if manager == nil || manager.h3RuleBreaker == nil || rule == "" || !targetUsesMixedHTTP3First(target) {
 		return 0, false, true
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	return manager.h3RuleBreaker.beginWithLease(rule, key, routeProtocolProbeTokenFromContext(ctx))
 }
 
@@ -365,7 +365,7 @@ func (manager *connectProxyManager) establishHTTP3RuleProbation(
 		manager.failHTTP3RuleProbation(rule, token, "missing_transport_evidence")
 		return connection
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	if !manager.h3RuleBreaker.establish(rule, token, key, binding) {
 		return connection
 	}

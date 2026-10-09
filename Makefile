@@ -3,7 +3,7 @@ PYTHON ?= python3
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell git show -s --format=%cI HEAD 2>/dev/null || echo unknown)
-STATICCHECK_VERSION ?= v0.7.0
+STATICCHECK_BIN := $(abspath bin/tools/staticcheck)
 GOVULNCHECK_VERSION ?= v1.7.0
 ACTIONLINT_VERSION ?= v1.7.7
 CROSS_BUILD_DIR ?= bin/cross
@@ -30,6 +30,7 @@ release-check:
 mod-check:
 	$(GO) mod verify
 	$(GO) mod tidy -diff
+	$(PYTHON) internal/browserhttp2/update_upstream.py --check --zip "$$( $(GO) env GOMODCACHE )/cache/download/golang.org/x/net/@v/v0.60.0.zip"
 
 test:
 	$(GO) test ./...
@@ -49,7 +50,11 @@ vet:
 	$(GO) vet ./...
 
 staticcheck:
-	$(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
+	$(GO) -C tools/staticcheck mod verify
+	$(GO) -C tools/staticcheck mod tidy -diff
+	mkdir -p bin/tools
+	$(GO) -C tools/staticcheck build -mod=readonly -trimpath -o "$(STATICCHECK_BIN)" honnef.co/go/tools/cmd/staticcheck
+	"$(STATICCHECK_BIN)" ./...
 
 vuln:
 	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...

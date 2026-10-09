@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 
-FROM golang:1.25.13-alpine@sha256:1e0126852075c9c60731c8ba49088448b91f63e2aed97ca9d1a9791622a05946 AS build
+FROM golang:1.27.2-alpine@sha256:85dc1069ac644ea3c527b177303a406eb3358192816cd7f9e5848eb658851673 AS build
 
 WORKDIR /src
 RUN apk add --no-cache ca-certificates
@@ -9,6 +9,7 @@ RUN go mod download
 COPY *.go ./
 COPY config ./config
 COPY controller ./controller
+COPY internal ./internal
 COPY utils ./utils
 COPY LICENSE THIRD_PARTY_NOTICES ./
 
