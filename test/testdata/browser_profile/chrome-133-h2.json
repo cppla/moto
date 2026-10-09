@@ -1,0 +1,260 @@
+{
+  "actor": "chrome",
+  "evidence": {
+    "connect_received": true,
+    "response_status": 502
+  },
+  "features": {
+    "connect.header_names": [
+      ":method",
+      ":authority",
+      "user-agent"
+    ],
+    "connect.user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "h2.connection_window_increment": 15663105,
+    "h2.settings": [
+      {
+        "id": 1,
+        "value": 65536
+      },
+      {
+        "id": 2,
+        "value": 0
+      },
+      {
+        "id": 4,
+        "value": 6291456
+      },
+      {
+        "id": 6,
+        "value": 262144
+      }
+    ],
+    "tls.alpn": [
+      "h2",
+      "http/1.1"
+    ],
+    "tls.cipher_suites": [
+      "0x?a?a",
+      "0x1301",
+      "0x1302",
+      "0x1303",
+      "0xc02b",
+      "0xc02f",
+      "0xc02c",
+      "0xc030",
+      "0xcca9",
+      "0xcca8",
+      "0xc013",
+      "0xc014",
+      "0x009c",
+      "0x009d",
+      "0x002f",
+      "0x0035"
+    ],
+    "tls.extension_ids": [
+      "0x0005",
+      "0x000a",
+      "0x000b",
+      "0x000d",
+      "0x0010",
+      "0x0012",
+      "0x0017",
+      "0x001b",
+      "0x0023",
+      "0x002b",
+      "0x002d",
+      "0x0033",
+      "0x4469",
+      "0x?a?a",
+      "0x?a?a",
+      "0xfe0d",
+      "0xff01"
+    ],
+    "tls.key_share_groups": [
+      {
+        "group": "0x?a?a",
+        "key_exchange_bytes": 1
+      },
+      {
+        "group": "0x11ec",
+        "key_exchange_bytes": 1216
+      },
+      {
+        "group": "0x001d",
+        "key_exchange_bytes": 32
+      }
+    ],
+    "tls.signature_algorithms": [
+      "0x0403",
+      "0x0804",
+      "0x0401",
+      "0x0503",
+      "0x0805",
+      "0x0501",
+      "0x0806",
+      "0x0601"
+    ],
+    "tls.supported_groups": [
+      "0x?a?a",
+      "0x11ec",
+      "0x001d",
+      "0x0017",
+      "0x0018"
+    ],
+    "tls.supported_versions": [
+      "0x?a?a",
+      "0x0304",
+      "0x0303"
+    ]
+  },
+  "normalization": [
+    "TLS GREASE values become 0x?a?a; vector positions and extension multiplicity are retained",
+    "TLS extension IDs are sorted because Chrome permutes extension order",
+    "TLS random, session ID, key share bytes, padding, and unlisted extension payloads are excluded",
+    "HTTP/2 SETTINGS and CONNECT header names retain wire order"
+  ],
+  "protocol": "h2",
+  "raw_artifacts": {
+    "h2-client-plaintext.bin": {
+      "bytes": 201,
+      "sha256": "54ec457b0e023d846cf39e354ec19daff8e5787f3a716cf386a73f73dd35a414"
+    },
+    "tls-clienthello.bin": {
+      "bytes": 1733,
+      "sha256": "54010064a1ad3c8aac6378b9b49ba0de54c965fcab5cb5766ff3569b40dc0aeb"
+    }
+  },
+  "scenario": "connect_rejected_after_headers",
+  "schema_version": 1,
+  "source": {
+    "automation": "Playwright CLI 0.1.22",
+    "browser_metadata_sha256": "419b9dc6ba93ec3a45816cdac76188b05e7db5636fe14acfa5b2f1ef7ae7ead6",
+    "browser_product": "Chrome/133.0.6943.141",
+    "browser_revision": "@2a5d6da0d6165d7b107502095a937fe7704fcef6",
+    "browser_version": "133.0.6943.141",
+    "captured_at": "2026-10-09T06:27:01.145640+00:00",
+    "effective_flags": [
+      "--disable-field-trial-config",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-back-forward-cache",
+      "--disable-breakpad",
+      "--disable-client-side-phishing-detection",
+      "--disable-component-extensions-with-background-pages",
+      "--disable-component-update",
+      "--no-default-browser-check",
+      "--disable-default-apps",
+      "--disable-dev-shm-usage",
+      "--disable-edgeupdater",
+      "--disable-extensions",
+      "--disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,NetworkTimeServiceQuerying,AimEnabled,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion",
+      "--enable-features=CDPScreenshotNewSurface",
+      "--allow-pre-commit-input",
+      "--disable-hang-monitor",
+      "--disable-ipc-flooding-protection",
+      "--disable-popup-blocking",
+      "--disable-prompt-on-repost",
+      "--disable-renderer-backgrounding",
+      "--disable-updater-scheduler",
+      "--force-color-profile=srgb",
+      "--metrics-recording-only",
+      "--no-first-run",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--no-service-autorun",
+      "--export-tagged-pdf",
+      "--disable-search-engine-choice-screen",
+      "--unsafely-disable-devtools-self-xss-warnings",
+      "--edge-skip-compat-layer-relaunch",
+      "--disable-infobars",
+      "--disable-search-engine-choice-screen",
+      "--disable-sync",
+      "--enable-unsafe-swiftshader",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-sync",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--enable-automation",
+      "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+      "--proxy-server=https://127.0.0.1:61602",
+      "--ignore-certificate-errors-spki-list=OJ+e3lINvDPSrrxIkkatieIh0ewV9pPDSMWLCCGTZ6o=",
+      "--disable-quic",
+      "--disable-blink-features=AutomationControlled",
+      "--user-data-dir=<isolated-temporary-profile>",
+      "--remote-debugging-pipe",
+      "--no-startup-window",
+      "--flag-switches-begin",
+      "--flag-switches-end"
+    ],
+    "executable_sha256": "da71460cc32bd0fd7880b9eb1c7d1176d2465599bcc401f2265f7b7540df4d4e",
+    "fixture_commit": "7878925437227390c551ad63d9b516f056d1ba43",
+    "fixture_worktree_dirty": true,
+    "flags": [
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-sync",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--enable-automation",
+      "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+      "--proxy-server=https://127.0.0.1:61602",
+      "--ignore-certificate-errors-spki-list=OJ+e3lINvDPSrrxIkkatieIh0ewV9pPDSMWLCCGTZ6o=",
+      "--disable-quic"
+    ],
+    "headless": false,
+    "platform": "Darwin-arm64",
+    "source_url": "https://storage.googleapis.com/chrome-for-testing-public/133.0.6943.141/mac-arm64/chrome-mac-arm64.zip",
+    "archive_sha256": "ec940509119220ee2a464dea26556cb5a8163eabce6f4bcdf15fbacad2da3993",
+    "sample_count": 3
+  },
+  "sample_evidence": [
+    {
+      "sample": 1,
+      "captured_at": "2026-10-09T06:27:01.145640+00:00",
+      "browser_metadata_sha256": "419b9dc6ba93ec3a45816cdac76188b05e7db5636fe14acfa5b2f1ef7ae7ead6",
+      "raw_artifacts": {
+        "h2-client-plaintext.bin": {
+          "bytes": 201,
+          "sha256": "54ec457b0e023d846cf39e354ec19daff8e5787f3a716cf386a73f73dd35a414"
+        },
+        "tls-clienthello.bin": {
+          "bytes": 1733,
+          "sha256": "54010064a1ad3c8aac6378b9b49ba0de54c965fcab5cb5766ff3569b40dc0aeb"
+        }
+      }
+    },
+    {
+      "sample": 2,
+      "captured_at": "2026-10-09T06:27:06.935028+00:00",
+      "browser_metadata_sha256": "fbdb5ad2fe78594f6f834d842825feb2ff681eda53b479ee6fed9157e82e8884",
+      "raw_artifacts": {
+        "h2-client-plaintext.bin": {
+          "bytes": 201,
+          "sha256": "54ec457b0e023d846cf39e354ec19daff8e5787f3a716cf386a73f73dd35a414"
+        },
+        "tls-clienthello.bin": {
+          "bytes": 1797,
+          "sha256": "1fece956853054f9dd9e35a37abda68825248b05c4750cfe3f09780ace57ff29"
+        }
+      }
+    },
+    {
+      "sample": 3,
+      "captured_at": "2026-10-09T06:27:12.326275+00:00",
+      "browser_metadata_sha256": "7d226935a1a799c41f48f04c1a5a2bf9da9c7ef4922b9c9d63d17a26abf4c865",
+      "raw_artifacts": {
+        "h2-client-plaintext.bin": {
+          "bytes": 201,
+          "sha256": "54ec457b0e023d846cf39e354ec19daff8e5787f3a716cf386a73f73dd35a414"
+        },
+        "tls-clienthello.bin": {
+          "bytes": 1765,
+          "sha256": "23869cbb06346951709ba8a303a64b5ecb0df0ce488911707c5e4fe4416c35d7"
+        }
+      }
+    }
+  ]
+}

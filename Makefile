@@ -12,7 +12,7 @@ REGRESSION_SEED ?=
 REGRESSION_OUTPUT ?= bin/routing-regression
 LDFLAGS := -s -w -buildid= -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build check ci fmt-check workflow-check release-check mod-check test race fault-test routing-regression vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
+.PHONY: build check ci fmt-check workflow-check release-check mod-check test race fault-test routing-regression browser-profile-check vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
 
 build:
 	mkdir -p bin
@@ -45,6 +45,13 @@ fault-test:
 # run/pass counts. The broader fault suite complements this fixed coverage.
 routing-regression:
 	$(PYTHON) -B test/routing_regression.py --go "$(GO)" --count "$(REGRESSION_COUNT)" --output "$(REGRESSION_OUTPUT)" $(if $(REGRESSION_SEED),--seed "$(REGRESSION_SEED)")
+
+# Compare actual loopback Moto bytes with a captured, fixed Chrome baseline.
+# No browser or upstream credentials; test traffic stays on loopback.
+browser-profile-check:
+	$(PYTHON) -B test/test_browser_profile_compare.py
+	$(PYTHON) -B test/test_browser_profile_regression.py
+	$(PYTHON) -B test/browser_profile_regression.py --go "$(GO)" --protocol h2 --scenario all --samples 3
 
 vet:
 	$(GO) vet ./...
@@ -106,6 +113,6 @@ cross-build:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-darwin-arm64 .
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-windows-amd64.exe .
 
-check: fmt-check workflow-check release-check mod-check test race fault-test routing-regression vet staticcheck vuln config-check container-context-check bench-check bench-smoke
+check: fmt-check workflow-check release-check mod-check test race fault-test routing-regression browser-profile-check vet staticcheck vuln config-check container-context-check bench-check bench-smoke
 
 ci: check cross-build

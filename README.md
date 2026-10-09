@@ -428,6 +428,8 @@ CI 覆盖格式、模块完整性、测试、race、vet、staticcheck、可达�
 
 `make routing-regression` 会在 race 检查下重复运行选路、赢家缓存及恢复回归，并保存测试清单、随机种子、原始结果和通过次数；空测试集、跳过或未完成的测试均不会通过。CI 在 Linux 和 macOS 上执行这项检查。需要重现测试顺序时使用 `make routing-regression REGRESSION_SEED=<报告中的种子>`；种子仅复现测试顺序，不保证复现线程调度。
 
+`make browser-profile-check` 将 Moto 的本地实测握手与固定版本 Chrome 的采集样本比较，覆盖 H2 拒绝响应、域名/SNI、Basic Auth、成功传输与连接复用；已知差异会显式报告，新差异或缺失数据会阻止通过。这是有限字段的回归检查，不是“不可识别”认证；H3 尚未取得同场景浏览器样本。[采集来源与覆盖边界](test/testdata/browser_profile/README.md)。
+
 完全本地的回归门禁不访问外网，会报告直连、启动初期（输出中保留名称 `cold`，但同一阶段后续请求会逐渐变热）和热态的成功吞吐与 p50/p95/p99，并采样 CPU、RSS、FD 和 goroutine。这是功能与回归 smoke，不是绝对容量结论：
 
 ```bash

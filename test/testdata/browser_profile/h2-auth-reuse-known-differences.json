@@ -1,0 +1,110 @@
+{
+  "allowed_differences": {
+    "auth.sequence": {
+      "baseline": [
+        {
+          "credentials": "none",
+          "status": 407
+        },
+        {
+          "credentials": "none",
+          "status": 407
+        },
+        {
+          "credentials": "valid",
+          "status": 200
+        },
+        {
+          "credentials": "valid",
+          "status": 200
+        }
+      ],
+      "candidate": [
+        {
+          "credentials": "valid",
+          "status": 200
+        },
+        {
+          "credentials": "valid",
+          "status": 200
+        }
+      ],
+      "reason": "Observed authentication sequence difference: this isolated Chrome context sends two first-origin unauthenticated attempts receiving 407, then two authenticated successful tunnels; Moto sends credentials preemptively for both. Both require second-origin first-attempt authentication. No artificial challenge was added to Moto."
+    },
+    "connect.first.hpack_representations": {
+      "baseline": [
+        "literal_without_indexing:static_name",
+        "indexed_dynamic",
+        "indexed_dynamic",
+        "literal_incremental_indexing:static_name"
+      ],
+      "candidate": [
+        "literal_incremental_indexing:static_name",
+        "literal_incremental_indexing:static_name",
+        "literal_incremental_indexing:static_name",
+        "literal_incremental_indexing:static_name"
+      ],
+      "reason": "Observed HPACK encoding mismatch on the first successful CONNECT. Chrome does not index CONNECT method; Moto does. In the authenticated case Chrome has already encoded challenge attempts, whereas Moto authenticates preemptively, so dynamic table history also differs. No production behavior was changed."
+    },
+    "connect.second.hpack_representations": {
+      "baseline": [
+        "literal_without_indexing:static_name",
+        "literal_incremental_indexing:static_name",
+        "indexed_dynamic",
+        "indexed_dynamic"
+      ],
+      "candidate": [
+        "dynamic_table_size_update",
+        "indexed_dynamic",
+        "literal_incremental_indexing:static_name",
+        "indexed_dynamic",
+        "indexed_dynamic"
+      ],
+      "reason": "Observed HPACK mismatch on the reused connection: Chrome encodes CONNECT method without indexing; Moto references its dynamic index and emits a table size update before this block in this fixture. This exact representation pair is recorded, not a full HPACK match."
+    },
+    "tls.extension_ids": {
+      "baseline": [
+        "0x0000",
+        "0x0005",
+        "0x000a",
+        "0x000b",
+        "0x000d",
+        "0x0010",
+        "0x0012",
+        "0x0017",
+        "0x001b",
+        "0x0023",
+        "0x002b",
+        "0x002d",
+        "0x0033",
+        "0x4469",
+        "0x?a?a",
+        "0x?a?a",
+        "0xfe0d",
+        "0xff01"
+      ],
+      "candidate": [
+        "0x0000",
+        "0x0005",
+        "0x000a",
+        "0x000b",
+        "0x000d",
+        "0x0010",
+        "0x0012",
+        "0x0017",
+        "0x001b",
+        "0x0023",
+        "0x002b",
+        "0x002d",
+        "0x0033",
+        "0x44cd",
+        "0x?a?a",
+        "0x?a?a",
+        "0xfe0d",
+        "0xff01"
+      ],
+      "reason": "Observed ALPS codepoint mismatch: fixed Chrome for Testing 133.0.6943.141 uses 0x4469 while Moto uses 0x44cd. Only this exact extension vector pair is accepted; this is not browser equivalence."
+    }
+  },
+  "schema_version": 1
+}

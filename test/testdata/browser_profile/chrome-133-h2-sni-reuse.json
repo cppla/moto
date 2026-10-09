@@ -1,0 +1,570 @@
+{
+  "actor": "chrome",
+  "evidence": {
+    "auth_challenges": 0,
+    "auth_required": false,
+    "auth_validated": 0,
+    "client_payloads_verified": true,
+    "completed_payloads": 2,
+    "connect_received": true,
+    "connections": [
+      {
+        "id": 1,
+        "negotiated_protocol": "h2",
+        "server_name": "proxy.baseline.invalid",
+        "wire_requests": [
+          {
+            "auth": "none",
+            "authority": "accounts.google.com:443",
+            "header_names": [
+              ":method",
+              ":authority",
+              "user-agent"
+            ],
+            "hpack_representations": [
+              "literal_without_indexing:static_name",
+              "literal_incremental_indexing:static_name",
+              "literal_incremental_indexing:static_name"
+            ],
+            "stream_id": 1,
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+          },
+          {
+            "auth": "none",
+            "authority": "accounts.google.com:443",
+            "header_names": [
+              ":method",
+              ":authority",
+              "user-agent"
+            ],
+            "hpack_representations": [
+              "literal_without_indexing:static_name",
+              "indexed_dynamic",
+              "indexed_dynamic"
+            ],
+            "stream_id": 3,
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+          },
+          {
+            "auth": "none",
+            "authority": "accounts.google.com:443",
+            "header_names": [
+              ":method",
+              ":authority",
+              "user-agent"
+            ],
+            "hpack_representations": [
+              "literal_without_indexing:static_name",
+              "indexed_dynamic",
+              "indexed_dynamic"
+            ],
+            "stream_id": 5,
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "negotiated_protocol": "h2",
+        "server_name": "proxy.baseline.invalid",
+        "wire_requests": [
+          {
+            "auth": "none",
+            "authority": "one.baseline.invalid:443",
+            "header_names": [
+              ":method",
+              ":authority",
+              "user-agent"
+            ],
+            "hpack_representations": [
+              "literal_without_indexing:static_name",
+              "literal_incremental_indexing:static_name",
+              "literal_incremental_indexing:static_name"
+            ],
+            "stream_id": 1,
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+          },
+          {
+            "auth": "none",
+            "authority": "two.baseline.invalid:443",
+            "header_names": [
+              ":method",
+              ":authority",
+              "user-agent"
+            ],
+            "hpack_representations": [
+              "literal_without_indexing:static_name",
+              "literal_incremental_indexing:static_name",
+              "indexed_dynamic"
+            ],
+            "stream_id": 3,
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+          }
+        ]
+      }
+    ],
+    "requests": [
+      {
+        "auth": "none",
+        "authority": "accounts.google.com:443",
+        "connection_id": 1,
+        "method": "CONNECT",
+        "payload_completed": false,
+        "status": 403,
+        "stream_id": 1
+      },
+      {
+        "auth": "none",
+        "authority": "accounts.google.com:443",
+        "connection_id": 1,
+        "method": "CONNECT",
+        "payload_completed": false,
+        "status": 403,
+        "stream_id": 3
+      },
+      {
+        "auth": "none",
+        "authority": "one.baseline.invalid:443",
+        "connection_id": 2,
+        "method": "CONNECT",
+        "origin_host": "one.baseline.invalid",
+        "origin_method": "GET",
+        "origin_path": "/one",
+        "payload_completed": true,
+        "response_bytes": 117,
+        "status": 200,
+        "stream_id": 1
+      },
+      {
+        "auth": "none",
+        "authority": "accounts.google.com:443",
+        "connection_id": 1,
+        "method": "CONNECT",
+        "payload_completed": false,
+        "status": 403,
+        "stream_id": 5
+      },
+      {
+        "auth": "none",
+        "authority": "two.baseline.invalid:443",
+        "connection_id": 2,
+        "method": "CONNECT",
+        "origin_host": "two.baseline.invalid",
+        "origin_method": "GET",
+        "origin_path": "/two",
+        "payload_completed": true,
+        "response_bytes": 117,
+        "status": 200,
+        "stream_id": 3
+      }
+    ],
+    "response_status": 200,
+    "reused_physical_connection": true,
+    "server_name": "proxy.baseline.invalid",
+    "successful_tunnels": 2
+  },
+  "features": {
+    "auth.sequence": [
+      {
+        "credentials": "none",
+        "status": 200
+      },
+      {
+        "credentials": "none",
+        "status": 200
+      }
+    ],
+    "connect.first.header_names": [
+      ":method",
+      ":authority",
+      "user-agent"
+    ],
+    "connect.first.hpack_representations": [
+      "literal_without_indexing:static_name",
+      "literal_incremental_indexing:static_name",
+      "literal_incremental_indexing:static_name"
+    ],
+    "connect.reused_physical_connection": true,
+    "connect.second.header_names": [
+      ":method",
+      ":authority",
+      "user-agent"
+    ],
+    "connect.second.hpack_representations": [
+      "literal_without_indexing:static_name",
+      "literal_incremental_indexing:static_name",
+      "indexed_dynamic"
+    ],
+    "connect.user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "h2.connection_window_increment": 15663105,
+    "h2.settings": [
+      {
+        "id": 1,
+        "value": 65536
+      },
+      {
+        "id": 2,
+        "value": 0
+      },
+      {
+        "id": 4,
+        "value": 6291456
+      },
+      {
+        "id": 6,
+        "value": 262144
+      }
+    ],
+    "tls.alpn": [
+      "h2",
+      "http/1.1"
+    ],
+    "tls.cipher_suites": [
+      "0x?a?a",
+      "0x1301",
+      "0x1302",
+      "0x1303",
+      "0xc02b",
+      "0xc02f",
+      "0xc02c",
+      "0xc030",
+      "0xcca9",
+      "0xcca8",
+      "0xc013",
+      "0xc014",
+      "0x009c",
+      "0x009d",
+      "0x002f",
+      "0x0035"
+    ],
+    "tls.extension_ids": [
+      "0x0000",
+      "0x0005",
+      "0x000a",
+      "0x000b",
+      "0x000d",
+      "0x0010",
+      "0x0012",
+      "0x0017",
+      "0x001b",
+      "0x0023",
+      "0x002b",
+      "0x002d",
+      "0x0033",
+      "0x4469",
+      "0x?a?a",
+      "0x?a?a",
+      "0xfe0d",
+      "0xff01"
+    ],
+    "tls.key_share_groups": [
+      {
+        "group": "0x?a?a",
+        "key_exchange_bytes": 1
+      },
+      {
+        "group": "0x11ec",
+        "key_exchange_bytes": 1216
+      },
+      {
+        "group": "0x001d",
+        "key_exchange_bytes": 32
+      }
+    ],
+    "tls.server_name": "proxy.baseline.invalid",
+    "tls.signature_algorithms": [
+      "0x0403",
+      "0x0804",
+      "0x0401",
+      "0x0503",
+      "0x0805",
+      "0x0501",
+      "0x0806",
+      "0x0601"
+    ],
+    "tls.supported_groups": [
+      "0x?a?a",
+      "0x11ec",
+      "0x001d",
+      "0x0017",
+      "0x0018"
+    ],
+    "tls.supported_versions": [
+      "0x?a?a",
+      "0x0304",
+      "0x0303"
+    ]
+  },
+  "normalization": [
+    "TLS normalization matches the rejected-CONNECT baseline; actual proxy SNI is additionally retained",
+    "HTTP/2 SETTINGS and successful CONNECT header names retain wire order",
+    "HPACK classes retain literal/indexed encoding, name-table source and dynamic table size updates; values and exact indexes are excluded",
+    "Authentication records preserve challenge attempts separately from successful CONNECT requests",
+    "Only exact allowed CONNECT authorities enter auth.sequence; denied browser background requests remain in evidence and raw artifacts",
+    "Multiple first-origin challenges are retained; second-origin CONNECT must use cached credentials without a challenge",
+    "Raw bytes can include denied Chrome background hostnames and contain only public fixture credentials"
+  ],
+  "protocol": "h2",
+  "raw_artifacts": {
+    "connection-01-h2-client-plaintext.bin": {
+      "bytes": 300,
+      "sha256": "e1fbe5f2573e4befe659e2b3cd5f7346d7a36069f90f6518013d6a1341f5dfee"
+    },
+    "connection-01-tls-clienthello.bin": {
+      "bytes": 1732,
+      "sha256": "2b167f83a363fb8fd8969c0e4d222f0e9e443ae33d2f9c15bb3b73484ff0472a"
+    },
+    "connection-02-h2-client-plaintext.bin": {
+      "bytes": 5310,
+      "sha256": "5a52f0bde86e3304adb3518cd6b1c736b1dbc51296869bd7065c57626092da0b"
+    },
+    "connection-02-tls-clienthello.bin": {
+      "bytes": 1796,
+      "sha256": "0148c87fc0fd59905274584b0cf208f702f201a50b64574aef9e6df8ae5a2eb6"
+    }
+  },
+  "sample_evidence": [
+    {
+      "auth_challenges": 0,
+      "browser_metadata_sha256": "9b43e53d87ecfa922dfc096d0035d832e89e1213b097a9d3705d2bed10e65514",
+      "captured_at": "2026-10-09T07:15:24.124015+00:00",
+      "raw_artifacts": {
+        "connection-01-h2-client-plaintext.bin": {
+          "bytes": 300,
+          "sha256": "e1fbe5f2573e4befe659e2b3cd5f7346d7a36069f90f6518013d6a1341f5dfee"
+        },
+        "connection-01-tls-clienthello.bin": {
+          "bytes": 1732,
+          "sha256": "2b167f83a363fb8fd8969c0e4d222f0e9e443ae33d2f9c15bb3b73484ff0472a"
+        },
+        "connection-02-h2-client-plaintext.bin": {
+          "bytes": 5310,
+          "sha256": "5a52f0bde86e3304adb3518cd6b1c736b1dbc51296869bd7065c57626092da0b"
+        },
+        "connection-02-tls-clienthello.bin": {
+          "bytes": 1796,
+          "sha256": "0148c87fc0fd59905274584b0cf208f702f201a50b64574aef9e6df8ae5a2eb6"
+        }
+      },
+      "sample": 1,
+      "successful_requests": [
+        {
+          "auth": "none",
+          "authority": "one.baseline.invalid:443",
+          "connection_id": 2,
+          "method": "CONNECT",
+          "origin_host": "one.baseline.invalid",
+          "origin_method": "GET",
+          "origin_path": "/one",
+          "payload_completed": true,
+          "response_bytes": 117,
+          "status": 200,
+          "stream_id": 1
+        },
+        {
+          "auth": "none",
+          "authority": "two.baseline.invalid:443",
+          "connection_id": 2,
+          "method": "CONNECT",
+          "origin_host": "two.baseline.invalid",
+          "origin_method": "GET",
+          "origin_path": "/two",
+          "payload_completed": true,
+          "response_bytes": 117,
+          "status": 200,
+          "stream_id": 3
+        }
+      ]
+    },
+    {
+      "auth_challenges": 0,
+      "browser_metadata_sha256": "7f44a178985be23dfbb621115ce2b34a4484093715ac100a23f62908f89c04dd",
+      "captured_at": "2026-10-09T07:15:31.865896+00:00",
+      "raw_artifacts": {
+        "connection-01-h2-client-plaintext.bin": {
+          "bytes": 300,
+          "sha256": "e1fbe5f2573e4befe659e2b3cd5f7346d7a36069f90f6518013d6a1341f5dfee"
+        },
+        "connection-01-tls-clienthello.bin": {
+          "bytes": 1764,
+          "sha256": "95b89e47e95374338f18e2748ad85760236acbd0ce8f8313692071cc87377d4a"
+        },
+        "connection-02-h2-client-plaintext.bin": {
+          "bytes": 5342,
+          "sha256": "f471670b8495dd08c0897eadde429ec578b5f94e96230c513e1e6696a050130c"
+        },
+        "connection-02-tls-clienthello.bin": {
+          "bytes": 1828,
+          "sha256": "87b67f8ebbb1b7506989a45be77ed486bb8bd6300349a78c9c3d974f7b39658b"
+        }
+      },
+      "sample": 2,
+      "successful_requests": [
+        {
+          "auth": "none",
+          "authority": "one.baseline.invalid:443",
+          "connection_id": 2,
+          "method": "CONNECT",
+          "origin_host": "one.baseline.invalid",
+          "origin_method": "GET",
+          "origin_path": "/one",
+          "payload_completed": true,
+          "response_bytes": 117,
+          "status": 200,
+          "stream_id": 1
+        },
+        {
+          "auth": "none",
+          "authority": "two.baseline.invalid:443",
+          "connection_id": 2,
+          "method": "CONNECT",
+          "origin_host": "two.baseline.invalid",
+          "origin_method": "GET",
+          "origin_path": "/two",
+          "payload_completed": true,
+          "response_bytes": 117,
+          "status": 200,
+          "stream_id": 3
+        }
+      ]
+    },
+    {
+      "auth_challenges": 0,
+      "browser_metadata_sha256": "36e133c4c3a72d57d314c7c13c5a03fc37cf58da88c70ee9eb6c09d2a23b62a4",
+      "captured_at": "2026-10-09T07:15:42.778887+00:00",
+      "raw_artifacts": {
+        "connection-01-h2-client-plaintext.bin": {
+          "bytes": 300,
+          "sha256": "e1fbe5f2573e4befe659e2b3cd5f7346d7a36069f90f6518013d6a1341f5dfee"
+        },
+        "connection-01-tls-clienthello.bin": {
+          "bytes": 1828,
+          "sha256": "3319d90d1f4de08bf315ae3b3229bcf07623b95b79737f334014aac83e6a99bd"
+        },
+        "connection-02-h2-client-plaintext.bin": {
+          "bytes": 5342,
+          "sha256": "a2fae2785790a6eb341dcc3e5cd554d38809ebbef344c205c66ce7fdda4d6dea"
+        },
+        "connection-02-tls-clienthello.bin": {
+          "bytes": 1764,
+          "sha256": "9cb9b34afb6a11bb858e506f80f4d7f1b4c1604f778d5d12175dd7f157f50f10"
+        }
+      },
+      "sample": 3,
+      "successful_requests": [
+        {
+          "auth": "none",
+          "authority": "one.baseline.invalid:443",
+          "connection_id": 2,
+          "method": "CONNECT",
+          "origin_host": "one.baseline.invalid",
+          "origin_method": "GET",
+          "origin_path": "/one",
+          "payload_completed": true,
+          "response_bytes": 117,
+          "status": 200,
+          "stream_id": 1
+        },
+        {
+          "auth": "none",
+          "authority": "two.baseline.invalid:443",
+          "connection_id": 2,
+          "method": "CONNECT",
+          "origin_host": "two.baseline.invalid",
+          "origin_method": "GET",
+          "origin_path": "/two",
+          "payload_completed": true,
+          "response_bytes": 117,
+          "status": 200,
+          "stream_id": 3
+        }
+      ]
+    }
+  ],
+  "scenario": "h2_sni_reuse",
+  "schema_version": 1,
+  "source": {
+    "archive_sha256": "ec940509119220ee2a464dea26556cb5a8163eabce6f4bcdf15fbacad2da3993",
+    "automation": "Playwright CLI 0.1.22",
+    "browser_metadata_sha256": "9b43e53d87ecfa922dfc096d0035d832e89e1213b097a9d3705d2bed10e65514",
+    "browser_product": "Chrome/133.0.6943.141",
+    "browser_revision": "@2a5d6da0d6165d7b107502095a937fe7704fcef6",
+    "browser_user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "browser_version": "133.0.6943.141",
+    "captured_at": "2026-10-09T07:15:24.124015+00:00",
+    "effective_flags": [
+      "--disable-field-trial-config",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-back-forward-cache",
+      "--disable-breakpad",
+      "--disable-client-side-phishing-detection",
+      "--disable-component-extensions-with-background-pages",
+      "--disable-component-update",
+      "--no-default-browser-check",
+      "--disable-default-apps",
+      "--disable-dev-shm-usage",
+      "--disable-edgeupdater",
+      "--disable-extensions",
+      "--disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,DialMediaRouteProvider,GlobalMediaControls,HttpsUpgrades,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,BlockOriginHeaderModificationOnRedirect,Translate,AutoDeElevate,OptimizationHints,NetworkTimeServiceQuerying,AimEnabled,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion",
+      "--enable-features=CDPScreenshotNewSurface",
+      "--allow-pre-commit-input",
+      "--disable-hang-monitor",
+      "--disable-ipc-flooding-protection",
+      "--disable-popup-blocking",
+      "--disable-prompt-on-repost",
+      "--disable-renderer-backgrounding",
+      "--disable-updater-scheduler",
+      "--force-color-profile=srgb",
+      "--metrics-recording-only",
+      "--no-first-run",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--no-service-autorun",
+      "--export-tagged-pdf",
+      "--disable-search-engine-choice-screen",
+      "--unsafely-disable-devtools-self-xss-warnings",
+      "--edge-skip-compat-layer-relaunch",
+      "--disable-infobars",
+      "--disable-search-engine-choice-screen",
+      "--disable-sync",
+      "--enable-unsafe-swiftshader",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-sync",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--enable-automation",
+      "--host-resolver-rules=MAP proxy.baseline.invalid 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+      "--proxy-server=https://proxy.baseline.invalid:58884",
+      "--ignore-certificate-errors-spki-list=NrTdfRQzWU1IVifTmEB2rP7Erh7XxscqxSEGQvCsCrg=",
+      "--disable-quic",
+      "--disable-blink-features=AutomationControlled",
+      "--user-data-dir=<isolated-temporary-profile>",
+      "--remote-debugging-pipe",
+      "--no-startup-window",
+      "--flag-switches-begin",
+      "--flag-switches-end"
+    ],
+    "executable_sha256": "da71460cc32bd0fd7880b9eb1c7d1176d2465599bcc401f2265f7b7540df4d4e",
+    "fixture_commit": "7878925437227390c551ad63d9b516f056d1ba43",
+    "fixture_worktree_dirty": true,
+    "flags": [
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-sync",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--enable-automation",
+      "--host-resolver-rules=MAP proxy.baseline.invalid 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+      "--proxy-server=https://proxy.baseline.invalid:58884",
+      "--ignore-certificate-errors-spki-list=NrTdfRQzWU1IVifTmEB2rP7Erh7XxscqxSEGQvCsCrg=",
+      "--disable-quic"
+    ],
+    "headless": false,
+    "platform": "Darwin-arm64",
+    "sample_count": 3,
+    "source_url": "https://storage.googleapis.com/chrome-for-testing-public/133.0.6943.141/mac-arm64/chrome-mac-arm64.zip"
+  }
+}

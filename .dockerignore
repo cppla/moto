@@ -2,6 +2,7 @@
 .github
 .idea
 bin
+output/playwright
 config/setting.json
 test/native_proxy
 docs
