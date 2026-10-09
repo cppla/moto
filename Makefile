@@ -12,7 +12,7 @@ REGRESSION_SEED ?=
 REGRESSION_OUTPUT ?= bin/routing-regression
 LDFLAGS := -s -w -buildid= -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build check ci fmt-check workflow-check release-check mod-check test race fault-test routing-regression browser-profile-check vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
+.PHONY: build check ci fmt-check workflow-check release-check mod-check test race fault-test routing-regression browser-profile-check transport-regression-check vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
 
 build:
 	mkdir -p bin
@@ -26,6 +26,7 @@ workflow-check:
 
 release-check:
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) test/release_sbom_test.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) test/release_workflow_test.py
 
 mod-check:
 	$(GO) mod verify
@@ -52,6 +53,17 @@ browser-profile-check:
 	$(PYTHON) -B test/test_browser_profile_compare.py
 	$(PYTHON) -B test/test_browser_profile_regression.py
 	$(PYTHON) -B test/browser_profile_regression.py --go "$(GO)" --protocol h2 --scenario all --samples 3
+
+# Keep detailed comparison output local while preserving the regression gate.
+transport-regression-check:
+	@log="$$(mktemp "$${TMPDIR:-/tmp}/moto-transport-regression.XXXXXX")" || exit 1; \
+	trap 'rm -f "$$log"' 0; \
+	if $(MAKE) --no-print-directory browser-profile-check >"$$log" 2>&1; then \
+		echo "Transport regression checks passed."; \
+	else \
+		echo "Transport regression checks failed. Reproduce locally with make browser-profile-check." >&2; \
+		exit 1; \
+	fi
 
 vet:
 	$(GO) vet ./...
@@ -113,6 +125,6 @@ cross-build:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-darwin-arm64 .
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-windows-amd64.exe .
 
-check: fmt-check workflow-check release-check mod-check test race fault-test routing-regression browser-profile-check vet staticcheck vuln config-check container-context-check bench-check bench-smoke
+check: fmt-check workflow-check release-check mod-check test race fault-test routing-regression transport-regression-check vet staticcheck vuln config-check container-context-check bench-check bench-smoke
 
 ci: check cross-build

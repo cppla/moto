@@ -31,13 +31,7 @@ jobs:
       - name: Test
         run: make test
       - name: Check transport regression
-        run: |
-          if make browser-profile-check >"$RUNNER_TEMP/moto-transport-regression.log" 2>&1; then
-            echo "Transport regression checks passed."
-          else
-            echo "::error::Transport regression checks failed. Reproduce locally with make browser-profile-check."
-            exit 1
-          fi
+        run: make transport-regression-check
       - name: Vet
         run: make vet
       - name: Static analysis

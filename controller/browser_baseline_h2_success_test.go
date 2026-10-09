@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -236,28 +237,190 @@ func browserH2SuccessRunMoto(t *testing.T, ctx context.Context, endpoint string,
 		if err != nil {
 			t.Fatalf("Moto successful CONNECT %d: %v", index+1, err)
 		}
+		// H2 tunnels do not implement deadlines. Keep the whole fixture exchange,
+		// including the origin shutdown read, bounded by the capture context.
+		stopOnCancel := context.AfterFunc(ctx, func() { _ = tunnel.Close() })
 		origin := tls.Client(tunnel, &tls.Config{RootCAs: roots, ServerName: request.URL.Host, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
-		deadline, _ := ctx.Deadline()
-		_ = origin.SetDeadline(deadline)
 		if err := origin.HandshakeContext(ctx); err != nil {
 			_ = origin.Close()
+			stopOnCancel()
 			t.Fatal(err)
 		}
 		if err := request.Write(origin); err != nil {
 			_ = origin.Close()
+			stopOnCancel()
 			t.Fatal(err)
 		}
-		response, err := http.ReadResponse(bufio.NewReader(origin), request)
-		if err != nil {
-			_ = origin.Close()
-			t.Fatal(err)
-		}
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
-		_ = response.Body.Close()
+		readErr := browserH2SuccessReadOriginResponse(origin, tunnel, request, index)
 		_ = origin.Close()
-		if readErr != nil || response.StatusCode != http.StatusOK || string(body) != browserH2SuccessBody(index) {
-			t.Fatalf("Moto payload %d: status=%d body=%q error=%v", index+1, response.StatusCode, body, readErr)
+		stopOnCancel()
+		if readErr != nil {
+			t.Fatalf("Moto payload %d: %v", index+1, readErr)
 		}
+	}
+}
+
+func browserH2SuccessReadOriginResponse(origin, tunnel io.Reader, request *http.Request, index int) error {
+	reader := bufio.NewReader(origin)
+	response, err := http.ReadResponse(reader, request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+	if err != nil {
+		return fmt.Errorf("read origin response body: %w", err)
+	}
+	if response.StatusCode != http.StatusOK || string(body) != browserH2SuccessBody(index) {
+		return fmt.Errorf("unexpected origin response: status=%d body=%q", response.StatusCode, body)
+	}
+	// This controlled origin promises Connection: close. Let its TLS shutdown
+	// finish before closing the CONNECT upload: an early client close makes the
+	// proxy's upload goroutine close net.Pipe while its download still relays
+	// close_notify, misreporting a fully delivered response as a closed pipe.
+	// Reuse the buffered reader so any bytes after the declared body fail closed.
+	if err := browserH2SuccessWaitEOF(reader, "origin"); err != nil {
+		return err
+	}
+	// close_notify ends the inner TLS stream before the proxy necessarily
+	// finishes its relay. Also await the outer H2 END_STREAM before canceling
+	// the tunnel, so the upload cannot close the pipe underneath that relay.
+	return browserH2SuccessWaitEOF(tunnel, "CONNECT")
+}
+
+func browserH2SuccessWaitEOF(reader io.Reader, stage string) error {
+	var extra [1]byte
+	if _, err := io.ReadFull(reader, extra[:]); err != io.EOF {
+		if err != nil {
+			return fmt.Errorf("read %s shutdown: %w", stage, err)
+		}
+		return fmt.Errorf("unexpected bytes after %s response", stage)
+	}
+	return nil
+}
+
+type browserH2SuccessShutdownReader struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (reader browserH2SuccessShutdownReader) Read([]byte) (int, error) {
+	close(reader.started)
+	<-reader.release
+	return 0, io.EOF
+}
+
+func TestBrowserBaselineH2SuccessWaitsForOriginShutdown(t *testing.T) {
+	for _, stage := range []string{"origin", "CONNECT"} {
+		t.Run(stage, func(t *testing.T) {
+			body := browserH2SuccessBody(0)
+			response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			shutdown := browserH2SuccessShutdownReader{started: make(chan struct{}), release: make(chan struct{})}
+			releaseShutdown := sync.OnceFunc(func() { close(shutdown.release) })
+			defer releaseShutdown()
+			var reader io.Reader = strings.NewReader(response)
+			var tunnel io.Reader = strings.NewReader("")
+			if stage == "origin" {
+				reader = io.MultiReader(reader, shutdown)
+			} else {
+				tunnel = shutdown
+			}
+			request, err := http.NewRequest(http.MethodGet, browserH2SuccessURLs[0], nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- browserH2SuccessReadOriginResponse(reader, tunnel, request, 0) }()
+			select {
+			case err := <-done:
+				t.Fatalf("response verification returned before %s shutdown: %v", stage, err)
+			case <-shutdown.started:
+			case <-time.After(time.Second):
+				t.Fatalf("response verification did not wait for %s shutdown", stage)
+			}
+			releaseShutdown()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("response verification after %s shutdown: %v", stage, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("response verification did not finish after %s shutdown", stage)
+			}
+		})
+	}
+}
+
+func TestBrowserBaselineH2SuccessOriginResponseFailures(t *testing.T) {
+	wantBody := browserH2SuccessBody(0)
+	for _, test := range []struct {
+		name        string
+		body        string
+		extra       string
+		finalErr    error
+		tunnelExtra string
+		tunnelErr   error
+		wantErr     error
+		valid       bool
+	}{
+		{name: "complete", body: wantBody, finalErr: io.EOF, valid: true},
+		{name: "truncated", body: wantBody[:len(wantBody)-1], finalErr: io.EOF, wantErr: io.ErrUnexpectedEOF},
+		{name: "corrupt", body: strings.Repeat("x", len(wantBody)), finalErr: io.EOF},
+		{name: "trailing_bytes", body: wantBody, extra: "unexpected", finalErr: io.EOF},
+		{name: "shutdown_timeout", body: wantBody, finalErr: os.ErrDeadlineExceeded, wantErr: os.ErrDeadlineExceeded},
+		{name: "shutdown_closed_pipe", body: wantBody, finalErr: io.ErrClosedPipe, wantErr: io.ErrClosedPipe},
+		{name: "tunnel_trailing_bytes", body: wantBody, finalErr: io.EOF, tunnelExtra: "unexpected"},
+		{name: "tunnel_shutdown_timeout", body: wantBody, finalErr: io.EOF, tunnelErr: os.ErrDeadlineExceeded, wantErr: os.ErrDeadlineExceeded},
+		{name: "tunnel_shutdown_closed_pipe", body: wantBody, finalErr: io.EOF, tunnelErr: io.ErrClosedPipe, wantErr: io.ErrClosedPipe},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s%s", len(wantBody), test.body, test.extra)
+			reader := io.MultiReader(strings.NewReader(response), iotest.ErrReader(test.finalErr))
+			request, err := http.NewRequest(http.MethodGet, browserH2SuccessURLs[0], nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tunnelErr := test.tunnelErr
+			if tunnelErr == nil {
+				tunnelErr = io.EOF
+			}
+			tunnel := io.MultiReader(strings.NewReader(test.tunnelExtra), iotest.ErrReader(tunnelErr))
+			err = browserH2SuccessReadOriginResponse(reader, tunnel, request, 0)
+			if (err == nil) != test.valid {
+				t.Fatalf("origin response error = %v, valid = %t", err, test.valid)
+			}
+			if test.wantErr != nil && !errors.Is(err, test.wantErr) {
+				t.Fatalf("origin response error = %v, want %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestBrowserBaselineH2SuccessOriginShutdownDeadline(t *testing.T) {
+	reader, writer := net.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	request, err := http.NewRequest(http.MethodGet, browserH2SuccessURLs[0], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- browserH2SuccessReadOriginResponse(reader, strings.NewReader(""), request, 0) }()
+	body := browserH2SuccessBody(0)
+	if _, err := fmt.Fprintf(writer, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body); err != nil {
+		t.Fatal(err)
+	}
+	// The entire response has been consumed, but the origin never shuts down.
+	if err := reader.SetReadDeadline(time.Now().Add(25 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("origin shutdown error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("origin shutdown read ignored its deadline")
 	}
 }
 

@@ -14,7 +14,13 @@ Source: https://github.com/molecule-man/go-brrr/tree/v1.2.0
 License: MIT
 Copyright (c) 2026 Andrii Berezhynskyi
 
-Both components are distributed under the following license:
+github.com/molecule-man/go-brrr bundled Arm Optimized Routines log2 port
+Source: https://github.com/molecule-man/go-brrr/blob/v1.2.0/internal/encoder/log2.go
+License declaration: MIT OR Apache-2.0 WITH LLVM-exception
+Moto uses the MIT option for this component.
+Copyright (c) 2018-2025, Arm Limited.
+
+These components are distributed under the following MIT license:
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -43,6 +49,20 @@ behavior from http2/client_conn_pool.go (Copyright 2015 The Go Authors).
 The internal/browserhttp2, internal/browserhttpcommon and internal/browserhttpsfv
 packages contain a pinned, narrowly modified copy of this version. See
 internal/browserhttp2/UPSTREAM.md for the reproducible source import and patches.
+
+golang.org/x/crypto v0.57.0
+Source: https://go.googlesource.com/crypto/+/refs/tags/v0.57.0
+License file: LICENSE
+
+golang.org/x/sys v0.48.0
+Source: https://go.googlesource.com/sys/+/refs/tags/v0.48.0
+License file: LICENSE
+
+golang.org/x/text v0.42.0
+Source: https://go.googlesource.com/text/+/refs/tags/v0.42.0
+License file: LICENSE
+
+The four golang.org/x modules above contain the same license text:
 -------------------------------------------------------------------------------
 
 Copyright 2009 The Go Authors.
@@ -78,6 +98,11 @@ github.com/refraction-networking/utls, via github.com/cppla/utls
 Pinned fork: ff869e255a305a8e722a14f6a090e49666cc5f78
 Source: https://github.com/cppla/utls/tree/ff869e255a305a8e722a14f6a090e49666cc5f78
 License file: LICENSE
+Additional source-file attributions under this license:
+Copyright 2017 Google Inc. All rights reserved.
+Copyright 2022 uTLS Authors. All rights reserved.
+Copyright 2023 The uTLS Authors. All rights reserved.
+Copyright (c) 2019, Psiphon Inc. All rights reserved. (u_prng.go)
 -------------------------------------------------------------------------------
 
 Copyright (c) 2009 The Go Authors. All rights reserved.
@@ -144,9 +169,11 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ===============================================================================
-github.com/andybalholm/brotli v1.0.6
-Source: https://github.com/andybalholm/brotli/tree/v1.0.6
-License file: LICENSE
+Brotli reference implementation attribution, via github.com/molecule-man/go-brrr
+Source acknowledgment: https://github.com/molecule-man/go-brrr/blob/v1.2.0/README.md
+The original Brotli author notice is retained below from
+github.com/andybalholm/brotli v1.0.6/LICENSE:
+https://github.com/andybalholm/brotli/blob/v1.0.6/LICENSE
 -------------------------------------------------------------------------------
 
 Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
@@ -173,6 +200,8 @@ THE SOFTWARE.
 github.com/klauspost/compress v1.20.1
 Source: https://github.com/klauspost/compress/tree/v1.20.1
 License file: LICENSE
+Additional source-file attribution (fse, huff0 and zstd/bitwriter.go):
+Based on work Copyright (c) 2013, Yann Collet, released under BSD License.
 -------------------------------------------------------------------------------
 
 Copyright (c) 2012 The Go Authors. All rights reserved.
@@ -479,3 +508,152 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+===============================================================================
+github.com/klauspost/compress bundled xxhash component
+Source: https://github.com/klauspost/compress/tree/v1.20.1/zstd/internal/xxhash
+License file: zstd/internal/xxhash/LICENSE.txt
+-------------------------------------------------------------------------------
+
+Copyright (c) 2016 Caleb Spare
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+===============================================================================
+github.com/apernet/quic-go bundled go-tree component
+Source: https://github.com/apernet/quic-go/blob/a10df75c260c/internal/utils/tree/tree.go
+License notice: internal/utils/tree/tree.go
+-------------------------------------------------------------------------------
+
+Copyright (c) 2017 Ross Oreto
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+===============================================================================
+github.com/quic-go/qpack v0.6.0
+Source: https://github.com/quic-go/qpack/tree/v0.6.0
+License file: LICENSE.md
+-------------------------------------------------------------------------------
+
+Copyright 2019 Marten Seemann
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+===============================================================================
+go.uber.org/zap v1.28.0
+Source: https://github.com/uber-go/zap/tree/v1.28.0
+License file: LICENSE
+-------------------------------------------------------------------------------
+
+Copyright (c) 2016-2024 Uber Technologies, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+===============================================================================
+go.uber.org/multierr v1.10.0
+Source: https://github.com/uber-go/multierr/tree/v1.10.0
+License file: LICENSE.txt
+-------------------------------------------------------------------------------
+
+Copyright (c) 2017-2021 Uber Technologies, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+===============================================================================
+gopkg.in/natefinch/lumberjack.v2 v2.2.1
+Source: https://github.com/natefinch/lumberjack/tree/v2.2.1
+License file: LICENSE
+-------------------------------------------------------------------------------
+
+The MIT License (MIT)
+
+Copyright (c) 2014 Nate Finch
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
