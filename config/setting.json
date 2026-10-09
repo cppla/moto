@@ -140,14 +140,10 @@
       "maxConnections": 4096,
       "maxConnectionsPerIP": 1024,
       "blacklist": null,
-      "userAgent": [
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-      ],
       "targets": [
         {
           "address": "proxy-a.example.com:443",
           "connectProxy": {
-            "browserProfile": "chrome",
             "protocols": ["h3", "h2"],
             "serverName": "proxy-a.example.com",
             "basicAuth": {
@@ -159,7 +155,6 @@
         {
           "address": "proxy-b.example.com:443",
           "connectProxy": {
-            "browserProfile": "chrome",
             "protocols": ["h3", "h2"],
             "serverName": "proxy-b.example.com",
             "basicAuth": {
@@ -192,14 +187,10 @@
       "maxConnections": 4096,
       "maxConnectionsPerIP": 1024,
       "blacklist": null,
-      "userAgent": [
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
-      ],
       "targets": [
         {
           "address": "proxy-a.example.com:443",
           "connectProxy": {
-            "browserProfile": "chrome",
             "protocols": ["h3", "h2"],
             "serverName": "proxy-a.example.com",
             "basicAuth": {
@@ -211,7 +202,6 @@
         {
           "address": "proxy-b.example.com:443",
           "connectProxy": {
-            "browserProfile": "chrome",
             "protocols": ["h3", "h2"],
             "serverName": "proxy-b.example.com",
             "basicAuth": {

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"moto/config"
 	"net"
@@ -12,6 +13,44 @@ import (
 
 	"github.com/apernet/quic-go"
 )
+
+func TestHTTP3UDPBlackholeH2ProbeUsesFixedChromeUserAgent(t *testing.T) {
+	const destination = "probe-destination.example:443"
+	expectedAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("fixture:fixture-password"))
+	var requests atomic.Int64
+	proxy := newHTTP2ConnectTestServer(t, func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.ProtoMajor != 2 || request.Method != http.MethodConnect || request.Host != destination {
+			t.Error("blackhole validation did not send the expected H2 CONNECT authority")
+		}
+		if values := request.Header.Values("User-Agent"); len(values) != 1 || values[0] != connectProxyChromeUserAgent {
+			t.Error("blackhole H2 validation lost the fixed Chrome User-Agent")
+		}
+		if request.Header.Get("Proxy-Authorization") != expectedAuth {
+			t.Error("blackhole H2 validation lost upstream authentication")
+		}
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+	})
+	manager := newConnectProxyManager()
+	manager.h2 = newHTTP2ConnectTestManager(proxy)
+	manager.dialers[config.ConnectProxyH2] = manager.h2.dial
+	t.Cleanup(manager.close)
+	target := http2ConnectTestTarget(proxy, "fixture", "fixture-password")
+	target.ConnectProxy.Protocols = []string{config.ConnectProxyH3, config.ConnectProxyH2}
+	// The degradation event is synthetic, but validation goes through the real
+	// production H2 request builder and a TLS/HTTP2 server, without UA context.
+	event := prepareHTTP3BlackholeEvent(t, manager, "mixed", target, destination, 91)
+	manager.noteHTTP3UDPBlackhole(event)
+	manager.maintenanceWG.Wait()
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("real H2 validation requests = %d, want 1", got)
+	}
+	if blackholeRulePhase(manager, "mixed") != http3RuleBreakerCooldown ||
+		blackholeSlotLifecycle(manager.h3, event) != http3TransportDraining {
+		t.Fatal("successful fixed-UA H2 validation did not commit cooldown and draining")
+	}
+}
 
 func TestHTTP3UDPBlackholeValidationArmsOnlyExactSlotAndReusesCooldown(t *testing.T) {
 	manager := newConnectProxyManager()

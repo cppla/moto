@@ -33,161 +33,145 @@ import (
 // Config.ChromeParrot alone would miss a preset whose transport parameters were
 // lost while copying the ClientHello, or settings overridden inside quic-go.
 func TestHTTP3ChromeClientHelloAndTransportParametersOnWire(t *testing.T) {
-	for _, profile := range []string{"", config.BrowserProfileChrome} {
-		name := profile
-		if name == "" {
-			name = "native"
-		}
-		t.Run(name, func(t *testing.T) {
-			endpoint, roots, packets, requests := chromeWireServer(t)
-			negotiated := make(chan tls.ConnectionState, 1)
-			manager := newHTTP3ConnectManager(func(key http3ConnectTransportKey, owner context.Context) *http3.Transport {
-				transport := newHTTP3ConnectTransportWithOwner(key, owner)
-				transport.TLSClientConfig.RootCAs = roots
-				originalDial := transport.Dial
-				transport.Dial = func(ctx context.Context, address string, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
-					connection, err := originalDial(ctx, address, tlsConfig, quicConfig)
-					if err == nil {
-						negotiated <- connection.ConnectionState().TLS
-					}
-					return connection, err
+	t.Run("default", func(t *testing.T) {
+		endpoint, roots, packets, requests := chromeWireServer(t)
+		negotiated := make(chan tls.ConnectionState, 1)
+		manager := newHTTP3ConnectManager(func(key http3ConnectTransportKey, owner context.Context) *http3.Transport {
+			transport := newHTTP3ConnectTransportWithOwner(key, owner)
+			transport.TLSClientConfig.RootCAs = roots
+			originalDial := transport.Dial
+			transport.Dial = func(ctx context.Context, address string, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
+				connection, err := originalDial(ctx, address, tlsConfig, quicConfig)
+				if err == nil {
+					negotiated <- connection.ConnectionState().TLS
 				}
-				return transport
-			})
-			t.Cleanup(manager.close)
-			target := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{
-				Protocols: []string{config.ConnectProxyH3}, ServerName: "example.com", BrowserProfile: profile,
-				BasicAuth: &config.BasicAuthConfig{Username: "wire-user-marker", Password: "wire-password-marker"},
-			}}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			tunnel, err := manager.dial(ctx, target, "wire-destination-marker.example:443")
-			if err != nil {
-				t.Fatalf("actual Moto HTTP/3 CONNECT: %v", err)
+				return connection, err
 			}
-			t.Cleanup(func() { _ = tunnel.Close() })
-			assertConnectTunnelEcho(t, tunnel, "verified-real-h3-payload")
-			if requests.Load() != 1 {
-				t.Fatalf("CONNECT requests = %d, want 1", requests.Load())
-			}
-			select {
-			case state := <-negotiated:
-				if state.Version != tls.VersionTLS13 || state.NegotiatedProtocol != "h3" || len(state.VerifiedChains) == 0 {
-					t.Fatalf("successful TLS state lacks TLS 1.3, h3 or verified chains: %+v", state)
-				}
-			default:
-				t.Fatal("CONNECT succeeded without a completed physical handshake")
-			}
-
-			datagrams := packets.snapshot()
-			hello, initialPackets, err := chromeWireClientHello(datagrams)
-			if err != nil {
-				t.Fatalf("decode actual QUIC Initial: %v", err)
-			}
-			serverName, alpn, err := parseTLSClientHelloBody(hello[4:])
-			if err != nil || serverName != "example.com" || !reflect.DeepEqual(alpn, []string{"h3"}) {
-				t.Fatalf("wire ClientHello SNI/ALPN = %q/%v, error %v", serverName, alpn, err)
-			}
-			for _, marker := range []string{"wire-user-marker", "wire-password-marker", "wire-destination-marker"} {
-				if bytes.Contains(hello, []byte(marker)) {
-					t.Fatalf("ClientHello leaks CONNECT marker %q", marker)
-				}
-			}
-			ciphers, extensions := chromeWireExtensions(t, hello)
-			params := chromeWireTransportParameters(t, extensions[57])
-			if profile == "" {
-				chromeWireAssertInteger(t, params, 1, 90000)
-				if _, ok := params[0x3128]; ok {
-					t.Fatal("native profile unexpectedly advertises Chrome connection options")
-				}
-				if _, ok := extensions[17613]; ok {
-					t.Fatal("native profile unexpectedly advertises Chrome ALPS")
-				}
-				return
-			}
-			if len(datagrams) == 0 {
-				t.Fatal("successful handshake emitted no captured datagrams")
-			}
-			if len(datagrams[0]) != 1250 {
-				t.Fatalf("first UDP datagram size = %d, want pinned Chrome 1250", len(datagrams[0]))
-			}
-			first := datagrams[0]
-			if binary.BigEndian.Uint32(first[1:5]) != 1 || first[5] != 8 || first[14] != 0 {
-				t.Fatalf("Initial version/DCID/SCID header = %x, want v1 / 8 / 0", first[:15])
-			}
-			if initialPackets < 2 {
-				t.Fatalf("ClientHello completed in %d Initial packets, want split ML-KEM hello", initialPackets)
-			}
-			if want := []uint16{0x1301, 0x1302, 0x1303}; !reflect.DeepEqual(ciphers, want) {
-				t.Fatalf("QUIC ClientHello cipher suites = %x, want %x", ciphers, want)
-			}
-			var ids []int
-			for id := range extensions {
-				ids = append(ids, int(id))
-			}
-			slices.Sort(ids)
-			wantIDs := []int{0, 10, 13, 16, 27, 43, 45, 51, 57, 17613, 0xca34, 0xfe0d}
-			slices.Sort(wantIDs)
-			if !reflect.DeepEqual(ids, wantIDs) {
-				t.Fatalf("wire extension IDs = %x, want pinned QUIC profile %x", ids, wantIDs)
-			}
-			for id, want := range map[uint16][]byte{
-				10:    {0, 8, 0x11, 0xec, 0, 29, 0, 23, 0, 24},
-				13:    {0, 18, 4, 3, 8, 4, 4, 1, 5, 3, 8, 5, 5, 1, 8, 6, 6, 1, 2, 1},
-				27:    {2, 0, 2}, // Brotli certificate compression.
-				43:    {2, 3, 4}, // TLS 1.3 only, no TCP TLS 1.2 compatibility.
-				45:    {1, 1},
-				17613: {0, 3, 2, 'h', '3'},
-			} {
-				if !bytes.Equal(extensions[id], want) {
-					t.Fatalf("extension %d = %x, want %x", id, extensions[id], want)
-				}
-			}
-			if len(extensions[0xfe0d]) == 0 || len(extensions[0xca34]) < 3 {
-				t.Fatal("missing GREASE ECH or trust anchor extension data")
-			}
-			for id, want := range map[uint64]uint64{
-				1: 30000, 3: 1472, 4: 15728640, 5: 6291456, 6: 6291456, 7: 6291456,
-				8: 100, 9: 103, 0x20: 65536,
-			} {
-				chromeWireAssertInteger(t, params, id, want)
-			}
-			if source, ok := params[15]; !ok || len(source.value) != 0 {
-				t.Fatalf("initial_source_connection_id = %x, want present and empty", source.value)
-			}
-			if !bytes.Equal(params[0x3128].value, []byte("ORIG")) {
-				t.Fatalf("google_connection_options = %q, want ORIG", params[0x3128].value)
-			}
-			version := params[0x11].value
-			if len(version) != 12 || binary.BigEndian.Uint32(version[:4]) != 1 {
-				t.Fatalf("version_information = %x, want chosen v1 and two available versions", version)
-			}
-			one, two := binary.BigEndian.Uint32(version[4:8]), binary.BigEndian.Uint32(version[8:12])
-			if one != 1 {
-				one, two = two, one
-			}
-			if one != 1 || two&0x0f0f0f0f != 0x0a0a0a0a {
-				t.Fatalf("available QUIC versions = %x, want v1 and reserved GREASE", version[4:])
-			}
-			for _, id := range []uint64{10, 11, 12, 14} {
-				if _, ok := params[id]; ok {
-					t.Fatalf("Chrome wire parameters unexpectedly contain omitted parameter %d", id)
-				}
-			}
-			grease := 0
-			for id, parameter := range params {
-				if id%31 == 27 {
-					grease++
-					if parameter.idBytes != 8 || len(parameter.value) > 15 {
-						t.Fatalf("GREASE transport parameter id bytes/value size = %d/%d", parameter.idBytes, len(parameter.value))
-					}
-				}
-			}
-			if grease != 1 || len(params) != 13 {
-				t.Fatalf("wire transport parameters = %d, GREASE = %d, want 13/1", len(params), grease)
-			}
+			return transport
 		})
-	}
+		t.Cleanup(manager.close)
+		target := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{
+			Protocols: []string{config.ConnectProxyH3}, ServerName: "example.com",
+			BasicAuth: &config.BasicAuthConfig{Username: "wire-user-marker", Password: "wire-password-marker"},
+		}}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tunnel, err := manager.dial(ctx, target, "wire-destination-marker.example:443")
+		if err != nil {
+			t.Fatalf("actual Moto HTTP/3 CONNECT: %v", err)
+		}
+		t.Cleanup(func() { _ = tunnel.Close() })
+		assertConnectTunnelEcho(t, tunnel, "verified-real-h3-payload")
+		if requests.Load() != 1 {
+			t.Fatalf("CONNECT requests = %d, want 1", requests.Load())
+		}
+		select {
+		case state := <-negotiated:
+			if state.Version != tls.VersionTLS13 || state.NegotiatedProtocol != "h3" || len(state.VerifiedChains) == 0 {
+				t.Fatalf("successful TLS state lacks TLS 1.3, h3 or verified chains: %+v", state)
+			}
+		default:
+			t.Fatal("CONNECT succeeded without a completed physical handshake")
+		}
+
+		datagrams := packets.snapshot()
+		hello, initialPackets, err := chromeWireClientHello(datagrams)
+		if err != nil {
+			t.Fatalf("decode actual QUIC Initial: %v", err)
+		}
+		serverName, alpn, err := parseTLSClientHelloBody(hello[4:])
+		if err != nil || serverName != "example.com" || !reflect.DeepEqual(alpn, []string{"h3"}) {
+			t.Fatalf("wire ClientHello SNI/ALPN = %q/%v, error %v", serverName, alpn, err)
+		}
+		for _, marker := range []string{"wire-user-marker", "wire-password-marker", "wire-destination-marker"} {
+			if bytes.Contains(hello, []byte(marker)) {
+				t.Fatalf("ClientHello leaks CONNECT marker %q", marker)
+			}
+		}
+		ciphers, extensions := chromeWireExtensions(t, hello)
+		params := chromeWireTransportParameters(t, extensions[57])
+		if len(datagrams) == 0 {
+			t.Fatal("successful handshake emitted no captured datagrams")
+		}
+		if len(datagrams[0]) != 1250 {
+			t.Fatalf("first UDP datagram size = %d, want pinned Chrome 1250", len(datagrams[0]))
+		}
+		first := datagrams[0]
+		if binary.BigEndian.Uint32(first[1:5]) != 1 || first[5] != 8 || first[14] != 0 {
+			t.Fatalf("Initial version/DCID/SCID header = %x, want v1 / 8 / 0", first[:15])
+		}
+		if initialPackets < 2 {
+			t.Fatalf("ClientHello completed in %d Initial packets, want split ML-KEM hello", initialPackets)
+		}
+		if want := []uint16{0x1301, 0x1302, 0x1303}; !reflect.DeepEqual(ciphers, want) {
+			t.Fatalf("QUIC ClientHello cipher suites = %x, want %x", ciphers, want)
+		}
+		var ids []int
+		for id := range extensions {
+			ids = append(ids, int(id))
+		}
+		slices.Sort(ids)
+		wantIDs := []int{0, 10, 13, 16, 27, 43, 45, 51, 57, 17613, 0xca34, 0xfe0d}
+		slices.Sort(wantIDs)
+		if !reflect.DeepEqual(ids, wantIDs) {
+			t.Fatalf("wire extension IDs = %x, want pinned QUIC profile %x", ids, wantIDs)
+		}
+		for id, want := range map[uint16][]byte{
+			10:    {0, 8, 0x11, 0xec, 0, 29, 0, 23, 0, 24},
+			13:    {0, 18, 4, 3, 8, 4, 4, 1, 5, 3, 8, 5, 5, 1, 8, 6, 6, 1, 2, 1},
+			27:    {2, 0, 2}, // Brotli certificate compression.
+			43:    {2, 3, 4}, // TLS 1.3 only, no TCP TLS 1.2 compatibility.
+			45:    {1, 1},
+			17613: {0, 3, 2, 'h', '3'},
+		} {
+			if !bytes.Equal(extensions[id], want) {
+				t.Fatalf("extension %d = %x, want %x", id, extensions[id], want)
+			}
+		}
+		if len(extensions[0xfe0d]) == 0 || len(extensions[0xca34]) < 3 {
+			t.Fatal("missing GREASE ECH or trust anchor extension data")
+		}
+		for id, want := range map[uint64]uint64{
+			1: 30000, 3: 1472, 4: 15728640, 5: 6291456, 6: 6291456, 7: 6291456,
+			8: 100, 9: 103, 0x20: 65536,
+		} {
+			chromeWireAssertInteger(t, params, id, want)
+		}
+		if source, ok := params[15]; !ok || len(source.value) != 0 {
+			t.Fatalf("initial_source_connection_id = %x, want present and empty", source.value)
+		}
+		if !bytes.Equal(params[0x3128].value, []byte("ORIG")) {
+			t.Fatalf("google_connection_options = %q, want ORIG", params[0x3128].value)
+		}
+		version := params[0x11].value
+		if len(version) != 12 || binary.BigEndian.Uint32(version[:4]) != 1 {
+			t.Fatalf("version_information = %x, want chosen v1 and two available versions", version)
+		}
+		one, two := binary.BigEndian.Uint32(version[4:8]), binary.BigEndian.Uint32(version[8:12])
+		if one != 1 {
+			one, two = two, one
+		}
+		if one != 1 || two&0x0f0f0f0f != 0x0a0a0a0a {
+			t.Fatalf("available QUIC versions = %x, want v1 and reserved GREASE", version[4:])
+		}
+		for _, id := range []uint64{10, 11, 12, 14} {
+			if _, ok := params[id]; ok {
+				t.Fatalf("Chrome wire parameters unexpectedly contain omitted parameter %d", id)
+			}
+		}
+		grease := 0
+		for id, parameter := range params {
+			if id%31 == 27 {
+				grease++
+				if parameter.idBytes != 8 || len(parameter.value) > 15 {
+					t.Fatalf("GREASE transport parameter id bytes/value size = %d/%d", parameter.idBytes, len(parameter.value))
+				}
+			}
+		}
+		if grease != 1 || len(params) != 13 {
+			t.Fatalf("wire transport parameters = %d, GREASE = %d, want 13/1", len(params), grease)
+		}
+	})
 }
 
 func TestHTTP3ChromeCertificateVerificationOnWire(t *testing.T) {
@@ -211,7 +195,7 @@ func TestHTTP3ChromeCertificateVerificationOnWire(t *testing.T) {
 			})
 			t.Cleanup(manager.close)
 			target := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{
-				Protocols: []string{config.ConnectProxyH3}, ServerName: test.serverName, BrowserProfile: config.BrowserProfileChrome,
+				Protocols: []string{config.ConnectProxyH3}, ServerName: test.serverName,
 			}}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
@@ -257,7 +241,7 @@ func TestHTTP3ChromeRejectsNonH3ALPN(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	transport := newHTTP3ConnectTransportWithOwner(http3ConnectTransportKey{
-		address: listener.Addr().String(), serverName: "example.com", browserProfile: config.BrowserProfileChrome,
+		address: listener.Addr().String(), serverName: "example.com",
 	}, context.Background())
 	t.Cleanup(func() { _ = transport.Close() })
 	transport.TLSClientConfig.RootCAs = roots

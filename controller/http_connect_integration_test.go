@@ -44,7 +44,6 @@ func TestHTTPConnectIntegrationTunnelModes(t *testing.T) {
 					writer.(http.Flusher).Flush()
 				})
 				rule := httpConnectIntegrationRule(mode, target)
-				rule.UserAgent = []string{"Configured-Moto-UA/1.0"}
 				server := startHTTPConnectIntegrationServer(t, rule, install)
 				client := dialHTTPConnectIntegrationClient(t, server)
 				reader := bufio.NewReader(client)
@@ -101,8 +100,8 @@ func TestHTTPConnectIntegrationTunnelModes(t *testing.T) {
 					if got := upstream.Header.Get("Proxy-Authorization"); got != wantAuth {
 						t.Fatalf("upstream did not receive configured Basic auth")
 					}
-					if got := upstream.Header.Get("User-Agent"); got != rule.UserAgent[0] {
-						t.Errorf("upstream User-Agent = %q, want %q", got, rule.UserAgent[0])
+					if got := upstream.Header.Get("User-Agent"); got != connectProxyChromeUserAgent || len(upstream.Header.Values("User-Agent")) != 1 {
+						t.Errorf("upstream User-Agent = %q, want one fixed %q", upstream.Header.Values("User-Agent"), connectProxyChromeUserAgent)
 					}
 					for _, header := range []string{"Authorization", "Cookie", "X-Client-Secret"} {
 						if upstream.Header.Get(header) != "" {

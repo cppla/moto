@@ -98,7 +98,7 @@ func TestHTTP3SetupDeadlineBudgetAndQUICClone(t *testing.T) {
 	}
 }
 
-func TestHTTP3TransportUsesFastKeepAliveWithConservativeIdleFallback(t *testing.T) {
+func TestHTTP3TransportUsesFastKeepAliveWithChromeIdleTimeout(t *testing.T) {
 	transport := newHTTP3ConnectTransportWithOwner(
 		http3ConnectTransportKey{address: "proxy.example:443", serverName: "proxy.example"},
 		context.Background(),
@@ -110,8 +110,11 @@ func TestHTTP3TransportUsesFastKeepAliveWithConservativeIdleFallback(t *testing.
 	if got := transport.QUICConfig.KeepAlivePeriod; got != 10*time.Second {
 		t.Fatalf("QUIC keepalive = %s, want 10s", got)
 	}
-	if got := transport.QUICConfig.MaxIdleTimeout; got != 90*time.Second {
-		t.Fatalf("QUIC max idle timeout = %s, want 90s", got)
+	if got := transport.QUICConfig.MaxIdleTimeout; got != 30*time.Second {
+		t.Fatalf("QUIC max idle timeout = %s, want Chrome 30s", got)
+	}
+	if !transport.QUICConfig.ChromeParrot || len(transport.QUICConfig.Versions) != 1 || transport.QUICConfig.Versions[0] != quic.Version1 {
+		t.Fatalf("default QUIC config must use Chrome over v1: %+v", transport.QUICConfig)
 	}
 }
 

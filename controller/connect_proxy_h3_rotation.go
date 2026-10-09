@@ -50,7 +50,6 @@ type http3TunnelStats struct {
 	ruleName            string
 	target              *config.Target
 	destination         string
-	userAgent           string
 	probation           http3RuleProbationBinding
 	pending             atomic.Int64
 	writeStarted        atomic.Int64
@@ -69,7 +68,6 @@ type http3UDPBlackholeProbe struct {
 	ruleName    string
 	target      *config.Target
 	destination string
-	userAgent   string
 }
 
 type http3UDPBlackholeEvent struct {
@@ -447,7 +445,6 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 					ruleName:    tunnel.ruleName,
 					target:      tunnel.target,
 					destination: tunnel.destination,
-					userAgent:   tunnel.userAgent,
 				})
 			}
 		}

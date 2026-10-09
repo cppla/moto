@@ -15,9 +15,8 @@ import (
 
 func http3ConnectKey(target *config.Target) http3ConnectTransportKey {
 	return http3ConnectTransportKey{
-		address:        target.Address,
-		serverName:     target.ConnectProxy.ServerName,
-		browserProfile: target.ConnectProxy.BrowserProfile,
+		address:    target.Address,
+		serverName: target.ConnectProxy.ServerName,
 	}
 }
 

@@ -27,9 +27,11 @@ const (
 	// This is a defensive cap for one physical DNS+QUIC setup. The configured
 	// rule/attempt deadline remains authoritative whenever it is shorter.
 	http3ConnectMaxHandshakeTimeout = 30 * time.Second
-	http3ConnectIdleTimeout         = 90 * time.Second
-	http3ConnectKeepAlivePeriod     = 10 * time.Second
-	http3ConnectMaxResponseHeaders  = 16 << 10
+	// Match the fixed Chrome transport parameters; keepalive remains shorter
+	// so quiet established CONNECT tunnels do not expire at this boundary.
+	http3ConnectIdleTimeout        = 30 * time.Second
+	http3ConnectKeepAlivePeriod    = 10 * time.Second
+	http3ConnectMaxResponseHeaders = 16 << 10
 	// Stay below common peer-controlled bidirectional stream ceilings and
 	// open another pooled QUIC connection before a long CONNECT can consume all
 	// stream credit. The pool remains bounded at the default rule connection cap.
@@ -43,9 +45,8 @@ var (
 )
 
 type http3ConnectTransportKey struct {
-	address        string
-	serverName     string
-	browserProfile string
+	address    string
+	serverName string
 }
 
 type http3AddressResolver interface {
@@ -239,21 +240,15 @@ func newHTTP3ConnectTransportWithResolver(
 			ServerName: key.serverName,
 		},
 		QUICConfig: &quic.Config{
+			ChromeParrot: true,
+			// The pinned QUIC transport-parameter template advertises v1.
+			Versions:             []quic.Version{quic.Version1},
 			HandshakeIdleTimeout: http3ConnectMaxHandshakeTimeout,
 			MaxIdleTimeout:       http3ConnectIdleTimeout,
 			KeepAlivePeriod:      http3ConnectKeepAlivePeriod,
 		},
 		DisableCompression:     true,
 		MaxResponseHeaderBytes: http3ConnectMaxResponseHeaders,
-	}
-	if key.browserProfile == config.BrowserProfileChrome {
-		transport.QUICConfig.ChromeParrot = true
-		// The pinned QUIC transport-parameter template advertises v1. It is
-		// separate from the TCP ClientHello template used for this profile.
-		transport.QUICConfig.Versions = []quic.Version{quic.Version1}
-		// ChromeParrot advertises a 30s idle timeout. Keep Moto's 10s
-		// keepalive so established, quiet CONNECT tunnels remain usable.
-		transport.QUICConfig.MaxIdleTimeout = 30 * time.Second
 	}
 	// quic-go coalesces the first connection setup per proxy host. Its default
 	// dial inherits the first request's context, so canceling one Boost loser can
@@ -281,10 +276,7 @@ func newHTTP3ConnectTransportWithResolver(
 			return nil, context.DeadlineExceeded
 		}
 		dialQUICConfig := cloneHTTP3QUICConfigForSetup(quicConfig, remaining)
-		if key.browserProfile == config.BrowserProfileChrome {
-			return dialHTTP3Chrome(dialCtx, resolved, tlsConfig, dialQUICConfig)
-		}
-		return quic.DialAddr(dialCtx, resolved, tlsConfig, dialQUICConfig)
+		return dialHTTP3Chrome(dialCtx, resolved, tlsConfig, dialQUICConfig)
 	}
 	return transport
 }
@@ -770,9 +762,7 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 		token := base64.StdEncoding.EncodeToString([]byte(auth.Username + ":" + auth.Password))
 		request.Header.Set("Proxy-Authorization", "Basic "+token)
 	}
-	if userAgent, ok := connectProxyProfileUserAgent(ctx, target); ok {
-		request.Header.Set("User-Agent", userAgent)
-	}
+	request.Header.Set("User-Agent", connectProxyChromeUserAgent)
 
 	setupFlightSnapshot := transportSlot.setupFlights.snapshot()
 	response, err := transport.RoundTrip(request)
@@ -846,13 +836,11 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 		return nil, statusErr
 	}
 	ruleName, _ := connectProxyRuleNameFromContext(ctx)
-	userAgent, _ := connectProxyProfileUserAgent(ctx, target)
 	tunnelStats := &http3TunnelStats{
 		slot:        transportSlot,
 		ruleName:    ruleName,
 		target:      target,
 		destination: destination,
-		userAgent:   userAgent,
 	}
 	conn := &http3TunnelConn{
 		reader:     response.Body,

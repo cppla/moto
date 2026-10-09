@@ -91,7 +91,6 @@ func (manager *connectProxyManager) validateHTTP3UDPBlackholeFallback(
 	ctx, cancel := context.WithTimeout(base, http3UDPBlackholeH2ProbeTimeout)
 	defer cancel()
 	ctx = withConnectProxyRuleName(ctx, probe.ruleName)
-	ctx = withConnectProxyUserAgent(ctx, probe.userAgent)
 	if manager.h3 == nil || !manager.retainActiveUDPBlackholeScopes(probe.ruleName, token) {
 		return
 	}

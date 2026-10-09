@@ -163,7 +163,7 @@ func TestHTTP3ChromeSlotOwnsIndependentSockets(t *testing.T) {
 	waitChromeLifecyclePacketClosed(t, packets[1])
 }
 
-func TestHTTP3ChromeProfileKeepsDistinctPoolAndSiblingTunnels(t *testing.T) {
+func TestHTTP3ChromeServerNamesKeepDistinctPoolsAndSiblingTunnels(t *testing.T) {
 	endpoint, roots, closeServer, connectionCount := startHTTP3ConnectTestServer(t, http.HandlerFunc(echoHTTP3OwnershipTunnel))
 	defer closeServer()
 	var capturedMu sync.Mutex
@@ -184,12 +184,12 @@ func TestHTTP3ChromeProfileKeepsDistinctPoolAndSiblingTunnels(t *testing.T) {
 		return transport
 	})
 	defer manager.close()
-	native := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{Protocols: []string{config.ConnectProxyH3}}}
-	chrome := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{
-		Protocols: []string{config.ConnectProxyH3}, BrowserProfile: config.BrowserProfileChrome,
+	defaultName := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{Protocols: []string{config.ConnectProxyH3}}}
+	explicitName := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3}, ServerName: "example.com",
 	}}
 	var tunnels []net.Conn
-	for _, target := range []*config.Target{native, chrome, chrome} {
+	for _, target := range []*config.Target{defaultName, explicitName, explicitName} {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		tunnel, err := manager.dial(ctx, target, "destination.example:443")
 		cancel()
@@ -200,13 +200,13 @@ func TestHTTP3ChromeProfileKeepsDistinctPoolAndSiblingTunnels(t *testing.T) {
 		tunnels = append(tunnels, tunnel)
 	}
 	if got := connectionCount.Load(); got != 2 {
-		t.Fatalf("physical connections = %d, want distinct native and reused Chrome pools", got)
+		t.Fatalf("physical connections = %d, want distinct server-name pools with reuse", got)
 	}
 	manager.mu.Lock()
-	nativeSlots, chromeSlots := len(manager.transports[http3ConnectKey(native)]), len(manager.transports[http3ConnectKey(chrome)])
+	defaultSlots, explicitSlots := len(manager.transports[http3ConnectKey(defaultName)]), len(manager.transports[http3ConnectKey(explicitName)])
 	manager.mu.Unlock()
-	if nativeSlots != 1 || chromeSlots != 1 {
-		t.Fatalf("pool slots = native %d Chrome %d, want one each", nativeSlots, chromeSlots)
+	if defaultSlots != 1 || explicitSlots != 1 {
+		t.Fatalf("pool slots = default name %d explicit name %d, want one each", defaultSlots, explicitSlots)
 	}
 	_ = tunnels[1].Close()
 	for _, tunnel := range []net.Conn{tunnels[0], tunnels[2]} {
@@ -241,7 +241,7 @@ func TestHTTP3ChromeProfileKeepsDistinctPoolAndSiblingTunnels(t *testing.T) {
 	}
 }
 
-func TestBrowserProfileH3IdleTunnelSurvivesAdvertisedTimeout(t *testing.T) {
+func TestChromeH3IdleTunnelSurvivesAdvertisedTimeout(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires 35 seconds of real idle time to exceed the advertised 30s timeout")
 	}
@@ -254,7 +254,7 @@ func TestBrowserProfileH3IdleTunnelSurvivesAdvertisedTimeout(t *testing.T) {
 	})
 	defer manager.close()
 	target := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{
-		Protocols: []string{config.ConnectProxyH3}, BrowserProfile: config.BrowserProfileChrome,
+		Protocols: []string{config.ConnectProxyH3},
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	tunnel, err := manager.dial(ctx, target, "idle.example:443")
@@ -363,9 +363,9 @@ func TestHTTP3ChromeConcurrentSlotAndPeerClose(t *testing.T) {
 	}
 }
 
-func TestHTTP3ChromeCooldownAndHalfOpenUseProfileIdentity(t *testing.T) {
+func TestHTTP3ChromeCooldownAndHalfOpenUseServerNameIdentity(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	chromeRecovers := false
+	recoveringAvailable := false
 	h3Calls := make(map[string]int)
 	managedProbeSeen := false
 	manager := &connectProxyManager{
@@ -374,12 +374,12 @@ func TestHTTP3ChromeCooldownAndHalfOpenUseProfileIdentity(t *testing.T) {
 		cooldownMax:  time.Minute,
 		dialers: map[string]connectProxyDialFunc{
 			config.ConnectProxyH3: func(ctx context.Context, target *config.Target, _ string) (net.Conn, error) {
-				profile := target.ConnectProxy.BrowserProfile
-				h3Calls[profile]++
-				if profile == config.BrowserProfileChrome {
+				serverName := target.ConnectProxy.ServerName
+				h3Calls[serverName]++
+				if serverName == "recovering.example" {
 					managedProbeSeen = http3ManagedProbeFromContext(ctx)
-					if !chromeRecovers {
-						return nil, errors.New("Chrome QUIC setup unavailable")
+					if !recoveringAvailable {
+						return nil, errors.New("QUIC setup unavailable")
 					}
 				}
 				return newHTTP3CooldownTestConnection(t), nil
@@ -389,35 +389,35 @@ func TestHTTP3ChromeCooldownAndHalfOpenUseProfileIdentity(t *testing.T) {
 			},
 		},
 	}
-	native := &config.Target{Address: "proxy.example:443", ConnectProxy: &config.ConnectProxyConfig{
-		Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2},
+	healthy := &config.Target{Address: "proxy.example:443", ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2}, ServerName: "healthy.example",
 	}}
-	chrome := &config.Target{Address: native.Address, ConnectProxy: &config.ConnectProxyConfig{
-		Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2}, BrowserProfile: config.BrowserProfileChrome,
+	recovering := &config.Target{Address: healthy.Address, ConnectProxy: &config.ConnectProxyConfig{
+		Protocols: []string{config.ConnectProxyH3, config.ConnectProxyH2}, ServerName: "recovering.example",
 	}}
-	for _, target := range []*config.Target{chrome, native, chrome} {
+	for _, target := range []*config.Target{recovering, healthy, recovering} {
 		connection, err := manager.dial(context.Background(), target, "destination.example:443")
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = connection.Close()
 	}
-	if h3Calls[config.BrowserProfileChrome] != 1 || h3Calls[""] != 1 {
-		t.Fatalf("profile H3 attempts = %v, want Chrome cooled while native remains eligible", h3Calls)
+	if h3Calls["recovering.example"] != 1 || h3Calls["healthy.example"] != 1 {
+		t.Fatalf("H3 attempts = %v, want only the failed server name cooled down", h3Calls)
 	}
 	now = now.Add(10 * time.Second)
-	chromeRecovers = true
-	connection, err := manager.dial(context.Background(), chrome, "destination.example:443")
+	recoveringAvailable = true
+	connection, err := manager.dial(context.Background(), recovering, "destination.example:443")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = connection.Close()
-	if !managedProbeSeen || h3Calls[config.BrowserProfileChrome] != 2 {
-		t.Fatalf("Chrome recovery did not use its own half-open probe: managed=%v calls=%v", managedProbeSeen, h3Calls)
+	if !managedProbeSeen || h3Calls["recovering.example"] != 2 {
+		t.Fatalf("server-name recovery did not use its own half-open probe: managed=%v calls=%v", managedProbeSeen, h3Calls)
 	}
-	_, managed, allowed := manager.beginHTTP3Attempt(context.Background(), chrome)
+	_, managed, allowed := manager.beginHTTP3Attempt(context.Background(), recovering)
 	if !allowed || managed {
-		t.Fatalf("recovered Chrome profile = allowed %v managed %v, want normal admission", allowed, managed)
+		t.Fatalf("recovered server name = allowed %v managed %v, want normal admission", allowed, managed)
 	}
 }
 
@@ -454,7 +454,7 @@ func TestHTTP3ChromeLargeConcurrentPayloadCrossesReceiveWindows(t *testing.T) {
 	})
 	defer manager.close()
 	target := &config.Target{Address: endpoint, ConnectProxy: &config.ConnectProxyConfig{
-		Protocols: []string{config.ConnectProxyH3}, BrowserProfile: config.BrowserProfileChrome,
+		Protocols: []string{config.ConnectProxyH3},
 	}}
 	var tunnels []net.Conn
 	for range 2 {
@@ -526,7 +526,7 @@ func TestHTTP3ChromeLargeConcurrentPayloadCrossesReceiveWindows(t *testing.T) {
 }
 
 func TestHTTP3ChromeRejectsServerInitiatedBidirectionalStream(t *testing.T) {
-	endpoint, roots, serverConnections, _ := startHTTP3CloseObservationServer(t, "")
+	endpoint, roots, serverConnections, _ := startHTTP3CloseObservationServer(t, "", 0)
 	remote, err := net.ResolveUDPAddr("udp", endpoint)
 	if err != nil {
 		t.Fatal(err)

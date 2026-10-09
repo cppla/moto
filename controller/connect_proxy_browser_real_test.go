@@ -59,7 +59,6 @@ func TestBrowserProfileRealRoutes(t *testing.T) {
 				target := *original
 				proxy := *original.ConnectProxy
 				proxy.Protocols = scenario.protocols
-				proxy.BrowserProfile = config.BrowserProfileChrome
 				target.ConnectProxy = &proxy
 				manager := newConnectProxyManager()
 				defer manager.close()

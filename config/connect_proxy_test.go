@@ -13,7 +13,6 @@ func TestLoadSOCKS5ConnectProxyConfiguration(t *testing.T) {
 			"listen":"127.0.0.1:83",
 			"mode":"boost",
 			"protocol":"socks5",
-			"userAgent":["Browser/1.0","Browser/2.0"],
 			"healthCheck":{"type":"tcp"},
 			"targets":[{
 				"address":"proxy.example.com:443",
@@ -37,9 +36,6 @@ func TestLoadSOCKS5ConnectProxyConfiguration(t *testing.T) {
 	if rule.Protocol != ProtocolSOCKS5 || rule.HealthCheck.Type != HealthCheckTCP {
 		t.Fatalf("protocol/health = %q/%q, want socks5/tcp", rule.Protocol, rule.HealthCheck.Type)
 	}
-	if got := strings.Join(rule.UserAgent, ","); got != "Browser/1.0,Browser/2.0" {
-		t.Fatalf("userAgent = %q, want configured values", got)
-	}
 	proxy := rule.Targets[0].ConnectProxy
 	if proxy == nil || strings.Join(proxy.Protocols, ",") != "h3,h2" {
 		t.Fatalf("connect proxy protocols = %+v, want h3,h2", proxy)
@@ -49,108 +45,25 @@ func TestLoadSOCKS5ConnectProxyConfiguration(t *testing.T) {
 	}
 }
 
-func TestSOCKS5UserAgentValidation(t *testing.T) {
-	newRule := func() *Rule {
-		return &Rule{
-			Name:      "socks",
-			Listen:    "127.0.0.1:1080",
-			Mode:      ModeNormal,
-			Protocol:  ProtocolSOCKS5,
-			UserAgent: []string{"Browser/1.0"},
-			Targets: []*Target{{
-				Address:      "proxy.example.com:443",
-				ConnectProxy: &ConnectProxyConfig{Protocols: []string{ConnectProxyH2}},
-			}},
+func TestStrictJSONRejectsRemovedUserAgentFields(t *testing.T) {
+	for _, protocol := range []string{ProtocolSOCKS5, ProtocolHTTP, ProtocolTCP} {
+		for _, field := range []string{"userAgent", "UserAgent", "useragent", "USERAGENT"} {
+			for name, value := range map[string]string{
+				"null": "null", "empty": "[]", "configured": `["Browser/1.0"]`,
+			} {
+				t.Run(protocol+"/"+field+"/"+name, func(t *testing.T) {
+					proxy := `,"connectProxy":{"protocols":["h3","h2"]}`
+					if protocol == ProtocolTCP {
+						proxy = ""
+					}
+					body := `{"log":{"level":"info","path":""},"rules":[{"name":"removed-ua","listen":"127.0.0.1:1080","mode":"normal","protocol":"` + protocol + `","targets":[{"address":"proxy.example:443"` + proxy + `}],"` + field + `":` + value + `}]}`
+					_, err := Load(writeConfig(t, body))
+					if err == nil || !strings.Contains(err.Error(), "unknown or non-canonical field") || !strings.Contains(err.Error(), `"`+field+`"`) {
+						t.Fatalf("Load() error = %v, want explicit rejection of removed field %q", err, field)
+					}
+				})
+			}
 		}
-	}
-
-	validMaximum := newRule()
-	validMaximum.UserAgent = make([]string, maxUserAgents)
-	for index := range validMaximum.UserAgent {
-		validMaximum.UserAgent[index] = strings.Repeat("a", maxUserAgentBytes-3) + string(rune('A'+index%26)) + string(rune('0'+index/26)) + string(rune('0'+index%10))
-	}
-	if err := validMaximum.Validate(); err != nil {
-		t.Fatalf("Validate() rejected maximum valid userAgent list: %v", err)
-	}
-
-	tests := map[string]struct {
-		mutate func(*Rule)
-		want   string
-	}{
-		"non-SOCKS rule": {
-			mutate: func(rule *Rule) { rule.Protocol = ProtocolTCP },
-			want:   "only valid for protocol socks5",
-		},
-		"too many entries": {
-			mutate: func(rule *Rule) { rule.UserAgent = make([]string, maxUserAgents+1) },
-			want:   "must not contain more than",
-		},
-		"empty entry": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{""} },
-			want:   "length must be between",
-		},
-		"entry too long": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{strings.Repeat("a", maxUserAgentBytes+1)} },
-			want:   "length must be between",
-		},
-		"leading whitespace": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{" Browser/1.0"} },
-			want:   "leading or trailing whitespace",
-		},
-		"trailing whitespace": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{"Browser/1.0 "} },
-			want:   "leading or trailing whitespace",
-		},
-		"newline": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{"Browser/1.0\nInjected"} },
-			want:   "only printable ASCII",
-		},
-		"NUL": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{"Browser/1.0\x00"} },
-			want:   "only printable ASCII",
-		},
-		"DEL": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{"Browser/1.0\x7f"} },
-			want:   "only printable ASCII",
-		},
-		"non-ASCII": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{"Browser/一"} },
-			want:   "only printable ASCII",
-		},
-		"duplicate": {
-			mutate: func(rule *Rule) { rule.UserAgent = []string{"Browser/1.0", "Browser/1.0"} },
-			want:   "duplicate value",
-		},
-	}
-
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			rule := newRule()
-			test.mutate(rule)
-			err := rule.Validate()
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("Validate() error = %v, want substring %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestUserAgentDisabledValues(t *testing.T) {
-	for name, field := range map[string]string{
-		"omitted": "",
-		"null":    `,"userAgent":null`,
-		"empty":   `,"userAgent":[]`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			body := `{"log":{"level":"info","path":""},"rules":[{"name":"tcp","listen":"127.0.0.1:8080","mode":"normal","targets":[{"address":"example.com:80"}]` + field + `}]}`
-			cfg, err := Load(writeConfig(t, body))
-			if err != nil {
-				t.Fatalf("Load() error = %v", err)
-			}
-			if len(cfg.Rules[0].UserAgent) != 0 {
-				t.Fatalf("UserAgent = %#v, want disabled", cfg.Rules[0].UserAgent)
-			}
-		})
 	}
 }
 

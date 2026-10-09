@@ -1032,15 +1032,12 @@ func TestHTTP3GenerationCancellationInterruptsDNSResolution(t *testing.T) {
 }
 
 func TestSOCKS5NormalUsesHTTP3Connect(t *testing.T) {
-	const (
-		banner    = "H3-READY\n"
-		userAgent = "Moto-H3-UA/1.0"
-	)
+	const banner = "H3-READY\n"
 	expectedAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("moto:secret"))
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.ProtoMajor != 3 || request.Method != http.MethodConnect ||
 			request.Host != "service.example:443" || request.Header.Get("Proxy-Authorization") != expectedAuth ||
-			request.Header.Get("User-Agent") != userAgent {
+			len(request.Header.Values("User-Agent")) != 1 || request.Header.Get("User-Agent") != connectProxyChromeUserAgent {
 			writer.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -1074,7 +1071,6 @@ func TestSOCKS5NormalUsesHTTP3Connect(t *testing.T) {
 		Timeout:             1_000,
 		MaxConnections:      16,
 		MaxConnectionsPerIP: 16,
-		UserAgent:           []string{userAgent},
 		Targets: []*config.Target{{
 			Address: endpoint,
 			ConnectProxy: &config.ConnectProxyConfig{
@@ -1091,7 +1087,7 @@ func TestSOCKS5NormalUsesHTTP3Connect(t *testing.T) {
 	defer clientSide.Close()
 	done := make(chan struct{})
 	go func() {
-		runtime.dispatch(context.Background(), serverSide, rule, userAgent)
+		runtime.dispatch(context.Background(), serverSide, rule)
 		close(done)
 	}()
 	performSOCKS5DomainRequest(t, clientSide, "service.example", 443)

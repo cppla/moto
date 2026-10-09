@@ -68,14 +68,18 @@ func TestHTTP3PhysicalCloseIntegration(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			observed.TakeAll()
-			endpoint, roots, peers, connectionCount := startHTTP3CloseObservationServer(t, wantAuthorization)
+			var serverIdleTimeout time.Duration
+			if test.idle {
+				serverIdleTimeout = 200 * time.Millisecond
+			}
+			endpoint, roots, peers, connectionCount := startHTTP3CloseObservationServer(t, wantAuthorization, serverIdleTimeout)
 			manager := newHTTP3ConnectManagerWithLogger(func(key http3ConnectTransportKey, owner context.Context) *http3.Transport {
 				transport := newHTTP3ConnectTransportWithOwner(key, owner)
 				transport.TLSClientConfig.RootCAs = roots
 				if test.idle {
-					// Production keepalive and timeout settings remain unchanged.
+					// Keep the default Chrome handshake and its 30s advertised timeout.
+					// The peer's shorter timeout bounds this test once keepalive stops.
 					transport.QUICConfig.KeepAlivePeriod = 0
-					transport.QUICConfig.MaxIdleTimeout = 200 * time.Millisecond
 				}
 				return transport
 			}, logger)
@@ -130,7 +134,14 @@ func TestHTTP3PhysicalCloseIntegration(t *testing.T) {
 				}
 			}
 
-			entry := waitHTTP3PhysicalCloseEntry(t, observed, endpoint)
+			observationBudget := 5 * time.Second
+			if test.idle {
+				// quic-go clamps the peer's advertised timeout to its 5s
+				// MinRemoteIdleTimeout. The default Chrome client therefore cannot
+				// report idle after only the peer fixture's local 200ms timeout.
+				observationBudget = 8 * time.Second
+			}
+			entry := waitHTTP3PhysicalCloseEntry(t, observed, endpoint, observationBudget)
 			fields := entry.ContextMap()
 			if fields["closeClass"] != test.wantClass || fields["closeOrigin"] != test.wantOrigin || entry.Level != test.wantLevel {
 				t.Fatalf("close classification: level=%s fields=%v", entry.Level, fields)
@@ -140,6 +151,20 @@ func TestHTTP3PhysicalCloseIntegration(t *testing.T) {
 			}
 			if age, ok := fields["connectionAgeMs"].(int64); !ok || age < 0 {
 				t.Fatalf("invalid connection age: %v", fields)
+			}
+			if test.idle {
+				if age := fields["connectionAgeMs"].(int64); age < 5000 {
+					t.Fatalf("Chrome client closed after %dms, before the negotiated 5s idle floor", age)
+				}
+				select {
+				case <-peer.Context().Done():
+				default:
+					t.Fatal("short-idle peer did not close its real QUIC connection")
+				}
+				var idleErr *quic.IdleTimeoutError
+				if cause := context.Cause(peer.Context()); !errors.As(cause, &idleErr) {
+					t.Fatalf("peer closure = %T, want its own idle timeout", cause)
+				}
 			}
 			wantActive := test.streams
 			if test.closeStreams {
@@ -186,9 +211,9 @@ func TestHTTP3PhysicalCloseIntegration(t *testing.T) {
 	}
 }
 
-func waitHTTP3PhysicalCloseEntry(t *testing.T, observed *observer.ObservedLogs, endpoint string) observer.LoggedEntry {
+func waitHTTP3PhysicalCloseEntry(t *testing.T, observed *observer.ObservedLogs, endpoint string, timeout time.Duration) observer.LoggedEntry {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		entries := observed.FilterField(zap.String("event", "h3_connection_closed")).
 			FilterField(zap.String("targetAddr", endpoint)).All()
@@ -201,7 +226,7 @@ func waitHTTP3PhysicalCloseEntry(t *testing.T, observed *observer.ObservedLogs, 
 	return observer.LoggedEntry{}
 }
 
-func startHTTP3CloseObservationServer(t *testing.T, authorization string) (string, *x509.CertPool, <-chan *quic.Conn, *atomic.Int64) {
+func startHTTP3CloseObservationServer(t *testing.T, authorization string, idleTimeout time.Duration) (string, *x509.CertPool, <-chan *quic.Conn, *atomic.Int64) {
 	t.Helper()
 	certificateSource := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	certificate := certificateSource.TLS.Certificates[0]
@@ -242,6 +267,9 @@ func startHTTP3CloseObservationServer(t *testing.T, authorization string) (strin
 				}
 			}
 		}),
+	}
+	if idleTimeout > 0 {
+		server.QUICConfig = &quic.Config{MaxIdleTimeout: idleTimeout}
 	}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(packetConn) }()

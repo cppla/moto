@@ -1,33 +1,39 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
-func TestConnectProxyBrowserProfileValidation(t *testing.T) {
-	for _, profile := range []string{"", BrowserProfileChrome} {
-		c := &ConnectProxyConfig{Protocols: []string{ConnectProxyH3, ConnectProxyH2}, BrowserProfile: profile}
+func TestConnectProxyWithoutBrowserProfileValidation(t *testing.T) {
+	for _, protocols := range [][]string{
+		nil,
+		{ConnectProxyH2},
+		{ConnectProxyH3},
+		{ConnectProxyH3, ConnectProxyH2},
+		{ConnectProxyH2, ConnectProxyH3},
+	} {
+		c := &ConnectProxyConfig{Protocols: protocols}
 		if err := c.Validate(); err != nil {
-			t.Fatalf("profile %q: %v", profile, err)
-		}
-	}
-	for _, profile := range []string{"Chrome", "chrome-latest", " chrome-133", "firefox"} {
-		c := &ConnectProxyConfig{BrowserProfile: profile}
-		if err := c.Validate(); err == nil {
-			t.Fatalf("unsupported profile %q accepted", profile)
+			t.Fatalf("protocols %q without a profile: %v", protocols, err)
 		}
 	}
 }
 
 func TestBrowserProfileStrictJSON(t *testing.T) {
-	valid := `{"rules":[{"targets":[{"connectProxy":{"protocols":["h3","h2"],"browserProfile":"chrome"}}]}]}`
+	valid := `{"rules":[{"targets":[{"connectProxy":{"protocols":["h3","h2"]}}]}]}`
 	if err := validateStrictConfigJSON([]byte(valid)); err != nil {
 		t.Fatal(err)
 	}
 	for _, input := range []string{
+		`{"rules":[{"targets":[{"connectProxy":{"browserProfile":"chrome"}}]}]}`,
+		`{"rules":[{"targets":[{"connectProxy":{"browserProfile":""}}]}]}`,
+		`{"rules":[{"targets":[{"connectProxy":{"browserProfile":null}}]}]}`,
 		`{"rules":[{"targets":[{"connectProxy":{"BrowserProfile":"chrome"}}]}]}`,
 		`{"rules":[{"targets":[{"connectProxy":{"browserProfile":"chrome","browserProfile":""}}]}]}`,
 	} {
-		if err := validateStrictConfigJSON([]byte(input)); err == nil {
-			t.Fatal("ambiguous profile field accepted")
+		if err := validateStrictConfigJSON([]byte(input)); err == nil || !strings.Contains(strings.ToLower(err.Error()), "browserprofile") {
+			t.Fatalf("removed profile field must be rejected explicitly: %v", err)
 		}
 	}
 }

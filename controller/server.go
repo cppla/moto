@@ -416,7 +416,7 @@ func (s *Server) acceptLoop(ctx context.Context, state *listenerState) error {
 			metricConnectionAccepted(rule.Name, rule.Mode)
 			metricConnectionActive(rule.Name, rule.Mode, 1)
 			defer metricConnectionActive(rule.Name, rule.Mode, -1)
-			generation.runtime.dispatch(connectionCtx, preparedConn, rule, binding.connectProxyUserAgent)
+			generation.runtime.dispatch(connectionCtx, preparedConn, rule)
 		}(clientIP)
 	}
 }
@@ -562,7 +562,7 @@ func (s *Server) releaseGlobal() {
 	}
 }
 
-func (runtime *routingRuntime) dispatch(ctx context.Context, conn net.Conn, rule *config.Rule, userAgent string) {
+func (runtime *routingRuntime) dispatch(ctx context.Context, conn net.Conn, rule *config.Rule) {
 	if rule != nil && rule.Protocol == config.ProtocolSOCKS5 {
 		client, err := prepareSOCKS5Client(conn, rule)
 		if err != nil {
@@ -574,7 +574,6 @@ func (runtime *routingRuntime) dispatch(ctx context.Context, conn net.Conn, rule
 		}
 		conn = client
 		ctx = withConnectDestination(ctx, client.destination)
-		ctx = withConnectProxyUserAgent(ctx, userAgent)
 	} else if rule != nil && rule.Protocol == config.ProtocolHTTP {
 		client, err := prepareHTTPConnectClient(conn, rule)
 		if err != nil {
@@ -586,7 +585,6 @@ func (runtime *routingRuntime) dispatch(ctx context.Context, conn net.Conn, rule
 		}
 		conn = client
 		ctx = withConnectDestination(ctx, client.destination)
-		ctx = withConnectProxyUserAgent(ctx, userAgent)
 	}
 	switch rule.Mode {
 	case "normal":

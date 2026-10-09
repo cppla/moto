@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"net/netip"
 	"slices"
 	"strings"
@@ -42,7 +43,6 @@ func TestLoadHTTPConnectConfiguration(t *testing.T) {
 			"mode":"boost",
 			"protocol":"http",
 			"allowlist":["127.0.0.0/8","::1/128"],
-			"userAgent":["Browser/1.0"],
 			"healthCheck":{"type":"tcp"},
 			"targets":[{
 				"address":"proxy.example.com:443",
@@ -60,9 +60,6 @@ func TestLoadHTTPConnectConfiguration(t *testing.T) {
 	rule := cfg.Rules[0]
 	if rule.Protocol != ProtocolHTTP || rule.HealthCheck.Type != HealthCheckTCP {
 		t.Fatalf("protocol/health = %q/%q, want http/tcp", rule.Protocol, rule.HealthCheck.Type)
-	}
-	if !slices.Equal(rule.UserAgent, []string{"Browser/1.0"}) {
-		t.Fatalf("userAgent = %q", rule.UserAgent)
 	}
 	proxy := rule.Targets[0].ConnectProxy
 	if !slices.Equal(proxy.Protocols, []string{ConnectProxyH3, ConnectProxyH2}) {
@@ -84,7 +81,6 @@ func TestConnectProtocolCompatibleModesAndTransports(t *testing.T) {
 					rule := newConnectProtocolTestRule(protocol)
 					rule.Mode = mode
 					rule.HealthCheck = &HealthCheckConfig{Type: HealthCheckTCP}
-					rule.UserAgent = []string{"Browser/1.0"}
 					rule.Targets[0].ConnectProxy.Protocols = slices.Clone(transports)
 					if err := rule.Validate(); err != nil {
 						t.Fatalf("Validate() error = %v", err)
@@ -98,6 +94,40 @@ func TestConnectProtocolCompatibleModesAndTransports(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestLoadConnectConfigurationWithoutUserAgent(t *testing.T) {
+	for _, protocol := range []string{ProtocolSOCKS5, ProtocolHTTP} {
+		for _, transports := range [][]string{nil, {ConnectProxyH2}, {ConnectProxyH3}, {ConnectProxyH3, ConnectProxyH2}, {ConnectProxyH2, ConnectProxyH3}} {
+			t.Run(protocol+"/"+strings.Join(transports, ","), func(t *testing.T) {
+				rule := newConnectProtocolTestRule(protocol)
+				rule.HealthCheck = &HealthCheckConfig{Type: HealthCheckTCP}
+				rule.Targets[0].ConnectProxy.Protocols = slices.Clone(transports)
+				rule.Targets[0].ConnectProxy.BasicAuth = &BasicAuthConfig{Username: "fixture-user", Password: "fixture-password"}
+				body, err := json.Marshal(&Config{Log: LogConfig{Level: "info"}, Rules: []*Rule{rule}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				cfg, err := Load(writeConfig(t, string(body)))
+				if err != nil {
+					t.Fatalf("Load() without removed fields: %v", err)
+				}
+				loaded := cfg.Rules[0]
+				proxy := loaded.Targets[0].ConnectProxy
+				want := transports
+				if len(want) == 0 {
+					want = []string{ConnectProxyH2}
+				}
+				if loaded.Protocol != protocol || !slices.Equal(proxy.Protocols, want) {
+					t.Fatalf("loaded protocols = %q/%q, want %q/%q", loaded.Protocol, proxy.Protocols, protocol, want)
+				}
+				if loaded.HealthCheck == nil || loaded.HealthCheck.Type != HealthCheckTCP ||
+					proxy.BasicAuth == nil || *proxy.BasicAuth != *rule.Targets[0].ConnectProxy.BasicAuth {
+					t.Fatal("loading without a custom UA lost health checks or upstream Basic Auth")
+				}
+			})
 		}
 	}
 }
@@ -117,8 +147,6 @@ func TestHTTPConnectValidation(t *testing.T) {
 		"unknown inbound":       {func(r *Rule) { r.Protocol = "https" }, `invalid protocol "https"`},
 		"unknown upstream":      {func(r *Rule) { r.Targets[0].ConnectProxy.Protocols = []string{"http"} }, `invalid protocol "http"`},
 		"duplicate upstream":    {func(r *Rule) { r.Targets[0].ConnectProxy.Protocols = []string{ConnectProxyH2, ConnectProxyH2} }, "duplicate protocol"},
-		"invalid user agent":    {func(r *Rule) { r.UserAgent = []string{"Browser\r\nInjected"} }, "only printable ASCII"},
-		"empty user agent":      {func(r *Rule) { r.UserAgent = []string{""} }, "length must be between"},
 		"invalid server name":   {func(r *Rule) { r.Targets[0].ConnectProxy.ServerName = "https://proxy.example.com" }, "invalid serverName"},
 		"invalid upstream auth": {func(r *Rule) { r.Targets[0].ConnectProxy.BasicAuth = &BasicAuthConfig{Username: "bad:user"} }, "must not contain ':'"},
 	}

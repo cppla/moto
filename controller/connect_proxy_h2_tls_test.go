@@ -24,13 +24,15 @@ import (
 	xhttp2 "moto/internal/browserhttp2"
 )
 
-func TestHTTP2TLSClientHelloUsesChromeProfile(t *testing.T) {
+func TestHTTP2TLSClientHelloAndHeaderUseFixedChromeIdentity(t *testing.T) {
 	const (
 		destination = "clienthello-destination-marker.example:443"
 		username    = "clienthello-user-marker"
 		password    = "clienthello-password-marker"
 	)
+	receivedUA := make(chan string, 1)
 	proxy, captures := newHTTP2TLSCaptureServer(t, []string{"h2"}, func(writer http.ResponseWriter, request *http.Request) {
+		receivedUA <- request.Header.Get("User-Agent")
 		writer.WriteHeader(http.StatusOK)
 		writer.(http.Flusher).Flush()
 		_, _ = io.Copy(io.Discard, request.Body)
@@ -49,6 +51,14 @@ func TestHTTP2TLSClientHelloUsesChromeProfile(t *testing.T) {
 		t.Fatalf("dial fingerprinted HTTP/2 CONNECT: %v", err)
 	}
 	defer connection.Close()
+	select {
+	case userAgent := <-receivedUA:
+		if userAgent != connectProxyChromeUserAgent {
+			t.Fatalf("upstream User-Agent = %q, want fixed Chrome identity", userAgent)
+		}
+	case <-ctx.Done():
+		t.Fatal("upstream did not observe the fixed User-Agent")
+	}
 
 	captured := waitForHTTP2TLSCapture(t, captures)
 	probe := capturedHTTP2ClientHello(t, captured)
@@ -73,158 +83,29 @@ func TestHTTP2TLSClientHelloUsesChromeProfile(t *testing.T) {
 	}
 }
 
-func TestHTTP2TLSProfileForUserAgent(t *testing.T) {
-	tests := []struct {
-		name      string
-		userAgent string
-		want      http2TLSClientHelloProfile
-	}{
-		{name: "empty", want: http2TLSProfileChrome133},
-		{name: "unknown", userAgent: "Moto-Test/1.0", want: http2TLSProfileChrome133},
-		{
-			name:      "desktop Chrome",
-			userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/133.0.0.0 Safari/537.36",
-			want:      http2TLSProfileChrome133,
-		},
-		{
-			name:      "Android Chrome",
-			userAgent: "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/133.0.0.0 Mobile Safari/537.36",
-			want:      http2TLSProfileChrome133,
-		},
-		{
-			name:      "modern Edge before embedded Chrome",
-			userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
-			want:      http2TLSProfileChrome133,
-		},
-		{
-			name:      "Firefox",
-			userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-			want:      http2TLSProfileFirefox120,
-		},
-		{
-			name:      "pure macOS Safari",
-			userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_1) AppleWebKit/605.1.15 Version/16.0 Safari/605.1.15",
-			want:      http2TLSProfileSafari160,
-		},
-		{
-			name:      "iPhone Safari before Safari",
-			userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 Version/14.0 Mobile/15E148 Safari/604.1",
-			want:      http2TLSProfileIOS14,
-		},
-		{
-			name:      "iPad Chrome",
-			userAgent: "Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X) AppleWebKit/605.1.15 CriOS/133.0.0.0 Mobile/15E148 Safari/604.1",
-			want:      http2TLSProfileIOS14,
-		},
-		{
-			name:      "iOS Edge",
-			userAgent: "Mozilla/5.0 AppleWebKit/605.1.15 EdgiOS/133.0 Mobile/15E148 Safari/605.1.15",
-			want:      http2TLSProfileIOS14,
-		},
+func TestHTTP2FixedChromeIdentityReusesPoolAndIsolatesEndpointAndServerName(t *testing.T) {
+	type requestIdentity struct {
+		server     int
+		peer       string
+		serverName string
+		userAgent  string
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := http2TLSProfileForUserAgent(test.userAgent); got != test.want {
-				t.Fatalf("profile for %q = %d, want %d", test.userAgent, got, test.want)
+	requests := make(chan requestIdentity, 8)
+	newProxy := func(server int) *httptest.Server {
+		return newHTTP2ConnectTestServer(t, func(writer http.ResponseWriter, request *http.Request) {
+			requests <- requestIdentity{
+				server: server, peer: request.RemoteAddr,
+				serverName: request.TLS.ServerName, userAgent: request.Header.Get("User-Agent"),
 			}
+			writer.WriteHeader(http.StatusOK)
+			writer.(http.Flusher).Flush()
+			_, _ = io.Copy(io.Discard, request.Body)
 		})
 	}
-}
-
-func TestHTTP2TLSProfileClientHelloIDs(t *testing.T) {
-	for _, test := range []struct {
-		profile http2TLSClientHelloProfile
-		want    utls.ClientHelloID
-	}{
-		{profile: http2TLSProfileChrome133, want: utls.HelloChrome_133},
-		{profile: http2TLSProfileFirefox120, want: utls.HelloFirefox_120},
-		{profile: http2TLSProfileSafari160, want: utls.HelloSafari_16_0},
-		{profile: http2TLSProfileIOS14, want: utls.HelloIOS_14},
-	} {
-		if got := test.profile.clientHelloID(); !reflect.DeepEqual(got, test.want) {
-			t.Fatalf("profile %d ClientHello ID = %#v, want %#v", test.profile, got, test.want)
-		}
-	}
-}
-
-func TestHTTP2TLSClientHelloProfilesOnWire(t *testing.T) {
-	tests := []struct {
-		name      string
-		userAgent string
-		profile   http2TLSClientHelloProfile
-	}{
-		{
-			name:      "Chrome 133",
-			userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/133.0.0.0 Safari/537.36",
-			profile:   http2TLSProfileChrome133,
-		},
-		{
-			name:      "Firefox 120",
-			userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-			profile:   http2TLSProfileFirefox120,
-		},
-		{
-			name:      "Safari 16",
-			userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_1) AppleWebKit/605.1.15 Version/16.0 Safari/605.1.15",
-			profile:   http2TLSProfileSafari160,
-		},
-		{
-			name:      "iOS 14",
-			userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 Version/14.0 Mobile/15E148 Safari/604.1",
-			profile:   http2TLSProfileIOS14,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			proxy, captures := newHTTP2TLSCaptureServer(t, []string{"h2"}, func(writer http.ResponseWriter, request *http.Request) {
-				writer.WriteHeader(http.StatusOK)
-				writer.(http.Flusher).Flush()
-				_, _ = io.Copy(io.Discard, request.Body)
-			})
-			manager := newHTTP2ConnectTestManager(proxy)
-			t.Cleanup(manager.closeIdle)
-			target := http2ConnectTestTarget(proxy, "", "")
-			target.ConnectProxy.ServerName = "example.com"
-
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			ctx = withConnectProxyUserAgent(ctx, test.userAgent)
-			connection, err := manager.dial(ctx, target, "profile-destination.example:443")
-			if err != nil {
-				t.Fatalf("dial HTTP/2 CONNECT with %s profile: %v", test.name, err)
-			}
-			defer connection.Close()
-
-			captured := waitForHTTP2TLSCapture(t, captures)
-			probe := capturedHTTP2ClientHello(t, captured)
-			fingerprint, err := (&utls.Fingerprinter{AllowBluntMimicry: true}).FingerprintClientHello(probe.Raw)
-			if err != nil {
-				t.Fatalf("fingerprint %s ClientHello: %v", test.name, err)
-			}
-			want, err := utls.UTLSIdToSpec(test.profile.clientHelloID())
-			if err != nil {
-				t.Fatalf("load %s uTLS profile: %v", test.name, err)
-			}
-			if !reflect.DeepEqual(fingerprint.CipherSuites, want.CipherSuites) {
-				t.Fatalf("%s ClientHello cipher suites = %#v, want %#v", test.name, fingerprint.CipherSuites, want.CipherSuites)
-			}
-			if wantALPN := []string{"h2", "http/1.1"}; !reflect.DeepEqual(probe.ALPNProtocols, wantALPN) {
-				t.Fatalf("%s ClientHello ALPN = %q, want %q", test.name, probe.ALPNProtocols, wantALPN)
-			}
-		})
-	}
-}
-
-func TestHTTP2TLSTransportPoolIsolatedBySelectedIdentity(t *testing.T) {
-	proxy := newHTTP2ConnectTestServer(t, func(writer http.ResponseWriter, request *http.Request) {
-		writer.WriteHeader(http.StatusOK)
-		writer.(http.Flusher).Flush()
-		_, _ = io.Copy(io.Discard, request.Body)
-	})
+	firstProxy, secondProxy := newProxy(0), newProxy(1)
 	roots := x509.NewCertPool()
-	roots.AddCert(proxy.Certificate())
+	roots.AddCert(firstProxy.Certificate())
+	roots.AddCert(secondProxy.Certificate())
 
 	var (
 		createdMu sync.Mutex
@@ -235,55 +116,64 @@ func TestHTTP2TLSTransportPoolIsolatedBySelectedIdentity(t *testing.T) {
 		created = append(created, key)
 		createdMu.Unlock()
 		transport := newHTTP2ConnectTransport(key)
+		if !transport.ChromeProfile {
+			t.Error("endpoint pool disabled the fixed Chrome HTTP/2 profile")
+		}
 		transport.TLSClientConfig.RootCAs = roots
 		return transport
 	})
 	t.Cleanup(manager.closeIdle)
-	target := http2ConnectTestTarget(proxy, "", "")
-
-	desktopChrome := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/133.0.0.0 Safari/537.36"
-	identities := []string{
-		desktopChrome,
-		desktopChrome,
-		"Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/133.0.0.0 Mobile Safari/537.36",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-	}
-	for _, userAgent := range identities {
+	first := http2ConnectTestTarget(firstProxy, "", "")
+	firstWithDNSName := http2ConnectTestTarget(firstProxy, "", "")
+	firstWithDNSName.ConnectProxy.ServerName = "example.com"
+	second := http2ConnectTestTarget(secondProxy, "", "")
+	targets := []*config.Target{first, first, firstWithDNSName, second}
+	observed := make([]requestIdentity, 0, len(targets))
+	for index, target := range targets {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		ctx = withConnectProxyUserAgent(ctx, userAgent)
-		connection, err := manager.dial(ctx, target, "pool-destination.example:443")
-		cancel()
+		// Distinct destinations still reuse the same endpoint/SNI transport.
+		destination := []string{"first.example:443", "second.example:443", "third.example:443", "fourth.example:443"}[index]
+		connection, err := manager.dial(ctx, target, destination)
 		if err != nil {
-			t.Fatalf("dial HTTP/2 CONNECT for identity %q: %v", userAgent, err)
+			cancel()
+			t.Fatalf("dial fixed-identity tunnel %d: %v", index, err)
 		}
-		if err := connection.Close(); err != nil {
-			t.Fatalf("close HTTP/2 CONNECT for identity %q: %v", userAgent, err)
+		defer connection.Close()
+		select {
+		case request := <-requests:
+			observed = append(observed, request)
+			if request.userAgent != connectProxyChromeUserAgent {
+				t.Errorf("tunnel %d User-Agent = %q, want the fixed Chrome value", index, request.userAgent)
+			}
+		case <-ctx.Done():
+			cancel()
+			t.Fatal("upstream did not observe fixed-identity CONNECT")
 		}
+		cancel()
 	}
 
 	createdMu.Lock()
 	gotCreated := append([]http2ConnectTransportKey(nil), created...)
 	createdMu.Unlock()
-	if len(gotCreated) != 4 {
-		t.Fatalf("created H2 identity pools = %d, want 4 for four distinct UA/profile identities: %#v", len(gotCreated), gotCreated)
+	wantCreated := []http2ConnectTransportKey{
+		{address: first.Address, serverName: first.ConnectProxy.ServerName},
+		{address: firstWithDNSName.Address, serverName: firstWithDNSName.ConnectProxy.ServerName},
+		{address: second.Address, serverName: second.ConnectProxy.ServerName},
 	}
-	for _, key := range gotCreated {
-		if key.userAgent == "" {
-			t.Fatalf("created H2 pool without selected User-Agent: %#v", key)
-		}
-		if got := http2TLSProfileForUserAgent(key.userAgent); got != key.tlsProfile {
-			t.Fatalf("pool profile for %q = %d, want mapped %d", key.userAgent, key.tlsProfile, got)
-		}
+	if !reflect.DeepEqual(gotCreated, wantCreated) {
+		t.Fatalf("created endpoint/SNI pools = %#v, want %#v", gotCreated, wantCreated)
 	}
-	if gotCreated[0].tlsProfile != http2TLSProfileChrome133 ||
-		gotCreated[1].tlsProfile != http2TLSProfileChrome133 ||
-		gotCreated[2].tlsProfile != http2TLSProfileChrome133 {
-		t.Fatalf("Chrome, Android Chrome, and Edge profiles = %d/%d/%d, want Chrome 133",
-			gotCreated[0].tlsProfile, gotCreated[1].tlsProfile, gotCreated[2].tlsProfile)
+	if observed[0].server != 0 || observed[1].server != 0 || observed[2].server != 0 || observed[3].server != 1 {
+		t.Fatalf("wrong upstream endpoint selection: %+v", observed)
 	}
-	if gotCreated[3].tlsProfile != http2TLSProfileFirefox120 {
-		t.Fatalf("Firefox profile = %d, want Firefox 120", gotCreated[3].tlsProfile)
+	if observed[0].peer != observed[1].peer {
+		t.Fatal("fixed-identity tunnels to the same endpoint/SNI did not reuse physical TLS")
+	}
+	if observed[0].peer == observed[2].peer {
+		t.Fatal("different TLS server names shared a physical connection")
+	}
+	if observed[0].serverName != "" || observed[2].serverName != "example.com" {
+		t.Fatalf("TLS SNI isolation lost: IP-name=%q DNS-name=%q", observed[0].serverName, observed[2].serverName)
 	}
 }
 

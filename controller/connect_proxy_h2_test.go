@@ -477,17 +477,14 @@ func TestHTTP2ConnectRejectsBadBasicAuthWithoutCredentialLeak(t *testing.T) {
 }
 
 func TestSOCKS5NormalUsesHTTP2ConnectAndRepliesAfterProxyAcceptance(t *testing.T) {
-	const (
-		banner    = "H2-READY\n"
-		userAgent = "Moto-H2-UA/1.0"
-	)
+	const banner = "H2-READY\n"
 	proxy := newHTTP2ConnectTestServer(t, func(w http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Proxy-Authorization") == "" {
 			w.WriteHeader(http.StatusProxyAuthRequired)
 			return
 		}
-		if got := request.Header.Get("User-Agent"); got != userAgent {
-			t.Errorf("User-Agent = %q, want %q", got, userAgent)
+		if got := request.Header.Get("User-Agent"); got != connectProxyChromeUserAgent {
+			t.Errorf("User-Agent = %q, want %q", got, connectProxyChromeUserAgent)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -500,16 +497,12 @@ func TestSOCKS5NormalUsesHTTP2ConnectAndRepliesAfterProxyAcceptance(t *testing.T
 	t.Cleanup(runtime.stopBackground)
 	installHTTP2ConnectTestManager(runtime, proxy)
 	rule := http2ConnectSOCKS5Rule(t, config.ModeNormal, proxy, "moto", "secret")
-	rule.UserAgent = []string{userAgent}
-	if err := rule.Validate(); err != nil {
-		t.Fatalf("rule.Validate() with User-Agent: %v", err)
-	}
 
 	serverSide, clientSide := net.Pipe()
 	defer clientSide.Close()
 	done := make(chan struct{})
 	go func() {
-		runtime.dispatch(context.Background(), serverSide, rule, userAgent)
+		runtime.dispatch(context.Background(), serverSide, rule)
 		close(done)
 	}()
 	performSOCKS5DomainRequest(t, clientSide, "service.example", 443)
@@ -549,7 +542,7 @@ func TestSOCKS5DoesNotAcknowledgeRejectedHTTP2Connect(t *testing.T) {
 	defer clientSide.Close()
 	done := make(chan struct{})
 	go func() {
-		runtime.dispatch(context.Background(), serverSide, rule, "")
+		runtime.dispatch(context.Background(), serverSide, rule)
 		close(done)
 	}()
 	performSOCKS5DomainRequest(t, clientSide, "service.example", 443)

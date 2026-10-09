@@ -196,7 +196,6 @@ TCP 是字节流，不保证一次读取就是完整数据包。Moto 会增量�
 | `hedge` | 关闭 | 仅用于至少两个唯一目标的 `boost`；空对象默认延迟范围 25–250 ms，且 `maxDelay` 必须小于规则 `timeout` |
 | `healthCheck` | 关闭 | 可选 TCP 或明文 HTTP 主动探测，达到阈值后暂时排除目标 |
 | `proxyProtocol` | 关闭 | 从可信 CIDR 接收 PROXY v1/v2，或向上游发送 v1/v2 |
-| `userAgent` | 缺省 | 用于 `socks5` / `http` 规则；Moto 启动时从非空数组中为每条规则随机选择一个上游身份，并在本次进程运行期间保持稳定 |
 | `allowlist` | 空 | CIDR 来源白名单；空值允许所有有效地址，CONNECT 入站使用非 loopback 监听时必须显式配置非空白名单 |
 | `blacklist` | 空 | 兼容旧配置的精确 IP 拒绝表 |
 | `maxConnections` | `4096` | 单规则连接上限 |
@@ -218,10 +217,6 @@ SOCKS5 到 H3/H2 CONNECT 的完整规则已经整合到 [config/setting.json](co
   "hedge": { "minDelay": 25, "maxDelay": 250 },
   "healthCheck": { "type": "tcp", "interval": 10000, "timeout": 2000 },
   "allowlist": ["127.0.0.0/8", "::1/128"],
-  "userAgent": [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0"
-  ],
   "targets": [
     {
       "address": "proxy-a.example.com:443",
@@ -259,7 +254,7 @@ SOCKS5 和 HTTP CONNECT 模式使用独立的协议连接管理，因此必须�
 
 `protocol: "http"` 提供本地 HTTP/1.1 CONNECT 入口，可用于通过 HTTP 代理访问 HTTPS 的客户端。它只支持 CONNECT 隧道，不支持普通 HTTP GET 等正向代理请求。建立隧道后，目标 HTTPS 的 TLS 流量保持加密，Moto 不解密目标网站内容。
 
-以下规则放入 `rules` 数组即可；上游地址和认证信息按实际环境填写，`connectProxy`、选路模式、H3/H2 回退和 `userAgent` 与 SOCKS5 入口一致：
+以下规则放入 `rules` 数组即可；上游地址和认证信息按实际环境填写，`connectProxy`、选路模式和 H3/H2 回退与 SOCKS5 入口一致：
 
 ```json
 {
@@ -291,13 +286,13 @@ HTTPS_PROXY=http://127.0.0.1:9006 curl https://example.com
 
 HTTP 入站不提供用户名/密码认证；`connectProxy.basicAuth` 仅用于 Moto 向上游代理认证。建议保持本地监听；非 loopback 监听必须配置明确的来源 `allowlist`，并配合防火墙限制访问，避免成为开放代理。
 
-### 可选的 Chrome 风格连接
+### Chrome 风格连接
 
-在目标的 `connectProxy` 中设置 `"browserProfile": "chrome"` 可启用实验性兼容模板；不写此字段则保留原有行为，支持 SOCKS5 和 HTTP CONNECT 入口。
+SOCKS5 和 HTTP CONNECT 入口的 H2/H3 上游固定启用 Chrome 风格兼容模板，无需配置开关。旧配置中的 `browserProfile` 和 `userAgent` 字段均需删除，否则严格配置校验会拒绝启动。
 
 H2 对齐 TLS 握手及部分 HTTP/2 协议特征；H3 对齐 QUIC/TLS 握手特征，**尚未对齐 HTTP/3 SETTINGS 和 QPACK 动态压缩行为**。这不是完整浏览器，也不保证流量不可识别；不会关闭证书校验或隐藏上游可见的 CONNECT 请求。模板随 Moto 版本固定，不代表自动跟随最新 Chrome。
 
-未配置 `userAgent` 时该模板提供 Chrome UA；显式配置的 UA 仍优先，请保持浏览器类型一致。建议先在自己的上游验证兼容性，再用于日常流量。
+上游 CONNECT 请求始终使用内置 Chrome User-Agent，不提供自定义或覆盖配置。升级后建议先验证自己的上游兼容性。
 
 <details>
 <summary><strong>TLS、健康检查与 PROXY protocol 示例</strong></summary>

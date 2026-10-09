@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"io"
-	"moto/config"
 	"net/http"
 	"strings"
 	"sync"
@@ -45,7 +44,6 @@ func TestHTTP2BrowserProfileOversizeResponsePreservesSibling(t *testing.T) {
 	manager := newHTTP2ConnectTestManager(proxy)
 	defer manager.closeIdle()
 	target := http2ConnectTestTarget(proxy, "", "")
-	target.ConnectProxy.BrowserProfile = config.BrowserProfileChrome
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	first, err := manager.dial(ctx, target, "healthy.example:443")
@@ -84,16 +82,16 @@ func TestHTTP2BrowserProfileOversizeResponsePreservesSibling(t *testing.T) {
 	}
 }
 
-func TestHTTP2BrowserProfileIsExplicitAndCopiedToPhysicalTransport(t *testing.T) {
-	defaultTransport := newHTTP2ConnectTransport(http2ConnectTransportKey{})
-	if defaultTransport.ChromeProfile {
-		t.Fatal("legacy default enabled browser HTTP/2 profile")
+func TestHTTP2BrowserProfileAlwaysEnabledAndCopiedToPhysicalTransport(t *testing.T) {
+	transport := newHTTP2ConnectTransport(http2ConnectTransportKey{})
+	pool := newHTTP2ConnectConnPool(transport)
+	physical := pool.physicalTransport(transport.TLSClientConfig, nil)
+	if !transport.ChromeProfile || !physical.ChromeProfile {
+		t.Fatal("default Chrome profile lost in physical transport")
 	}
-	profileTransport := newHTTP2ConnectTransport(http2ConnectTransportKey{browserProfile: config.BrowserProfileChrome})
-	pool := newHTTP2ConnectConnPool(profileTransport)
-	physical := pool.physicalTransport(profileTransport.TLSClientConfig, nil)
-	if !profileTransport.ChromeProfile || !physical.ChromeProfile {
-		t.Fatal("explicit profile was lost in physical connection transport")
+	if physical.MaxHeaderListSize != http2ConnectMaxResponseHeaders ||
+		physical.ReadIdleTimeout != http2ConnectReadIdleTimeout || physical.PingTimeout != http2ConnectPingTimeout {
+		t.Fatal("physical Chrome transport lost response limits or liveness timeouts")
 	}
 }
 
@@ -118,7 +116,6 @@ func TestHTTP2BrowserProfileBidirectionalPayloadCrossesBothWindows(t *testing.T)
 	manager := newHTTP2ConnectTestManager(proxy)
 	defer manager.closeIdle()
 	target := http2ConnectTestTarget(proxy, "", "")
-	target.ConnectProxy.BrowserProfile = config.BrowserProfileChrome
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	connection, err := manager.dial(ctx, target, "large.example:443")

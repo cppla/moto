@@ -66,8 +66,6 @@ const (
 	maxTLSMatchers      = 64
 	maxConfigFileBytes  = 16 << 20
 	maxBasicCredential  = 4 << 10
-	maxUserAgents       = 64
-	maxUserAgentBytes   = 1024
 )
 
 var validLogLevels = map[string]struct{}{
@@ -137,15 +135,10 @@ type Target struct {
 // one forward-proxy endpoint. HTTP/3 may be listed ahead of HTTP/2 so a runtime
 // with H3 support can fall back without changing the routing configuration.
 type ConnectProxyConfig struct {
-	Protocols      []string         `json:"protocols"`
-	ServerName     string           `json:"serverName,omitempty"`
-	BasicAuth      *BasicAuthConfig `json:"basicAuth,omitempty"`
-	BrowserProfile string           `json:"browserProfile,omitempty"`
+	Protocols  []string         `json:"protocols"`
+	ServerName string           `json:"serverName,omitempty"`
+	BasicAuth  *BasicAuthConfig `json:"basicAuth,omitempty"`
 }
-
-// BrowserProfileChrome is an explicit, version-pinned compatibility profile.
-// It does not claim to reproduce all browser behavior or conceal proxy use.
-const BrowserProfileChrome = "chrome"
 
 // BasicAuthConfig is sent only as an outbound Proxy-Authorization header. It
 // is never used for inbound SOCKS or HTTP authentication.
@@ -203,7 +196,6 @@ type Rule struct {
 	HealthCheck         *HealthCheckConfig   `json:"healthCheck,omitempty"`
 	Hedge               *HedgeConfig         `json:"hedge,omitempty"`
 	ProxyProtocol       *ProxyProtocolConfig `json:"proxyProtocol,omitempty"`
-	UserAgent           []string             `json:"userAgent,omitempty"`
 
 	allowPrefixes []netip.Prefix
 	blockedIPs    map[netip.Addr]struct{}
@@ -449,14 +441,6 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 	if _, ok := validProtocols[r.Protocol]; !ok {
 		return fmt.Errorf("invalid protocol %q", r.Protocol)
 	}
-	if len(r.UserAgent) != 0 {
-		if !IsConnectProtocol(r.Protocol) {
-			return errors.New("userAgent is only valid for protocol socks5 or http")
-		}
-		if err := validateUserAgents(r.UserAgent); err != nil {
-			return err
-		}
-	}
 	if IsConnectProtocol(r.Protocol) {
 		if r.Mode == ModeRegex || r.Mode == ModeTLS {
 			return fmt.Errorf("protocol %q is not compatible with mode %q", r.Protocol, r.Mode)
@@ -621,38 +605,10 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 	return nil
 }
 
-func validateUserAgents(userAgents []string) error {
-	if len(userAgents) > maxUserAgents {
-		return fmt.Errorf("userAgent must not contain more than %d entries", maxUserAgents)
-	}
-	seen := make(map[string]struct{}, len(userAgents))
-	for index, userAgent := range userAgents {
-		if len(userAgent) == 0 || len(userAgent) > maxUserAgentBytes {
-			return fmt.Errorf("userAgent[%d] length must be between 1 and %d bytes", index, maxUserAgentBytes)
-		}
-		if userAgent != strings.TrimSpace(userAgent) {
-			return fmt.Errorf("userAgent[%d] must not have leading or trailing whitespace", index)
-		}
-		for _, value := range []byte(userAgent) {
-			if value < 0x20 || value > 0x7e {
-				return fmt.Errorf("userAgent[%d] must contain only printable ASCII", index)
-			}
-		}
-		if _, duplicate := seen[userAgent]; duplicate {
-			return fmt.Errorf("userAgent[%d]: duplicate value", index)
-		}
-		seen[userAgent] = struct{}{}
-	}
-	return nil
-}
-
 // Validate normalizes and checks an ordered CONNECT transport preference.
 func (c *ConnectProxyConfig) Validate() error {
 	if c == nil {
 		return errors.New("connect proxy config is nil")
-	}
-	if c.BrowserProfile != "" && c.BrowserProfile != BrowserProfileChrome {
-		return fmt.Errorf("unsupported browserProfile %q (want %q or omitted)", c.BrowserProfile, BrowserProfileChrome)
 	}
 	if len(c.Protocols) == 0 {
 		c.Protocols = []string{ConnectProxyH2}

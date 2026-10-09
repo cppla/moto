@@ -23,8 +23,7 @@ type ReloadResult struct {
 }
 
 type ruleBinding struct {
-	rule                  *config.Rule
-	connectProxyUserAgent string
+	rule *config.Rule
 }
 
 // routingGeneration is immutable after publication except for its lease gate.
@@ -108,11 +107,7 @@ func newRoutingGeneration(
 			generation.retire()
 			return nil, fmt.Errorf("rules[%d]: duplicate listener key %q", index, key)
 		}
-		binding := &ruleBinding{rule: rule}
-		if config.IsConnectProtocol(rule.Protocol) {
-			binding.connectProxyUserAgent = selectConnectProxyUserAgent(rule.UserAgent, "")
-		}
-		generation.bindings[key] = binding
+		generation.bindings[key] = &ruleBinding{rule: rule}
 	}
 	processMetrics.registerRules(clone)
 	generation.metricsRegistered = true

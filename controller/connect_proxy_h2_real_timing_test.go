@@ -170,10 +170,6 @@ func TestHTTP2RealRoutePingTiming(t *testing.T) {
 		result.PayloadBytes = payload.Load()
 		result.Wire = stats.snapshot()
 	}()
-	// A fixed configured UA makes profile comparisons use the same TLS style.
-	if len(selected.UserAgent) > 0 {
-		ctx = withConnectProxyUserAgent(ctx, selected.UserAgent[0])
-	}
 	open := func() (net.Conn, *tls.Conn, error) {
 		setup, stop := context.WithTimeout(ctx, 12*time.Second)
 		defer stop()

@@ -191,7 +191,7 @@ func runSequentialConnectProxyCase(t *testing.T, mode string, test sequentialCon
 			done <- err
 			return
 		}
-		runtime.dispatch(ctx, accepted, rule, "")
+		runtime.dispatch(ctx, accepted, rule)
 		done <- nil
 	}()
 	client, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
