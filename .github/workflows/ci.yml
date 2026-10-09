@@ -30,21 +30,14 @@ jobs:
         run: make mod-check
       - name: Test
         run: make test
-      - name: Check captured browser profile regression
-        run: make browser-profile-check
-      - name: Retain browser comparison reports
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: browser-profile-reports
-          path: |
-            output/playwright/**/comparison.json
-            output/playwright/**/comparison.log
-            output/playwright/**/summary.json
-            output/playwright/**/server.log
-            output/playwright/**/build.log
-          if-no-files-found: ignore
-          retention-days: 14
+      - name: Check transport regression
+        run: |
+          if make browser-profile-check >"$RUNNER_TEMP/moto-transport-regression.log" 2>&1; then
+            echo "Transport regression checks passed."
+          else
+            echo "::error::Transport regression checks failed. Reproduce locally with make browser-profile-check."
+            exit 1
+          fi
       - name: Vet
         run: make vet
       - name: Static analysis
