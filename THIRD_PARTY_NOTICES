@@ -5,7 +5,9 @@ texts are reproduced from the indicated, version-pinned upstream modules.
 
 ===============================================================================
 github.com/apernet/quic-go v0.63.1-0.20261004180939-a10df75c260c
-Source: https://github.com/apernet/quic-go/tree/a10df75c260c
+via github.com/cppla/quic-go v0.63.1-0.20261009113701-3a0e2cdb87a8
+Source baseline: https://github.com/apernet/quic-go/tree/a10df75c260c
+Pinned fork: https://github.com/cppla/quic-go/tree/3a0e2cdb87a8a713e5a29240af8845cbbc96815d
 License: MIT
 Copyright (c) 2016 the quic-go authors & Google, Inc.
 
@@ -95,8 +97,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ===============================================================================
 github.com/refraction-networking/utls, via github.com/cppla/utls
-Pinned fork: ff869e255a305a8e722a14f6a090e49666cc5f78
-Source: https://github.com/cppla/utls/tree/ff869e255a305a8e722a14f6a090e49666cc5f78
+Pinned fork: 14c2a4cb1403d9ad48120936a1fb4e8efe825ad4
+Source: https://github.com/cppla/utls/tree/14c2a4cb1403d9ad48120936a1fb4e8efe825ad4
 License file: LICENSE
 Additional source-file attributions under this license:
 Copyright 2017 Google Inc. All rights reserved.

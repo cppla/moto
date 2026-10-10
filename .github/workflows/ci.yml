@@ -28,6 +28,8 @@ jobs:
         run: make release-check
       - name: Verify modules
         run: make mod-check
+      - name: Verify managed dependency baselines
+        run: make dependency-boundary-check
       - name: Test
         run: make test
       - name: Check transport regression
@@ -42,6 +44,17 @@ jobs:
         run: make fault-test
       - name: Check reachable vulnerabilities
         run: make vuln
+      - name: Query original upstream vulnerability advisories
+        if: always()
+        run: make upstream-vuln
+      - name: Retain upstream advisory evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-advisories
+          path: bin/security-advisories/
+          if-no-files-found: error
+          retention-days: 30
       - name: Validate sample config
         run: make config-check
       - name: Check container context and final image

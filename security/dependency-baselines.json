@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "scanner_version": "v1.7.0",
+  "dependencies": [
+    {
+      "id": "utls",
+      "module": "github.com/refraction-networking/utls",
+      "version": "v1.8.3-0.20261006222701-ff1b50fbbe9a",
+      "replacement": {
+        "module": "github.com/cppla/utls",
+        "version": "v0.0.0-20261009031926-14c2a4cb1403"
+      },
+      "advisory": {
+        "module": "github.com/refraction-networking/utls",
+        "version": "v1.8.3-0.20261006222701-ff1b50fbbe9a"
+      }
+    },
+    {
+      "id": "quic",
+      "module": "github.com/apernet/quic-go",
+      "version": "v0.63.1-0.20261004180939-a10df75c260c",
+      "replacement": {
+        "module": "github.com/cppla/quic-go",
+        "version": "v0.63.1-0.20261009113701-3a0e2cdb87a8"
+      },
+      "advisory": {
+        "module": "github.com/quic-go/quic-go",
+        "version": "v0.63.0"
+      }
+    },
+    {
+      "id": "xnet",
+      "module": "golang.org/x/net",
+      "version": "v0.60.0",
+      "advisory": {
+        "module": "golang.org/x/net",
+        "version": "v0.60.0"
+      },
+      "copied_source": {
+        "version": "v0.60.0",
+        "archive_sha256": "052e0453db47a96ae9567503e7c95ea925ab52682cb1cec31250541f7160107e"
+      }
+    }
+  ]
+}

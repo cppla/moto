@@ -12,7 +12,7 @@ REGRESSION_SEED ?=
 REGRESSION_OUTPUT ?= bin/routing-regression
 LDFLAGS := -s -w -buildid= -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build check ci fmt-check workflow-check release-check mod-check test race fault-test routing-regression browser-profile-check transport-regression-check vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
+.PHONY: build check ci fmt-check workflow-check release-check mod-check dependency-boundary-check upstream-vuln test race fault-test routing-regression browser-profile-check transport-regression-check vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
 
 build:
 	mkdir -p bin
@@ -32,6 +32,13 @@ mod-check:
 	$(GO) mod verify
 	$(GO) mod tidy -diff
 	$(PYTHON) internal/browserhttp2/update_upstream.py --check --zip "$$( $(GO) env GOMODCACHE )/cache/download/golang.org/x/net/@v/v0.60.0.zip"
+
+dependency-boundary-check:
+	$(PYTHON) -B scripts/dependency_security.py check --go "$(GO)"
+	$(PYTHON) -B test/dependency_security_test.py
+
+upstream-vuln:
+	$(PYTHON) -B scripts/dependency_security.py query --go "$(GO)"
 
 test:
 	$(GO) test ./...
@@ -125,6 +132,6 @@ cross-build:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-darwin-arm64 .
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-windows-amd64.exe .
 
-check: fmt-check workflow-check release-check mod-check test race fault-test routing-regression transport-regression-check vet staticcheck vuln config-check container-context-check bench-check bench-smoke
+check: fmt-check workflow-check release-check dependency-boundary-check mod-check test race fault-test routing-regression transport-regression-check vet staticcheck vuln upstream-vuln config-check container-context-check bench-check bench-smoke
 
 ci: check cross-build

@@ -386,6 +386,8 @@ make build
 ./bin/moto --version
 ```
 
+依赖安全检查同时覆盖实际代码的可达漏洞，以及分支依赖、内部复制代码对应的原始上游公告。`make dependency-boundary-check` 离线核对固定版本，`make upstream-vuln` 联网查询并保存证据；候选公告需要审查，不等同于已确认影响 Moto。维护方法见[依赖维护说明](docs/DEPENDENCY-MAINTENANCE.md)。
+
 <details>
 <summary><strong>Docker 与 systemd</strong></summary>
 

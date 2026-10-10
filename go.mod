@@ -2,8 +2,12 @@ module moto
 
 go 1.27.2
 
-// QUIC ClientHello compatibility and the Go 1.27.2 TLS security backport.
-replace github.com/refraction-networking/utls => github.com/cppla/utls v0.0.0-20261009014536-ff869e255a30
+// QUIC ClientHello lifecycle compatibility and the Go 1.27.2 TLS security backport.
+replace github.com/refraction-networking/utls => github.com/cppla/utls v0.0.0-20261009031926-14c2a4cb1403
+
+// Preserve QUIC CRYPTO offsets and buffer ownership across HelloRetryRequest.
+// Session resumption remains disabled in Moto's production transports.
+replace github.com/apernet/quic-go => github.com/cppla/quic-go v0.63.1-0.20261009113701-3a0e2cdb87a8
 
 require (
 	github.com/apernet/quic-go v0.63.1-0.20261004180939-a10df75c260c
