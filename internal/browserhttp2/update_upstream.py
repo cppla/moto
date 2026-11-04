@@ -13,8 +13,8 @@ import subprocess
 import urllib.request
 import zipfile
 
-VERSION = "v0.60.0"
-ZIP_SHA256 = "052e0453db47a96ae9567503e7c95ea925ab52682cb1cec31250541f7160107e"
+VERSION = "v0.62.0"
+ZIP_SHA256 = "50e869800f4921e910eb6550369f937c7187d130a7f7f78a26ef9b589a7071a6"
 PREFIX = f"golang.org/x/net@{VERSION}/"
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGES = {

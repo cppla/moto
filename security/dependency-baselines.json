@@ -31,14 +31,14 @@
     {
       "id": "xnet",
       "module": "golang.org/x/net",
-      "version": "v0.60.0",
+      "version": "v0.62.0",
       "advisory": {
         "module": "golang.org/x/net",
-        "version": "v0.60.0"
+        "version": "v0.62.0"
       },
       "copied_source": {
-        "version": "v0.60.0",
-        "archive_sha256": "052e0453db47a96ae9567503e7c95ea925ab52682cb1cec31250541f7160107e"
+        "version": "v0.62.0",
+        "archive_sha256": "50e869800f4921e910eb6550369f937c7187d130a7f7f78a26ef9b589a7071a6"
       }
     }
   ]

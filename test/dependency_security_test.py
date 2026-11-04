@@ -102,9 +102,9 @@ class SecurityTests(unittest.TestCase):
         SECURITY.check_boundary(self.root, self.policy)
 
     def test_copied_source_version_hash_and_duplicate_constants_fail(self):
-        for text in (self.importer.replace("v0.60.0", "v0.59.0"),
-                     self.importer.replace("052e0453", "152e0453"),
-                     self.importer + "VERSION = 'v0.60.0'\n"):
+        for text in (self.importer.replace("v0.62.0", "v0.59.0"),
+                     self.importer.replace("50e86980", "60e86980"),
+                     self.importer + "VERSION = 'v0.62.0'\n"):
             (self.root / SECURITY.IMPORTER).write_text(text, encoding="utf-8")
             with self.assertRaises(ValueError):
                 SECURITY.check_boundary(self.root, self.policy)

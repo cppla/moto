@@ -43,8 +43,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ===============================================================================
-golang.org/x/net v0.60.0
-Source: https://go.googlesource.com/net/+/refs/tags/v0.60.0
+golang.org/x/net v0.62.0
+Source: https://go.googlesource.com/net/+/refs/tags/v0.62.0
 License file: LICENSE
 Moto's H2 connection-pool adapter also derives reservation and dial-coalescing
 behavior from http2/client_conn_pool.go (Copyright 2015 The Go Authors).
@@ -52,16 +52,16 @@ The internal/browserhttp2, internal/browserhttpcommon and internal/browserhttpsf
 packages contain a pinned, narrowly modified copy of this version. See
 internal/browserhttp2/UPSTREAM.md for the reproducible source import and patches.
 
-golang.org/x/crypto v0.57.0
-Source: https://go.googlesource.com/crypto/+/refs/tags/v0.57.0
+golang.org/x/crypto v0.58.0
+Source: https://go.googlesource.com/crypto/+/refs/tags/v0.58.0
 License file: LICENSE
 
-golang.org/x/sys v0.48.0
-Source: https://go.googlesource.com/sys/+/refs/tags/v0.48.0
+golang.org/x/sys v0.49.0
+Source: https://go.googlesource.com/sys/+/refs/tags/v0.49.0
 License file: LICENSE
 
-golang.org/x/text v0.42.0
-Source: https://go.googlesource.com/text/+/refs/tags/v0.42.0
+golang.org/x/text v0.43.0
+Source: https://go.googlesource.com/text/+/refs/tags/v0.43.0
 License file: LICENSE
 
 The four golang.org/x modules above contain the same license text:

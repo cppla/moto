@@ -31,7 +31,7 @@ release-check:
 mod-check:
 	$(GO) mod verify
 	$(GO) mod tidy -diff
-	$(PYTHON) internal/browserhttp2/update_upstream.py --check --zip "$$( $(GO) env GOMODCACHE )/cache/download/golang.org/x/net/@v/v0.60.0.zip"
+	$(PYTHON) internal/browserhttp2/update_upstream.py --check --zip "$$( $(GO) env GOMODCACHE )/cache/download/golang.org/x/net/@v/v0.62.0.zip"
 
 dependency-boundary-check:
 	$(PYTHON) -B scripts/dependency_security.py check --go "$(GO)"

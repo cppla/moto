@@ -1,13 +1,13 @@
 # Pinned HTTP/2 source
 
 The generated Go files in this package and `internal/browserhttpcommon` and
-`internal/browserhttpsfv` come from `golang.org/x/net v0.60.0`.
+`internal/browserhttpsfv` come from `golang.org/x/net v0.62.0`.
 The upstream BSD license is retained in `LICENSE`; every upstream source keeps
 its original copyright notice. HPACK remains the upstream module dependency.
 
-Source archive: https://proxy.golang.org/golang.org/x/net/@v/v0.60.0.zip
+Source archive: https://proxy.golang.org/golang.org/x/net/@v/v0.62.0.zip
 
-SHA-256: `052e0453db47a96ae9567503e7c95ea925ab52682cb1cec31250541f7160107e`
+SHA-256: `50e869800f4921e910eb6550369f937c7187d130a7f7f78a26ef9b589a7071a6`
 
 Run `python3 internal/browserhttp2/update_upstream.py --check` to reproduce and
 verify the complete source import in memory. Pass `--zip <module-cache.zip>` for
