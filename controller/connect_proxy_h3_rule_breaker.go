@@ -964,6 +964,7 @@ func (manager *http3ConnectManager) acquireHTTP3RuleProbationTransport(
 		for _, source := range manager.transports[key] {
 			if source != nil && source != selected && source.lifecycle == http3TransportServing && source.replacement == nil {
 				selected.replaces = source
+				selected.replacesConnID = source.connectionID
 				source.replacement = selected
 				break
 			}

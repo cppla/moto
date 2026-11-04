@@ -167,26 +167,41 @@ func (manager *http3ConnectManager) observeHTTP3PhysicalDial(
 	connectionID := slot.connectionID
 	slot.detector = newHTTP3DegradationDetector(now)
 	slot.lastDecision = http3DegradationDecision{}
+	// Payload counters belong to the slot and can still be updated by sibling
+	// tunnels on an older physical connection. Preserve those totals, but never
+	// inherit the old generation's idle interval into this connection's detector
+	// or a subsequently armed forced drain.
+	slot.lastPayloadProgress.Store(now.UnixNano())
+	slot.lastSampledPayload = saturatingAdd(slot.payloadRead.Load(), slot.payloadWritten.Load())
+	if candidate := slot.replacement; candidate != nil && candidate.lifecycle == http3TransportWarming {
+		// A candidate replaces a physical generation, not the reusable slot.
+		// An in-flight candidate may already carry a successful CONNECT, so let
+		// its current user finish, but do not let it promote against this redial.
+		slot.replacement = nil
+		candidate.replaces = nil
+		candidate.replacesConnID = 0
+		candidate.lifecycle = http3TransportDraining
+		if candidate.active == 0 {
+			manager.removeSlotLocked(key, candidate)
+			closeCandidate = candidate
+		}
+	}
 	if slot.lifecycle == http3TransportServing {
 		wasDegraded := slot.health == http3TransportDegraded
 		slot.health = http3TransportHealthy
 		slot.rotationFailures = 0
 		slot.retryAt = time.Time{}
-		if wasDegraded && slot.replacement != nil && slot.replacement.lifecycle == http3TransportWarming &&
-			slot.replacement.active == 0 {
-			closeCandidate = slot.replacement
-			slot.replacement = nil
-			closeCandidate.replaces = nil
-			closeCandidate.lifecycle = http3TransportFailed
-			manager.removeSlotLocked(key, closeCandidate)
+		if closeCandidate != nil {
 			manager.recordHTTP3RotationEventLocked(key, string(slot.rotationReason), "recovered")
 		}
 		if wasDegraded {
 			recovered = manager.onRecovered
 		}
 	}
-	if slot.lastPayloadProgress.Load() == 0 {
-		slot.lastPayloadProgress.Store(now.UnixNano())
+	if slot.lifecycle != http3TransportWarming {
+		// Warming slots retain the reason for replacing their bound source.
+		// Serving and draining redials have no degradation evidence of their own.
+		slot.rotationReason = http3DegradationReasonNone
 	}
 	if recovered != nil {
 		// Reserve publication order while the transport state lock still defines
@@ -586,12 +601,14 @@ func (manager *http3ConnectManager) ensureHTTP3RotationCandidateLocked(
 		return nil, nil
 	}
 	if source.replacement != nil && source.replacement.lifecycle == http3TransportWarming {
-		source.replacement.rotationReason = source.rotationReason
+		if source.replacement.replaces == source && source.replacement.replacesConnID == source.connectionID {
+			source.replacement.rotationReason = source.rotationReason
+		}
 		return source.replacement, nil
 	}
 	for _, slot := range manager.transports[key] {
 		if slot != nil && slot.lifecycle == http3TransportWarming {
-			if slot.replaces == source {
+			if slot.replaces == source && slot.replacesConnID == source.connectionID {
 				slot.rotationReason = source.rotationReason
 			}
 			return slot, nil
@@ -618,6 +635,7 @@ func (manager *http3ConnectManager) ensureHTTP3RotationCandidateLocked(
 		return nil, err
 	}
 	candidate.replaces = source
+	candidate.replacesConnID = source.connectionID
 	candidate.rotationReason = source.rotationReason
 	source.replacement = candidate
 	manager.recordHTTP3RotationEventLocked(key, string(source.rotationReason), "candidate_created")
@@ -642,7 +660,7 @@ func (manager *http3ConnectManager) markHTTP3CandidateFailed(
 	key http3ConnectTransportKey,
 	candidate *http3ConnectTransportSlot,
 	cause error,
-) (*http3ConnectTransportSlot, bool) {
+) (*http3CandidateRetrySource, bool) {
 	if manager == nil || candidate == nil {
 		return nil, false
 	}
@@ -653,16 +671,18 @@ func (manager *http3ConnectManager) markHTTP3CandidateFailed(
 	}
 	candidate.lifecycle = http3TransportFailed
 	source := candidate.replaces
-	var retrySource *http3ConnectTransportSlot
+	var retrySource *http3CandidateRetrySource
 	if source != nil && source.replacement == candidate {
 		source.replacement = nil
-		if source.lifecycle == http3TransportServing && manager.containsSlotLocked(key, source) && source.transport != nil {
+		if source.connectionID == candidate.replacesConnID && source.lifecycle == http3TransportServing &&
+			manager.containsSlotLocked(key, source) && source.transport != nil {
 			source.rotationFailures++
 			source.retryAt = manager.timeNow().Add(http3RotationBackoff(source.rotationFailures))
-			retrySource = source
+			retrySource = &http3CandidateRetrySource{slot: source, connectionID: candidate.replacesConnID}
 		}
 	}
 	candidate.replaces = nil
+	candidate.replacesConnID = 0
 	manager.recordHTTP3RotationEventLocked(key, string(candidate.rotationReason), "candidate_failed")
 	retryAfter := http3RotationBackoff(max(1, sourceRotationFailures(source)))
 	manager.mu.Unlock()
@@ -702,7 +722,20 @@ func (manager *http3ConnectManager) promoteHTTP3Candidate(
 		return
 	}
 	source := candidate.replaces
+	matchingSource := source != nil && source.replacement == candidate && source.connectionID == candidate.replacesConnID
 	candidate.replaces = nil
+	candidate.replacesConnID = 0
+	if source != nil && source.replacement == candidate {
+		source.replacement = nil
+	}
+	if source != nil && !matchingSource {
+		// A delayed response must not drain, forgive failures, or publish a
+		// recovery for a newer source generation. Keep its own tunnel alive until
+		// releaseTransport retires this superseded candidate.
+		candidate.lifecycle = http3TransportDraining
+		manager.mu.Unlock()
+		return
+	}
 	candidate.health = http3TransportHealthy
 	candidate.rotationFailures = 0
 	candidate.retryAt = time.Time{}
@@ -711,10 +744,7 @@ func (manager *http3ConnectManager) promoteHTTP3Candidate(
 	} else {
 		candidate.lifecycle = http3TransportServing
 	}
-	if source != nil {
-		if source.replacement == candidate {
-			source.replacement = nil
-		}
+	if matchingSource && manager.containsSlotLocked(key, source) {
 		source.lifecycle = http3TransportDraining
 		source.retryAt = time.Time{}
 		source.rotationFailures = 0

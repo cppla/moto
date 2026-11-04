@@ -74,6 +74,7 @@ type http3ConnectTransportSlot struct {
 	detector           *http3DegradationDetector
 	lastDecision       http3DegradationDecision
 	replaces           *http3ConnectTransportSlot
+	replacesConnID     uint64
 	replacement        *http3ConnectTransportSlot
 	rotationFailures   int
 	rotationReason     http3DegradationReason
@@ -90,6 +91,13 @@ type http3ConnectTransportSlot struct {
 	maxBlockedWrites    atomic.Int64
 	lastPayloadProgress atomic.Int64
 	demandStarted       atomic.Int64
+}
+
+// A slot can redial without changing its address. A maintenance retry belongs
+// to the physical generation whose candidate failed, not any later occupant.
+type http3CandidateRetrySource struct {
+	slot         *http3ConnectTransportSlot
+	connectionID uint64
 }
 
 func (slot *http3ConnectTransportSlot) close() {
@@ -524,12 +532,13 @@ func (manager *http3ConnectManager) acquireTransport(
 // a fresh H3 slot here would bypass a newly committed H2 cooldown.
 func (manager *http3ConnectManager) acquireHTTP3CandidateRetrySource(
 	key http3ConnectTransportKey,
-	source *http3ConnectTransportSlot,
+	retry *http3CandidateRetrySource,
 ) (*http3.Transport, *http3ConnectTransportSlot, func(), error) {
-	if manager == nil || source == nil {
+	if manager == nil || retry == nil || retry.slot == nil {
 		return nil, nil, nil, errHTTP3CandidateRetrySourceUnavailable
 	}
 	manager.mu.Lock()
+	source := retry.slot
 	limit := source.limit
 	if limit <= 0 {
 		limit = manager.streamsPerTransport
@@ -538,7 +547,7 @@ func (manager *http3ConnectManager) acquireHTTP3CandidateRetrySource(
 		}
 	}
 	if manager.retired || !manager.containsSlotLocked(key, source) || source.transport == nil ||
-		source.lifecycle != http3TransportServing || source.active >= limit {
+		source.connectionID != retry.connectionID || source.lifecycle != http3TransportServing || source.active >= limit {
 		manager.mu.Unlock()
 		return nil, nil, nil, errHTTP3CandidateRetrySourceUnavailable
 	}
@@ -688,7 +697,7 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 	ctx context.Context,
 	target *config.Target,
 	destination string,
-	retrySource *http3ConnectTransportSlot,
+	retrySource *http3CandidateRetrySource,
 ) (net.Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -786,7 +795,7 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 			setupErr = errors.Join(errConnectProxyProtocolCapacity, setupErr)
 		}
 		candidateFailed := false
-		var candidateRetrySource *http3ConnectTransportSlot
+		var candidateRetrySource *http3CandidateRetrySource
 		if candidateAttempt && ctx.Err() == nil {
 			candidateRetrySource, candidateFailed = manager.markHTTP3CandidateFailed(key, transportSlot, setupErr)
 		}

@@ -197,7 +197,7 @@ func TestHTTP3WarmingFailureKeepsOldServingAndBacksOff(t *testing.T) {
 		t.Fatalf("acquire candidate: %v", err)
 	}
 	retrySource, accepted := manager.markHTTP3CandidateFailed(key, candidate, errors.New("candidate failed"))
-	if !accepted || retrySource != source {
+	if !accepted || retrySource == nil || retrySource.slot != source {
 		t.Fatal("warming candidate failure was not accepted")
 	}
 	releaseCandidate()
@@ -248,7 +248,7 @@ func TestHTTP3CandidateRetrySourceRejectsConcurrentDrain(t *testing.T) {
 		t.Fatalf("acquire warming candidate: selected=%p candidate=%p err=%v", selected, candidate, err)
 	}
 	retrySource, accepted := manager.markHTTP3CandidateFailed(key, candidate, errors.New("candidate failed"))
-	if !accepted || retrySource != source {
+	if !accepted || retrySource == nil || retrySource.slot != source {
 		t.Fatalf("candidate retry source = %p accepted:%t, want source %p", retrySource, accepted, source)
 	}
 	releaseCandidate()
