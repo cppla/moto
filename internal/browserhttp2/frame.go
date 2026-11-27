@@ -1723,7 +1723,9 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
 	hdec.SetMaxStringLength(fr.maxHeaderStringLen())
 	hdec.SetEmitFunc(func(hf hpack.HeaderField) {
 		if VerboseLogs && fr.logReads {
-			fr.debugReadLoggerf("http2: decoded hpack field %+v", hf)
+			logged := hf
+			logged.Value = debugHeaderValue(hf.Name, hf.Value)
+			fr.debugReadLoggerf("http2: decoded hpack field %+v", logged)
 		}
 		if !httpguts.ValidHeaderFieldValue(hf.Value) {
 			// Don't include the value in the error, because it may be sensitive.

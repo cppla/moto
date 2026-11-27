@@ -1745,7 +1745,7 @@ func (cc *ClientConn) encodeTrailers(trailer http.Header) ([]byte, error) {
 
 func (cc *ClientConn) writeHeader(name, value string) {
 	if VerboseLogs {
-		log.Printf("http2: Transport encoding header %q = %q", name, value)
+		log.Printf("http2: Transport encoding header %q = %q", name, debugHeaderValue(name, value))
 	}
 	cc.henc.WriteField(hpack.HeaderField{Name: name, Value: value})
 }

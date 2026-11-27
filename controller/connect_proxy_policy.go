@@ -191,6 +191,28 @@ func connectProxyStatusFailureClass(statusErr *connectProxyStatusError) connectP
 	return classifyConnectProxyStatus(statusErr.statusCode)
 }
 
+// A circuit rejection describes the entire decision only when every cause is
+// ErrCircuitOpen. errors.Is alone also matches a single rejected candidate
+// joined with another candidate's actual dial failure.
+func connectProxyOnlyCircuitOpen(err error) bool {
+	for err != nil {
+		if err == ErrCircuitOpen {
+			return true
+		}
+		if joined, ok := err.(interface{ Unwrap() []error }); ok {
+			children := joined.Unwrap()
+			for _, child := range children {
+				if !connectProxyOnlyCircuitOpen(child) {
+					return false
+				}
+			}
+			return len(children) > 0
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
 func connectProxyErrorIdentity(err error, fallbackTarget string) (target, protocol, class string) {
 	if statusErr := connectProxyFinalStatusError(err); statusErr != nil {
 		target = statusErr.target
@@ -209,6 +231,8 @@ func connectProxyErrorIdentity(err error, fallbackTarget string) (target, protoc
 		class = connectProxyAttemptTimeout
 	case errors.Is(err, context.Canceled):
 		class = connectProxyAttemptCanceled
+	case connectProxyOnlyCircuitOpen(err):
+		class = connectProxyLogCircuitOpen
 	default:
 		class = connectProxyAttemptTransportError
 	}

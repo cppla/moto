@@ -10,6 +10,8 @@ import (
 
 var connectProxyFailureLogLimiter = newConnectProxyErrorLogLimiter()
 
+const connectProxyLogCircuitOpen = "circuit_open"
+
 // logConnectProxyFailure emits one bounded, sampled final decision log. Lower
 // protocol attempts remain visible through metrics, avoiding one Error line per
 // target plus another aggregate line for the same inbound SOCKS request.
@@ -62,7 +64,7 @@ func logConnectProxyFailureTo(logger *zap.Logger, limiter *connectProxyErrorLogL
 	case string(connectProxyFailureProxyAuth):
 		logger.Error(message, fields...)
 	case string(connectProxyFailureRateLimited), string(connectProxyFailureServiceUnavailable),
-		connectProxyAttemptTransportError, connectProxyAttemptTimeout, string(connectProxyFailureStatusUnknown):
+		connectProxyLogCircuitOpen, connectProxyAttemptTransportError, connectProxyAttemptTimeout, string(connectProxyFailureStatusUnknown):
 		logger.Warn(message, fields...)
 	default:
 		logger.Info(message, fields...)

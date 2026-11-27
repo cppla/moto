@@ -29,6 +29,10 @@ profile. No encrypted or framed network writes are rewritten. Advertised
 features stay implemented: push remains disabled, the default 16 KiB maximum
 frame size is unchanged, and extended CONNECT is not newly advertised.
 
+Client and server header-encoding logs and decoded HPACK field logs use
+`debugHeaderValue` to redact `Authorization` and `Proxy-Authorization` at
+both HTTP/2 debug levels. The encoder and decoder retain the original values.
+
 The Chrome profile advertises a 256 KiB maximum header list. Moto separately
 retains its smaller CONNECT response acceptance limit; that application policy
 must not be implemented by lying about the decoder's advertised capacity.

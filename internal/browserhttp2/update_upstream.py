@@ -101,12 +101,24 @@ def transform(path, source):
                             'httpcommon "moto/internal/browserhttpcommon"')
     source = source.replace('"golang.org/x/net/internal/httpsfv"',
                             'httpsfv "moto/internal/browserhttpsfv"')
+    if path == "http2/frame.go":
+        source = replace_once(source,
+            'fr.debugReadLoggerf("http2: decoded hpack field %+v", hf)',
+            'logged := hf\n\t\t\tlogged.Value = debugHeaderValue(hf.Name, hf.Value)\n'
+            '\t\t\tfr.debugReadLoggerf("http2: decoded hpack field %+v", logged)')
+    if path == "http2/write.go":
+        source = replace_once(source,
+            'log.Printf("http2: server encoding header %q = %q", k, v)',
+            'log.Printf("http2: server encoding header %q = %q", k, debugHeaderValue(k, v))')
     if path == "http2/transport_common.go":
         source = replace_once(source, "type Transport struct {\n", "type Transport struct {\n"
             "\t// ChromeProfile enables Moto's explicit HTTP/2 connection profile.\n"
             "\t// It changes advertised receive limits and matching local state together.\n"
             "\tChromeProfile bool\n\n")
     if path == "http2/transport.go":
+        source = replace_once(source,
+            'log.Printf("http2: Transport encoding header %q = %q", name, value)',
+            'log.Printf("http2: Transport encoding header %q = %q", name, debugHeaderValue(name, value))')
         source = replace_once(source, "\tconf := configFromTransport(t)\n", "\tconf := configFromTransport(t)\n"
             "\tif t.ChromeProfile {\n\t\tapplyChromeReceiveConfig(&conf)\n\t}\n")
         source = replace_once(source, "\tcc.fr.MaxHeaderListSize = t.maxHeaderListSize()\n",

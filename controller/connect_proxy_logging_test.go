@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"moto/config"
 	"net/http"
 	"sync"
@@ -12,6 +14,36 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+func TestLogConnectProxyFailureSeparatesCircuitRejectionsFromDialErrors(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core)
+	limiter := newConnectProxyErrorLogLimiterWithNow(func() time.Time { return time.Unix(1, 0) })
+	rule := &config.Rule{Name: "boost"}
+	rejected := fmt.Errorf("all boost targets unavailable: %w", ErrCircuitOpen)
+	logFailure := func(err error) {
+		logConnectProxyFailureTo(logger, limiter, rule, "", err, "boost decision failed")
+	}
+
+	// Exhaust the circuit-open burst with both a wrapped and a joined rejection.
+	logFailure(rejected)
+	logFailure(fmt.Errorf("all routes: %w", errors.Join(rejected, ErrCircuitOpen)))
+	logFailure(ErrCircuitOpen)
+	// A real dial failure must still be logged under its own key.
+	logFailure(fmt.Errorf("all routes: %w", errors.Join(rejected, errors.New("connection refused"))))
+	logFailure(errors.Join(context.DeadlineExceeded, rejected))
+
+	entries := logs.AllUntimed()
+	want := []string{"circuit_open", "circuit_open", "transport_error", "timeout"}
+	if len(entries) != len(want) {
+		t.Fatalf("got %d log entries, want %d", len(entries), len(want))
+	}
+	for i, entry := range entries {
+		if class := entry.ContextMap()["class"]; entry.Level != zapcore.WarnLevel || class != want[i] {
+			t.Errorf("entry %d: level=%s class=%v, want warn/%s", i, entry.Level, class, want[i])
+		}
+	}
+}
 
 func TestLogConnectProxyFailureInfersProtocolForGenericMultiTargetErrors(t *testing.T) {
 	tests := []struct {
