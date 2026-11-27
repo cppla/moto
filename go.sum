@@ -2,8 +2,8 @@ github.com/cppla/quic-go v0.63.1-0.20261009113701-3a0e2cdb87a8 h1:cRdU8MvvT8WQsI
 github.com/cppla/quic-go v0.63.1-0.20261009113701-3a0e2cdb87a8/go.mod h1:TqjSZptjiHgfRItER3Mn5ymcv8OBcpfZkC2W9qn4WI0=
 github.com/cppla/utls v0.0.0-20261009031926-14c2a4cb1403 h1:4mCd3Kcelm0jFNEWI//rA80LenP2OiMc4E4it17nLQU=
 github.com/cppla/utls v0.0.0-20261009031926-14c2a4cb1403/go.mod h1:rc/ctWeKlh9LSk5k90KlSPcwF7P6D31mn/9GI2NAfBI=
-github.com/klauspost/compress v1.20.1 h1:T7kKElXUMXrUJ2E9QhQhxFtcK5rPyLdsGZvdbLMPdiQ=
-github.com/klauspost/compress v1.20.1/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
+github.com/klauspost/compress v1.20.2 h1:v5tiZvm1KGLyg5d5oXdXe3lsSPrbEUiKoXGia//I7Qo=
+github.com/klauspost/compress v1.20.2/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
 github.com/molecule-man/go-brrr v1.2.0 h1:dOJU45BC3Gc2WXoxAW0rgCAgVuu2gruAOGncfieA0Jw=
 github.com/molecule-man/go-brrr v1.2.0/go.mod h1:7ybW6/7gA3oKY45jOfVNjSJDtrr6ea4tzbsTkjmQDC4=
 github.com/quic-go/go-ossfuzz-seeds v0.1.0 h1:APacT+iIaNF6fd8AGEiN3bT/Jtkd2jz4v4TzM7MFjy0=

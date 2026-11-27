@@ -1,6 +1,6 @@
 module moto
 
-go 1.27.3
+go 1.27.4
 
 // QUIC ClientHello lifecycle compatibility and the Go 1.27.2 TLS security backport.
 replace github.com/refraction-networking/utls => github.com/cppla/utls v0.0.0-20261009031926-14c2a4cb1403
@@ -18,7 +18,7 @@ require (
 )
 
 require (
-	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/molecule-man/go-brrr v1.2.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect

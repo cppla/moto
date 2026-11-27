@@ -199,8 +199,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ===============================================================================
-github.com/klauspost/compress v1.20.1
-Source: https://github.com/klauspost/compress/tree/v1.20.1
+github.com/klauspost/compress v1.20.2
+Source: https://github.com/klauspost/compress/tree/v1.20.2
 License file: LICENSE
 Additional source-file attribution (fse, huff0 and zstd/bitwriter.go):
 Based on work Copyright (c) 2013, Yann Collet, released under BSD License.
@@ -513,7 +513,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ===============================================================================
 github.com/klauspost/compress bundled xxhash component
-Source: https://github.com/klauspost/compress/tree/v1.20.1/zstd/internal/xxhash
+Source: https://github.com/klauspost/compress/tree/v1.20.2/zstd/internal/xxhash
 License file: zstd/internal/xxhash/LICENSE.txt
 -------------------------------------------------------------------------------
 
